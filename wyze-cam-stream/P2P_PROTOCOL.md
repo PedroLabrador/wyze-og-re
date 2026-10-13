@@ -344,10 +344,53 @@ def chkval(buf, payload_len):          # payload_len = gute_get_encrypt_data_len
 - Result is stored at **offset 16** (`str r0, [r2, #0x10]` in `iv_init_frm_listsrv`).
 - `gute_get_encrypt_data_len` @ `0x2a9b4` returns the *payload* length; for a 40-byte frame the
   checksum loop indexes offsets 24/28/32/36 ⇒ payload = 16 ⇒ **`payload_len = total_len − 24`**.
-- **[WIRE]** the algorithm above is byte-exact: feeding it the plaintext terminal ID reproduces
-  the app's encrypted `chk` field exactly, and the same function validates against the decrypted
-  `LIST_RESP`. [!] but note the `d_log`/`d_real` split in §3a — the words at offsets 4/8 that go
-  into the checksum are **not** the ones that end up on the wire.
+- **[WIRE]** the algorithm above is byte-exact for **requests**: feeding it the plaintext terminal
+  ID reproduces the app's encrypted `chk` field exactly. [!] but note the `d_log`/`d_real` split in
+  §3a — the words at offsets 4/8 that go into the checksum are **not** the ones that end up on
+  the wire.
+
+### §4a. Responses — `g(header)` is NOT modelled, and you don't need it [WIRE — oracle-proven]
+
+[!] **Requests and responses are NOT symmetric.** The same `init_chkval` disassembly validates
+nothing on its own for an inbound frame, and this was proven with the running app as an oracle
+(`chk_probe.py`: patch a byte → re-encrypt → the app prints
+`iv_gute_frm_rc5_decrypt … chkval fail chk_val=<its answer> frm_chkval=<stored word>`).
+
+**What the oracle proved (do not re-derive these):**
+
+| # | Result | Verdict |
+|---|---|---|
+| 1 | Varying **any** payload word `24..172` by `D` moves the app's answer by exactly `D`: `chk(probe) ^ chk(base) == D` — all 38 words, one probe each | [OK] **payload is a plain XOR-fold, nwords = 38** |
+| 2 | `app_chk ^ our_chk` is **constant** under payload edits (identical `X` for an edit at off 100 and at off 24) | [OK] **`app_chk = g(header[0:23]) ^ fold(payload)`** |
+| 3 | Editing `W4`/`W8`/`W12`/flags each produced a *non-linear, non-`D`* change in `X` (e.g. `X(BASE)=0x9eb4f247`, `X(W4^=D)=0x0fb6ffd6`, `X(W8^=D)=0x43573b74`, `X(W12^=D)=0xa257e663`, `X(flags^=1)=0xde1f448f`) | [X] **static byte-exact reproduction of `g(header)` is NOT tractable** — it depends on `iv_gute_frm_decrypt_id` (`0x2ac40`) / a decryption path not modelled |
+
+**Consequence — the workaround that actually ships.** `g(header)` is a *constant* for a fixed
+header, so **keep the server's own checksum word (offset 16) and make only fold-neutral payload
+edits**. Then the app recomputes the identical value and accepts the frame.
+
+```
+1. decrypt genuine LIST_RESP          → plain
+2. rewrite IPv4 / ports in the records
+3. xor the sum of those byte-changes into a sacrificial payload word
+4. LEAVE offset 16 and the whole 32-byte header untouched
+5. re-encrypt, re-send  → app accepts
+```
+
+- Sacrificial word used: **offset 172** (record 3's trailing 4 bytes, `0` in every observed
+  record, and the *last* word of the fold — so no record field is disturbed).
+- [!] **Endianness trap (cost us a whole test run):** `delta` must be accumulated **and applied**
+  with the same endianness. IPv4 and the port fields are big-endian on the wire, so accumulate
+  with `struct.unpack(">I", …)` **and** apply with `struct.pack_into(">I", …)`. Applying with
+  `"<I"` XORs the bytes with the reversed sequence — a rotate-right-8 — and the fold comes out
+  off by `0x95c8bec8` instead of `0xc8bec895`. Verify **offline** before going live:
+  `checksum(plain_orig) == checksum(plain_mod)` and the XOR of all changed payload words is `0`.
+
+**Proof it works:** `cap_relay.py` rewrites all four relays to `192.168.77.13:28800` this way →
+zero `chkval fail chk_val=` in logcat, and the app prints
+`set current ListSrv to 192.168.77.13.` + `add udp_addr 192.168.77.13:28800 srv_id=49`.
+
+> Note the two distinct `chkval fail` lines in logcat: filter on **`chk_val=`**. The
+> `opt_encrypt=2 … chkval fail...` line carries no value and is unrelated noise.
 
 ---
 
@@ -497,6 +540,72 @@ gat_send_init_info_msg(ctx)               // 0x3eac4, next message in the chain
 **Chain so far:** `LIST_REQUEST` → `LIST_RESP` (relays) → TCP/UDP to a relay →
 `certify_req`(type 0x0c) → `certify_resp` (session key installed) → `init_info` →
 `GDM_JDAT_RPT` (camera LAN IPs) → KCP/AV.
+
+---
+
+## 5b. End-to-end: the app talking to *us* [WIRE — live, 2026-10-13]
+
+With §4a's fold-neutral rewrite in place, `cap_relay.py` runs a **full MITM**:
+
+```
+app --UDP--> 192.168.77.13:51701 (cap_relay) --UDP--> 18.118.90.161:51701 (genuine list srv)
+app <--MOD-- 192.168.77.13:51701                  (4 relays repointed at us, chk kept)
+app --UDP--> 192.168.77.13:28800 (cap_relay) --UDP--> 3.13.212.24:28800 (genuine relay)
+app <--UDP-- 192.168.77.13:28800
+```
+
+**Verified:** zero `chkval fail chk_val=`, `gat_on_rcvpkt_LIST_RESP … set current ListSrv to
+192.168.77.13.`, `add udp_addr 192.168.77.13:28800 srv_id=49`, and 9–12 relay packets relayed
+both ways per run.
+
+### Observed control-plane sequence (logcat, in order)
+
+```
+iv_fast_connect_srv srv_num=3 fast_connect=1
+iv_addRmtP2pSrv … add udp_addr 3.13.212.24:28800   srv_id=49   ← ip_env=0, FROM DISK CACHE
+iv_addRmtP2pSrv … add udp_addr 44.238.104.252:443  srv_id=18   ← ip_env=0, FROM DISK CACHE
+iv_addRmtP2pSrv … add udp_addr 54.208.16.245:443   srv_id=58   ← ip_env=0, FROM DISK CACHE
+iv_send_list_request mode=0 / port=51701
+iv_on_timeout_query_listsrv_resend: … to ipv4=192.168.77.13:51701 … list_req_cnt=…
+gat_on_rcvpkt_LIST_RESP … set current ListSrv to 192.168.77.13.
+iv_addRmtP2pSrv ip_env=1 → add udp_addr 192.168.77.13:28800 srv_id=49   ← OURS
+gat_send_detecReq_2_allp2psrv: cnt_all_srv_detect=N len=68 to 192.168.77.13:28800
+iv_gutes_on_respfrm_Detect chkval=… snd_sqnum=…
+iv_gutes_start_active_certify_req mtu=1032
+gutes_on_respfrm_certify_resp session_id=7696021469729393155
+gat_rcv_init_info_msg_resp srv_id=… frm_len=209 offline_cnt=0 online_cnt=4
+   did=429728658691722 wyze_id:CAM-1_D03F27747BB0   … (4 devices)
+gat_on_rcv_GDM_JDAT_RPT_REQ … content={"ProReadonly":{"_online":…,"netInfo":{"stVal":
+   {"ssid":"Jose","ip":"192.168.77.12", …}}}}   … (per camera)
+```
+
+> **`init_info` → `GDM` answered every open question in STATUS open-problem #1**: it carries
+> `online_cnt=4`, the `did`/`wyze_id` map, and each camera's **LAN IP + MAC + ssid**.
+> Cameras: `.217` D03F27747BB0 · `.224` D03F27EBFB10 · `.169` D03F2776110C · `.117` D03F277576D8.
+> [!] `netInfo` still has **no TCP/UDP port** — that comes from the KCP/GDM layer, not here.
+
+### [!] Two things the MITM does NOT yet reproduce
+
+1. **The app restores the real relays from a disk cache at startup** (`ip_env=0`), *before* our
+   `LIST_RESP` arrives, so `certify`/`init_info`/`GDM` can complete against the genuine AWS
+   relays while our leg only carries `Detect`. Our relays are added with `ip_env=1` afterwards.
+   Clearing that cache (find it via `run-as com.hualai`) is the untried fix.
+2. **`NET64 IPV4_TO_IPV6 FAIL`** — only record 0 of our four rewritten relays is added; records
+   1–3 fail conversion (they arrive with `ip_version_env=1` and, for records 1/3, a real IPv6
+   still present). So `srv_num=3` in the log counts the *cached* servers, not ours.
+
+**Relay wire formats captured in the clear** (both legs, `cap_relay.py` transcript):
+
+- `Detect` request — **type `0x01`, 68 B**, flags `0x00010000` (RC5, 8-byte header key), a
+  per-request nonce at `+4..+19`, and the constant 8-byte cookie `fcd4f19a43f516ee` repeated
+  4× at `+32..+63` (`+64..+67 = 0`).
+- `Detect` response — **type `0x02`, 56 B**, plaintext-looking: `d_log` (`a3601200 d6860184`)
+  at `+4..+11`, varying `+12..+19`, `0x0000855c` at `+20`, `1` at `+24`, a counter at `+36`,
+  and **Unix time at `+48`** (`f1c4cd6a` = 2026-10-13).
+- [!] With all four records collapsed onto one address, the app sometimes logs
+  `iv_gutes_on_respfrm_Detect not find p2p...` — the response can't be correlated back to a
+  server. Giving each record its **own local port** (28800/1/2/3, each forwarding to its real
+  relay) is the untried fix.
 
 ---
 

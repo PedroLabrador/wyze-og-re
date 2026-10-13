@@ -1,9 +1,28 @@
 # STATUS — where we are, what's next
 
-> Last updated: **2026-10-12**. Companion docs: [`REVERSE_ENGINEERING.md`](./REVERSE_ENGINEERING.md)
+> Last updated: **2026-10-13**. Companion docs: [`REVERSE_ENGINEERING.md`](./REVERSE_ENGINEERING.md)
 > (full findings + **VERDICT BOARD** of [OK] confirmed vs [X] disproved), [`SECRETS.md`](./SECRETS.md),
 > [`P2P_PROTOCOL.md`](./P2P_PROTOCOL.md) (**new — the wire protocol as actually reversed**),
 > [`README.md`](./README.md) (stale — flagged).
+
+## [!] READ THIS FIRST — big update (2026-10-13)
+
+**The response-checksum blocker is SOLVED and the relay MITM works end-to-end.** Details in
+[`P2P_PROTOCOL.md`](./P2P_PROTOCOL.md) §4a + §5b. Short version:
+
+1. **Requests**: our `init_chkval` model is byte-exact (§4).
+2. **Responses**: the app computes `g(header[0:23]) ^ fold(payload)`. `fold(payload)` is a plain
+   XOR-fold over the 38 payload words (oracle-proven), but `g(header)` depends on a decryption
+   path we do **not** model — and static reproduction was **disproved**. Workaround: **keep the
+   server's checksum word and make only fold-neutral payload edits** (XOR the byte-changes into
+   the sacrificial word at offset 172). Verified offline *and* live: zero `chkval fail chk_val=`.
+3. **`cap_relay.py`** now relays the whole list + relay conversation. The app prints
+   `set current ListSrv to 192.168.77.13.` and `add udp_addr 192.168.77.13:28800 srv_id=49`.
+4. **`init_info` → `GDM_JDAT_RPT` decoded from live logcat** — it delivers `online_cnt=4`, the
+   `did ↔ wyze_id` map, and each camera's **LAN IP + MAC + ssid**. Open problem #1 is answered
+   at the payload level; the frame formats still need reversing.
+5. Still open (§5b): the app restores the real relays from a **disk cache** before our response
+   arrives, and only 1 of our 4 rewritten records survives (`NET64 IPV4_TO_IPV6 FAIL`).
 
 ## [!] READ THIS FIRST — big update (2026-10-12, late session)
 
@@ -88,6 +107,8 @@ wyze-re/
 ├── uber-apk-signer.jar
 ├── wire/                              # captured LIST_REQUEST/LIST_RESP + README (ground truth)
 ├── listreq.py                         # byte-exact LIST_REQUEST builder (checksum + RC5-32/6/8)
+├── cap_relay.py                       # list-server impersonator + relay MITM (fold-neutral rewrite)
+├── chk_probe.py                       # app-as-checksum-oracle (proved §4a)
 ├── decode_lr.py                       # LIST_RESP payload decoder (prints the 4 relays)
 ├── probe_real.py                      # sends our packets to the real server, prints responses
 ├── cap_listsrv2.py                    # UDP+TCP list-server impersonator (app redirect target)
@@ -120,10 +141,12 @@ wyze-re/
 > between A/B/C" list is retired. Route C is the only live path, and its first two stages are
 > done, so the list starts where the work now actually is.
 
-1. **`init_info` → `GDM_JDAT_RPT`** — reverse `gat_send_init_info_msg` (`0x3eac4`),
+1. **`init_info` → `GDM_JDAT_RPT` — frame formats.** Payload level is [OK] decoded from live
+   logcat (§5b: `online_cnt=4`, `did↔wyze_id`, camera LAN IP/MAC/ssid). What's left is the
+   byte-exact framing: reverse `gat_send_init_info_msg` (`0x3eac4`),
    `gat_rcv_init_info_msg_resp` (`0x46960`), `gat_on_rcvpkt_GDM_JDAT_RESP` (`0x44a14`) and
-   `gat_on_rcvpkt_GDM_JDAT_REQ` (`0x43790`). This layer carries the `did ↔ TID` map and the
-   cameras' LAN IPs. **This is the current gate.**
+   `gat_on_rcvpkt_GDM_JDAT_REQ` (`0x43790`) — or just read them off the `cap_relay.py` capture
+   now that the relay leg is in the clear. **This is the current gate.**
 2. **How `certify_req` is actually dialled** — transport to the relay (TCP or UDP) and the
    byte-exact finalizer for type `0x0c` (checksum + RC5 over `[24:…]`). Assumed to follow
    §4/§5; not yet byte-verified because there is no `certify` capture.
@@ -162,8 +185,8 @@ wyze-re/
 |---|---|---|
 | 1 | `LIST_REQUEST` / `LIST_RESP` → relay list | [OK] **DONE** — byte-exact builder, real server answers, payload decoded (§3, §3a) |
 | 2 | GUTES `certify` → session key | [OK] **DONE** — frame format + `rc5_ctx_setkey(nonce, 32)` (§5a) |
-| 3 | `init_info` → `GDM_JDAT_RPT` (did↔TID, camera LAN IPs) | [X] **CURRENT GATE** |
-| 4 | Relay dial: transport + byte-exact type `0x0c` finalizer | [~] assumed from §4/§5, unverified |
+| 3 | `init_info` → `GDM_JDAT_RPT` (did↔TID, camera LAN IPs) | [~] **payload decoded live** — logcat gives `online_cnt=4`, `did↔wyze_id`, LAN IP/MAC/ssid per cam (§5b). Frame format still to reverse. |
+| 4 | Relay dial: transport + byte-exact type `0x0c` finalizer | [~] **MITM live** — `cap_relay.py` relays Detect/certify/init_info/GDM in the clear (§5b); `Detect` type 0x01/0x02 formats captured. `0x0c` finalizer still assumed. |
 | 5 | KCP config + AV channel framing → H.264/H.265 | [ ] not started |
 | 6 | Auth to camera (`accessToken` vs LAN password) | [ ] not started |
 | 7 | Python client → `ffmpeg` → HLS/WebRTC → browser grid of 4 → `server.py` | [ ] not started |

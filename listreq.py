@@ -79,6 +79,18 @@ def rc5_encrypt_block(S, blk: bytes, byteorder: str = "little") -> bytes:
     return A.to_bytes(4, byteorder) + B.to_bytes(4, byteorder)
 
 
+def rc5_decrypt_block(S, blk: bytes, byteorder: str = "little") -> bytes:
+    """Inverse of rc5_encrypt_block (the Feistel run backwards)."""
+    A = int.from_bytes(blk[0:4], byteorder)
+    B = int.from_bytes(blk[4:8], byteorder)
+    for i in range(ROUNDS, 0, -1):
+        B = (_rotl32((B - S[2 * i + 1]) & MASK, 32 - (A & 31)) ^ A) & MASK
+        A = (_rotl32((A - S[2 * i]) & MASK, 32 - (B & 31)) ^ B) & MASK
+    B = (B - S[1]) & MASK
+    A = (A - S[0]) & MASK
+    return A.to_bytes(4, byteorder) + B.to_bytes(4, byteorder)
+
+
 def payload_len(buf) -> int:
     """gute_get_encrypt_data_len: total_len - 24, minus optional extensions."""
     n = struct.unpack_from("<H", buf, 2)[0] - 24
