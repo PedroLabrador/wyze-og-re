@@ -192,16 +192,85 @@ Decrypted payload (offsets are from the frame start):
 168: 52 09 67 e8 00 00 00 00
 ```
 
-**[INFERRED]** `LIST_RESP` layout is **not yet decoded**. What is solid so far:
-- there is a **36-byte stride** — the marker `?? ?? 67 e8` recurs at +62/+98/+134/+170.
-- four network-order IPv4s sit at a fixed +12 offset inside each stride:
-  `44.238.104.252` (+68), `54.208.16.245` (+104), `52.40.221.253` (+140) — all AWS — plus
-  `3.13.212.24` at +32 (also seen in logcat as `iv_addRmtP2pSrv … srv_id=49`).
-- `192.168.77.15` / `192.168.77.16` at +76/+148 (private; likely an alternate path).
-- the 4 bytes before each marker are a repeated u16: `70 80 70 80`, `01 bb 01 bb`, `01 bb 01 bb`,
-  `c9 f9 c9 f9` — `01 bb` = **443** and `c9 f9` = **51705** read big-endian ⇒ *probably* a
-  `tcp_port || udp_port` pair, one pair per record. Ports `443`/`51705` at `+92/+93` and
-  `+128/+129`.
+### Decoded — frame header [CONFIRMED — disassembled]
+
+Recovered from `gat_on_rcvpkt_LIST_RESP` @ `0x4ad64`. The handler takes `(ctx, pkt)` and does
+`base = pkt + 400` — the 400-byte `pkt` wrapper ends exactly where the raw frame begins, so
+**`base` = the frame start**. Two reads prove it:
+
+| read | purpose |
+|---|---|
+| `ldrh r1, [base+2]` compared to `pkt+0x34` | frame's `total_len` sanity check |
+| `ldrh r1, [base+24]` then `and r1, #1` | the same `flags |= 1` bit our request builder sets |
+
+```
+frame +0   u8  magic   0x7f
+       +1   u8  type    0x16 = 22 = LIST_RESP
+       +2   u16 total_len   LE  (= 176 here)
+       +4   u32 / +8 u32 / +12 u32   header words (0xb106f64d / 0x5c73f1ba / 0x5f222af5)
+       +16   16 B            000102030405060708090a0b0c0d0e0f
+       +24   u16 flags        LE, bit0 = request-flag bit
+       +26   6 B             000081000400
+       +32   records[]       stride 36, count = (total_len - 32) / 36
+```
+
+**Records start at `base+32`, stride exactly 36** — the loop is
+`cursor = base+32; while (i < count) { iv_addRmtP2pSrv(ctx, cursor); cursor += 36; }`
+followed by `iv_store_srv_info(ctx, base+32, count)`. Here `176 - 32 = 144 = 4 × 36`, remainder 0.
+
+### Record layout [CONFIRMED — disassembled + WIRE]
+
+`iv_addRmtP2pSrv` @ `0x410d0` starts with `movw r3, #0x24` / `memcpy(local, rec, 36)` — the
+record copy sits at `r11-64`, so every `[r11, #-K]` reads record offset `64-K`. That map gives
+the whole layout (`fieldmap.py` regenerates it):
+
+| rec | field | type | maps to |
+|---|---|---|---|
+| `+0` | **IPv4** | u32, **network order** | key to `iv_findP2PSrv`; `sin_addr` of all 4 sockaddrs |
+| `+4` | **IPv6** | 16 B | passed bytewise; the client may overwrite it via `iv_get_ipv6_addr_from_ipv4(ctx, ipv4, rec+4)` |
+| `+20` | kind | u8 | `ubfx #1,#2` (2 bits) → `entry+0x5c` |
+| `+22` | **srv_id** | u16, LE | `entry+94` |
+| `+24` | **port1** | u16, **network order** | `sockaddr_in` at `entry+12` |
+| `+26` | port2 | u16, network order | `sockaddr_in` at `entry+112` |
+| `+28` | port3 | u16, network order | `sockaddr_in` at `entry+132` |
+| `+30` | port4 | u16, network order | `sockaddr_in` at `entry+148` |
+| `+32` | — | u32 | never read (zeros) |
+
+Each of the four targets is a plain `struct sockaddr_in { u16 family = AF_INET=2; u16 port;
+u32 addr; }` — `movw r0,#2 / strh [entry+12|112|132|148]` then the port, then the address.
+
+Port byte order is proven by the handler itself:
+`ldrh r4, [entry+14]; rev r4; lsr #16; uxth` converts the stored u16 back to host order for
+the log line — i.e. the wire bytes are big-endian.
+
+### The four relay servers it hands out
+
+```
+rec  srv_id  ipv4              ipv6                                    kind  ports +24/+26/+28/+30
+0    49      3.13.212.24       -                                       1     28800 / 28800 / 41001 / 26600
+1    18      44.238.104.252    2600:1f13:ac8:360b:ffc0:3853:a1f3:e992   9     443   / 443   / 8001  / 26600
+2    58      54.208.16.245     -                                       1     443   / 443   / 45501 / 26600
+3    28      52.40.221.253     2600:1f13:ac8:360c:f586:1adb:61e6:88f9   9     51705 / 51705 / 21001 / 26600
+```
+
+**Cross-check against the phone's live logcat — MATCH:**
+`iv_addRmtP2pSrv: add udp_addr 3.13.212.24:28800 srv_id=49` ↔ record 0
+(IPv4 from `rec+0`, port from `rec+24` big-endian, srv_id from `rec+22` LE). This is what
+closes the layout.
+
+Notes:
+- `port1 == port2` in all four records (the two sockaddrs are fed identical values).
+- `port4 = 26600` is **constant across every record**.
+- `kind` is `1` exactly when the IPv6 field is empty, `9` when it is populated — so bit3
+  most likely means "IPv6 present"; the 2 bits the code actually extracts (`bits[1:2]`) are
+  `0` in all four.
+- `192.168.77.15` / `192.168.77.16` (seen at `+76`/`+148` in the raw dump) are **not** IPv4s —
+  they are bytes 4–7 of records 1 and 3's *IPv6* field, inside `2600:1f13:0ac8:360b::`.
+- The relay set here (srv 49/18/58/28) is **different** from the built-in fast-connect list the
+  phone logs at startup (`35.81.136.54:8000` srv 38, `3.13.212.24:28800` srv 49,
+  `3.131.23.11:8443` srv 48) — only srv 49 overlaps.
+
+Decode it with `python3 decode_lr.py wire/list_resp_decrypted.hex`.
 
 ### What the server actually accepts (probed against `18.118.90.161:51701`)
 
@@ -453,6 +522,9 @@ LAN discovery
 | C30 | **[WIRE]** Server accepts *only* `[4:12]=d_real` + `checksum(d_log)` + `seq=0`; both IDs stable across restart |
 | C31 | **[WIRE]** There is an **HTTP fallback** for the list request on the same port 51701 (`mode=1`, `evhttp_connection`) |
 | C32 | Redirecting `GWApi.GWellP2PUrl` to the Mac works end-to-end and preserves login (same-signature reinstall) |
+| C33 | **[DISASSEMBLED]** `LIST_RESP` records start at **frame+32, stride 36**; `count = (total_len-32)/36` — exact fit (4×36) |
+| C34 | **[DISASSEMBLED]** record = `IPv4@0 (BE) | IPv6@4 (16B) | kind@20 | srv_id@22 (LE) | port1@24 | port2@26 | port3@28 | port4@30 (all BE)` |
+| C35 | **[WIRE+LOGCAT]** Layout cross-verified: record 0 decodes to `3.13.212.24:28800 srv_id=49`, exactly the phone's live `iv_addRmtP2pSrv` line |
 
 ---
 
@@ -469,8 +541,9 @@ LAN discovery
   app builds and sends. It also means we are no longer limited to "did the server answer".
 
 **Still hard:**
-- `LIST_RESP` payload decode (§3a — stride/ports/IPs spotted, record layout not pinned),
-  then the whole GUTES `certify` → `session_id` → `init_info` → `GDM` layer.
+- the whole GUTES `certify` → `session_id` → `init_info` → `GDM` layer (next up — the
+  builders are `iv_gutes_start_active_certify_req` @ `0x31ed8`, `gat_send_init_info_msg` @
+  `0x3eac4`, `gat_rcv_init_info_msg_resp` @ `0x46960`).
 - KCP configuration and the AV channel/frame protocol, then H.264/H.265 extraction.
 - `d_real` provenance (§3a) — worked around by hardcoding, not understood.
 - **[OPEN]** whether the server will accept a *different* terminal ID than this install's
@@ -481,7 +554,9 @@ LAN discovery
 cannot be sniffed from the Mac (no root, `tcpdump` unprivileged, adb over USB). But the
 redirect technique turns the *app itself* into the sniffer for anything it originates, which
 covers the control plane. The AV plane still has to come from disassembly unless we can
-redirect the relay endpoints too (possible in principle: rewrite the `LIST_RESP` IP fields and
-relay everything back).
+redirect the relay endpoints too — **now precisely specified**: rewrite `record+0` (the IPv4,
+4 bytes at `frame + 32 + i*36`) and/or `record+24` (the port) in the `LIST_RESP`, and the app
+will dial the Mac instead of AWS. Field positions are known exactly (§3a), so this is a
+5-line change to `cap_listsrv2.py`.
 
 **This is the crux of the strategic decision** — see `STATUS.md`.
