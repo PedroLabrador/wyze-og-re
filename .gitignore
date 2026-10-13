@@ -1,0 +1,44 @@
+# ============================================================
+# Large binary artifacts — reproducible from the public APK,
+# far too big for git (5+ GB total). Never commit these.
+# ============================================================
+*.apk
+*.apkm
+*.xapk
+*.idsig
+*.jar
+*.xlog
+com.hualai_*/
+wyze_3.23/
+wyze_xapk/
+
+# ============================================================
+# Signing material (throwaway debug keystore — password is
+# documented in wyze-cam-stream/SECRETS.md, regenerate if lost)
+# ============================================================
+wyze_debug.keystore
+
+# ============================================================
+# Live credentials — deliberately NOT in git.
+# Re-obtainable in ~1 min via the OAuth flow documented in
+# wyze-cam-stream/REVERSE_ENGINEERING.md (C1/C2).
+# Rotate before committing anything else; see SECRETS.md.
+# ============================================================
+wyze_token.json
+
+# ============================================================
+# Transient capture output / interpreter debris
+# ============================================================
+*.log
+*.pyc
+__pycache__/
+
+# ============================================================
+# Extracted from the device, not authored — junk
+# ============================================================
+sp_secure.xml
+
+# ============================================================
+# OS noise
+# ============================================================
+.DS_Store
