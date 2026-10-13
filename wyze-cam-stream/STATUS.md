@@ -36,13 +36,37 @@ Everything the app *originates* can now be captured this way (control plane). Th
 still un-captured, but the redirect trick can be extended to it by rewriting the relay IPs in
 the `LIST_RESP` and relaying traffic back.
 
+### Two more layers decoded (2026-10-12, same session)
+
+Since the ground-truth banner above, **two protocol layers were closed out from the
+disassembly** — both fully documented in [`P2P_PROTOCOL.md`](./P2P_PROTOCOL.md):
+
+1. **`LIST_RESP` payload decoded** (§3a). Records start at **frame+32, stride 36**, four of
+   them, exact fit. Each record = `IPv4@0 | IPv6@4 | kind@20 | srv_id@22 | port1@24 |
+   port2@26 | port3@28 | port4@30`. Cross-verified against the phone's live logcat:
+   record 0 decodes to `3.13.212.24:28800 srv_id=49` — exactly the `iv_addRmtP2pSrv` line
+   the phone printed. Run `python3 decode_lr.py wire/list_resp_decrypted.hex` to see it.
+2. **GUTES `certify` reversed** (§5a). `certify_req` = type `0x0c`, 64 bytes: a flags word
+   at +20, `hash(nonce)` at +28, and a **32-byte RC5-encrypted nonce at +32**. The response
+   carries an error code at +26 and an 8-byte token at +28..+36 (echoed in later requests).
+   **The session RC5 key is the client's own nonce** —
+   `rc5_ctx_setkey(ctx+0xd8, ctx+156, 32)` runs immediately after a successful `certify`.
+
+So: `LIST_REQUEST` → `LIST_RESP` (relays) → `certify` (session key) → `init_info` → `GDM`
+(camera LAN IPs) → KCP/AV. **The first two are done; `init_info`/`GDM` is the next gate.**
+
+> Practical consequence: because the relay IPv4/port now sit at known offsets
+> (`frame + 32 + i*36`), the redirect trick can be aimed at the **relay** too — rewrite those
+> 4 bytes and the app dials the Mac instead of AWS. That is the fallback if `init_info`/`GDM`
+> proves hard to read statically.
+
 ### The strategic fork (revisited)
 
 Option **(A)** just got substantially cheaper — it is no longer blind. See `P2P_PROTOCOL.md`
 §11 for the updated risk assessment:
 
-- **(A) Keep going pure-Python** — [OK] `LIST_REQUEST`/`LIST_RESP` **done**. Next: decode the
-  `LIST_RESP` payload → GUTES `certify` → `init_info` → `GDM` → KCP → AV.
+- **(A) Keep going pure-Python** — [OK] `LIST_REQUEST`/`LIST_RESP` **done**.
+  [OK] `certify` **done** (frame format + session key). Next: `init_info` → `GDM` → KCP → AV.
   Now has a byte-level oracle for anything the app sends.
 - **(B) Drive Gwell's own SDK** — obtain a Linux/x86 build of `libiotvideo` and call it from
   Python via ctypes with the `accessId`/`accessToken` we already have. Turns it into a glue job.
@@ -64,8 +88,12 @@ wyze-re/
 ├── uber-apk-signer.jar
 ├── wire/                              # captured LIST_REQUEST/LIST_RESP + README (ground truth)
 ├── listreq.py                         # byte-exact LIST_REQUEST builder (checksum + RC5-32/6/8)
+├── decode_lr.py                       # LIST_RESP payload decoder (prints the 4 relays)
 ├── probe_real.py                      # sends our packets to the real server, prints responses
 ├── cap_listsrv2.py                    # UDP+TCP list-server impersonator (app redirect target)
+├── disfn.py                           # annotated disassembly reader: disfn.py <start> <end> [--calls|--fields]
+├── fieldmap.py                        # r11-relative access → record offset (gave §3a's layout)
+├── mkplt.py                           # rebuild PLT stub → symbol map from objdump -R
 ├── wyze_token.json  wyze_devices.json
 ├── cdp_*.py  grab_*.py  watch_*.py  nav*.py  live_capture.py  clear_session.py  # capture scripts
 ├── auth_login.html  auth_url.txt  oauth_code.txt  pkce*.txt  pkce*.json  sp_secure.xml
@@ -87,23 +115,34 @@ wyze-re/
 9. Docs written with [OK]/[X] verdict board; files consolidated into `wyze-re/`.
 
 ## [X] Key open problems (in priority order)
-1. **How to get frames out.** Two candidate routes — **decide next**:
-   - **(A) APK frame-tap** *(lower risk)* — inject smali at
-     `MediaCodecVideoDecoder.send_packet(AVData)` (encoded H.264/H.265) + capture SPS/PPS from
-     `onReceiveChangedAVHeader`, label camera via `IoTVideoPlayer.setDataResource(deviceId,…)`; rebuild
-     with `apktool b` → `uber-apk-signer` → `adb install -r` (keeps login); app already streams all 4
-     cams simultaneously. *Caveat: needs the phone app running.*
-   - **(B) Native harness** *(better end-state)* — C binary, built `armv7a-linux-androideabi21-clang`,
-     run **via `run-as com.hualai`** (shell can't read app libs), `dlopen` the SDK's `iv_*` API, pull
-     frames independently of the app. Needs the `iv_*` signatures reversed.
-   - **(C) Pure-Python LAN client** *(highest effort/risk)* — must first crack UDP broadcast
-     discovery (§4.7) + the TCP/MTP handshake; no packet capture available to shortcut it.
-2. [?] **UDP broadcast discovery**: port + packet magic + response format (needed for C; also gives the
-   dynamic LAN port). `broadcast.c` strings located, function bodies not yet reversed.
-3. [?] **Who populates `tid_key_map`** (origin of the per-device TID).
-4. [?] **POST `Signature2`** content rule — blocked on runtime-injected `cg01_f3c397620f853b12` secret.
-5. [?] Confirm frame format (encoded vs decoded) at each tap point empirically.
-6. Wire frames → `ffmpeg` → HLS/WebRTC → browser UI (grid of 4), into `wyze-cam-stream/server.py`.
+
+> Routes A and B were **eliminated -- deliberate scope cut** (see DECISION below) — the old "decide
+> between A/B/C" list is retired. Route C is the only live path, and its first two stages are
+> done, so the list starts where the work now actually is.
+
+1. **`init_info` → `GDM_JDAT_RPT`** — reverse `gat_send_init_info_msg` (`0x3eac4`),
+   `gat_rcv_init_info_msg_resp` (`0x46960`), `gat_on_rcvpkt_GDM_JDAT_RESP` (`0x44a14`) and
+   `gat_on_rcvpkt_GDM_JDAT_REQ` (`0x43790`). This layer carries the `did ↔ TID` map and the
+   cameras' LAN IPs. **This is the current gate.**
+2. **How `certify_req` is actually dialled** — transport to the relay (TCP or UDP) and the
+   byte-exact finalizer for type `0x0c` (checksum + RC5 over `[24:…]`). Assumed to follow
+   §4/§5; not yet byte-verified because there is no `certify` capture.
+3. **KCP configuration + AV channel framing**, then H.264/H.265 extraction.
+4. **Auth to the camera** — `accessId`/`accessToken` vs a LAN password
+   (`iv_check_set_lan_device_pwd` / `giot_eif_send_check_lan_pwd`, unreversed).
+5. [?] POST `Signature2` content rule — blocked on runtime-injected
+   `cg01_f3c397620f853b12` secret (only needed to refresh tokens).
+6. Wire frames → `ffmpeg` → HLS/WebRTC → browser UI (grid of 4), into
+   `wyze-cam-stream/server.py`.
+7. `d_real` provenance (§3a) — worked around by hardcoding; not understood.
+
+### Retired / superseded (kept so nobody re-opens them)
+- [X] *APK frame-tap (Route A)* — needs the phone app running. User vetoed.
+- [X] *Native harness on the phone (Route B)* — phone must not be involved. User vetoed.
+- [X] *UDP broadcast discovery as a gateway step* — superseded. The cameras are reached via the
+  relay → KCP path, and their LAN IPs are handed to us by the relay (`GDM_JDAT_RPT`), not
+  discovered locally. The app *binds* `:8900` to receive but sends discovery to **IPv6
+  multicast ff02::1**, which our IPv4 listener never saw (verdict D17).
 
 ## DECISION (locked, from user)
 > **"I do not want an app running. I want to run a webserver, log in, and see all
@@ -112,38 +151,34 @@ wyze-re/
 - **Route A (in-app frame-tap) is ELIMINATED** — it needs the phone app running/streaming.
 - **Route B (native harness on the phone) is ELIMINATED** — the phone must not be involved.
 - **Chosen: Route C — pure-Python P2P client running on the Mac.** The Mac is already on
-  the camera LAN (`192.168.77.13`, cams at `192.168.0.x`), so it talks to the cameras
-  **directly over the LAN**. **The phone is completely uninvolved** — not even plugged in.
-- Cost: the whole LAN wire protocol must be reversed from static RE of
-  `lib/armeabi-v7a/libiotp2pav.so`. **No packet capture is available** (tcpdump needs sudo;
-  device not rooted) → there is no ground-truth wire log. Everything comes from disassembly.
+  the camera LAN (`192.168.77.13`, cams at `192.168.0.x`). **The phone is uninvolved at
+  runtime** — it is only used as an RE oracle (logcat, screenshot, tap).
+- Target: portable Python 3 + sockets, no macOS-specific code, runs unchanged on Windows.
+  RE tooling stays Mac-only.
 
-### Route C build order
-1. **UDP broadcast discovery** — find the destination port, request magic, and the response
-   format (must yield the camera's LAN **IP + service port + dev_id**). Gateway step; nothing
-   else works until this is solved.
-2. **TCP session + MTP/GUTES framing** — handshake + certify (`iv_gutes_*`, `iv_init_frm_*`).
-3. **Auth** — how `accessId`/`accessToken` (or a LAN password) is proven to the camera.
-4. **AV stream** — channel setup (`iv_init_frm_AvStreamCtl`, `iv_rcvpkt_AVSTREAMCTL_*`),
-   then H.264/H.265 frame extraction.
-5. Python client → `ffmpeg` → HLS/WebRTC → browser grid of 4 → wire into
-   `wyze-cam-stream/server.py`.
+### Route C build order — where each stage stands
 
-[!] **Known risk for B:** the per-device `accessToken` has a **7-day TTL**
+| # | Stage | Status |
+|---|---|---|
+| 1 | `LIST_REQUEST` / `LIST_RESP` → relay list | [OK] **DONE** — byte-exact builder, real server answers, payload decoded (§3, §3a) |
+| 2 | GUTES `certify` → session key | [OK] **DONE** — frame format + `rc5_ctx_setkey(nonce, 32)` (§5a) |
+| 3 | `init_info` → `GDM_JDAT_RPT` (did↔TID, camera LAN IPs) | [X] **CURRENT GATE** |
+| 4 | Relay dial: transport + byte-exact type `0x0c` finalizer | [~] assumed from §4/§5, unverified |
+| 5 | KCP config + AV channel framing → H.264/H.265 | [ ] not started |
+| 6 | Auth to camera (`accessToken` vs LAN password) | [ ] not started |
+| 7 | Python client → `ffmpeg` → HLS/WebRTC → browser grid of 4 → `server.py` | [ ] not started |
+
+**Ground-truth tooling for stages 3–4:** redirect `GWApi.GWellP2PUrl` to the Mac
+(`P2P_PROTOCOL.md` §3a recipe) to capture anything the app originates; to capture the
+*relay* conversation too, rewrite `LIST_RESP` `record+0`/`record+24` (frame offsets
+`32 + i*36`) to point at the Mac and relay traffic back.
+
+[!] **Token durability:** the per-device `accessToken` has a **7-day TTL**
 (`expireTime≈1792441xxx`) and refreshing it needs `POST plugin/mars/v2/regist_gw_user/`,
 whose signing secret `cg01_f3c397620f853b12` is **unknown** ([~] — see `SECRETS.md` §C).
 So a *durable* solution needs either that POST cracked, or the SDK's own
 `IoTVideoSdk.nativeUpdateToken` reused. Worth flagging: tokens harvested from
 logcat buy ~7 days of operation.
-
-## Immediate next action — Route B build order
-1. Reverse the `iv_*` C API: init config struct, register(accessId, accessToken),
-   `iv_start_av_link`, and the **frame-delivery callback** (encoded H.264/H.265).
-2. Decide harness level: raw `iv_*` (`libiotp2pav.so`) vs C++ `IoTVideoPlayer` (`libiotvideo.so`).
-3. Build with `armv7a-linux-androideabi21-clang`; run **via `run-as com.hualai`**
-   (plain `shell` cannot read `/data/app` libs).
-4. Emit raw Annex-B H.264 per camera over a TCP socket / pipe → Mac `ffmpeg` → HLS/WebRTC
-   → browser grid of 4 → wire into `wyze-cam-stream/server.py`.
 
 ## Standing constraints (don't forget)
 - Credentials only in browser UI; server must not store email/password.

@@ -406,6 +406,100 @@ Related symbols: `rc5_ctx_new 0x64994`, `rc5_ctx_free 0x64ae8`, `rc5_ctx_setkey 
 
 ---
 
+## 5a. GUTES `certify` — how the session key is agreed [CONFIRMED — disassembled]
+
+This is the layer right after `LIST_RESP`: the app dials a relay from §3a and runs `certify`
+to get a session, then `init_info` → `GDM`. Two functions give the whole exchange away.
+
+### `iv_gutes_start_active_certify_req(ctx)` @ `0x31ed8`
+
+Same `pkt` wrapper as before — `calloc(1, 0x268)`, 608 B zeroed, then
+**`frame = pkt + 400`** (the identical 400-byte header seen in `LIST_RESP`). It then writes:
+
+```
+frame+0    0x7f
+frame+1    0x0c            <- type 12 = certify_req
+frame+2    u16 LE  64      <- total_len (grows, see TLVs below)
+frame+4    u32   } terminal id, from ctx+0x240 / ctx+0x244
+frame+8    u32   }         <- same two words as LIST_REQUEST[4:12]
+frame+12   (untouched here — the common finalizer owns the checksum)
+frame+20   u32 = 0x01410000   flag/ver word, built by three mask/orr steps:
+             bits16-17 = ctx->field_0x94 & 3        (1 on the first call)
+             bit22     = 1
+             bit24     = 1
+frame+24   u16 flags     bit0 = "extended tail",  bit2 = "append 8-byte token"
+frame+26   u16           (left 0 in the request; it is the *error code* in the response)
+frame+28   u32 = giot_hash_string(nonce, 32)     <- hash of the PLAINTEXT nonce
+frame+32   32 B nonce, then RC5-encrypted in place:
+             for i in 0..1: rc5_ctx_enc(ctx->rc5_B /*ctx+0xdc*/, frame+32+i*16, 16)
+```
+
+The nonce itself:
+
+```
+if (time_adj != ctx->field_0x98) {          // cache it; only regenerate when it changes
+    ctx->field_0x98 = time_adj
+    iv_getRandomValue(ctx+156, 32)           // 32 random bytes live at ctx+156
+}
+memcpy(frame+32, ctx+156, 32)
+```
+
+`time_adj` comes from `time(NULL)` fed through an unnamed helper @ `0xb794c` with a second
+argument of `0x1c20` = **7200** — i.e. a UTC+2 (local) offset. **[OPEN]** exactly what that
+helper is, but it only feeds the cache key, so it does not affect the wire bytes.
+
+**Optional tail TLVs** (each one both sets a bit in `frame+24` and grows `total_len`):
+
+| condition | bit set | bytes appended | len delta |
+|---|---|---|---|
+| `cfg->field_0xd4 >= 556` | `frame+24` bit0 | `cfg+0xd4..0xd7` (4 B) at `frame+64+off` | +4 |
+| `cfg->field_0xde8 \| cfg->field_0xdec != 0` | `frame+24` bit2 | `cfg+0xde8..0xdef` (8 B) | +8 |
+
+The second one is the **echo of the token the server handed back in `certify_resp`** (below) —
+so it is absent on the very first `certify` and present on every later one.
+
+Finally `iv_gutes_add_send_pkt(ctx, pkt, &{cmd=3, timeout=30, ?=0, ?=3}, …)` and
+`ctx->field_0xc0 = 1` (state = waiting).
+
+### `gutes_on_respfrm_certify_resp(arg0, arg1, arg2, arg3)` @ `0x32bb0`
+
+`arg2` is the response packet — again read as `arg2 + 400` = the frame. `arg3` is a status
+code: **`arg3 == 2` means failure** (it logs, clears `ctx->field_0xc0`, clears bit1 of
+`cfg->field_0x1c`, bumps a counter at `cfg+0x14bc`, zeroes `cfg+5312` and returns).
+
+On the success path:
+
+| read | meaning |
+|---|---|
+| `u16 frame[+26]` | **error code** — non-zero ⇒ log + `ctx->field_0xc0 = 0` and stop; `3` is a special "fatal" case that also invokes a callback through `cfg+0x1124` and sets `cfg+0xde0 = 1` |
+| `u16 frame[+24] & 1` | if set ⇒ `cfg+0xdf2 = 1` |
+| `u32 frame[+28]` → `cfg+0xde8` | \  the 8-byte token echoed in later requests |
+| `u32 frame[+32]` → `cfg+0xdec` | / |
+
+then, critically:
+
+```
+rc5_ctx_setkey(ctx+0xd8, ctx+156, 32)     //  <-- THE SESSION KEY
+ctx->field_0x94 = 2
+ctx->field_0xc0 = 2   (state = certified)
+gat_send_init_info_msg(ctx)               // 0x3eac4, next message in the chain
+```
+
+> ### The key exchange, in one sentence
+> The client makes up **32 random bytes** (`iv_getRandomValue`), sends them inside
+> `certify_req[32:64]` RC5-encrypted under the **header-derived key** (§5), keeps a copy at
+> `ctx+156`, and on a successful `certify_resp` installs that same 32-byte value as the RC5
+> key for everything that follows — `rc5_ctx_setkey(ctx, nonce, 32)`.
+> So GUTES session traffic is RC5 with a **32-byte key = the client nonce**, while the
+> `LIST_*` and `certify_req` frames use the **8-byte header key**. Same `rc5_ctx_setkey`
+> routine, different key length ⇒ RC5-32/6/**256** rather than /6/8.
+
+**Chain so far:** `LIST_REQUEST` → `LIST_RESP` (relays) → TCP/UDP to a relay →
+`certify_req`(type 0x0c) → `certify_resp` (session key installed) → `init_info` →
+`GDM_JDAT_RPT` (camera LAN IPs) → KCP/AV.
+
+---
+
 ## 6. Transport [CONFIRMED]
 
 - **KCP over UDP.** Steady state emits `iv_cal_kcp_rate sta_cur->real_snd=… resend_frm=0
@@ -525,6 +619,9 @@ LAN discovery
 | C33 | **[DISASSEMBLED]** `LIST_RESP` records start at **frame+32, stride 36**; `count = (total_len-32)/36` — exact fit (4×36) |
 | C34 | **[DISASSEMBLED]** record = `IPv4@0 (BE) | IPv6@4 (16B) | kind@20 | srv_id@22 (LE) | port1@24 | port2@26 | port3@28 | port4@30 (all BE)` |
 | C35 | **[WIRE+LOGCAT]** Layout cross-verified: record 0 decodes to `3.13.212.24:28800 srv_id=49`, exactly the phone's live `iv_addRmtP2pSrv` line |
+| C36 | **[DISASSEMBLED]** `certify_req` = type `0x0c`, 64 B header+body: flags word `0x01410000` @+20, `hash(nonce)` @+28, **32-B RC5 nonce @+32** |
+| C37 | **[DISASSEMBLED]** `certify_resp` reports `u16 errcode` at `+26` and an **8-byte token** at `+28..+36`, echoed in later requests by `frame+24 bit2` |
+| C38 | **[DISASSEMBLED]** **The GUTES session RC5 key = the client's own 32-byte nonce** — `rc5_ctx_setkey(ctx+0xd8, ctx+156, 32)` right after a successful `certify` |
 
 ---
 
@@ -541,9 +638,12 @@ LAN discovery
   app builds and sends. It also means we are no longer limited to "did the server answer".
 
 **Still hard:**
-- the whole GUTES `certify` → `session_id` → `init_info` → `GDM` layer (next up — the
-  builders are `iv_gutes_start_active_certify_req` @ `0x31ed8`, `gat_send_init_info_msg` @
-  `0x3eac4`, `gat_rcv_init_info_msg_resp` @ `0x46960`).
+- `init_info` → `GDM` layer (the builders are `gat_send_init_info_msg` @ `0x3eac4`,
+  `gat_rcv_init_info_msg_resp` @ `0x46960`, `gat_on_rcvpkt_GDM_JDAT_RESP` @ `0x44a14`,
+  `gat_on_rcvpkt_GDM_JDAT_REQ` @ `0x44aa4`) — this is what carries the camera LAN IPs.
+- Which transport the relay dial actually uses (TCP? UDP?) and the exact `certify_req`
+  finalizer — the checksum + RC5 over `[24:…]` for type `0x0c` is assumed to follow §4/§5
+  but has not been byte-verified against a capture (no `certify` capture yet).
 - KCP configuration and the AV channel/frame protocol, then H.264/H.265 extraction.
 - `d_real` provenance (§3a) — worked around by hardcoding, not understood.
 - **[OPEN]** whether the server will accept a *different* terminal ID than this install's
