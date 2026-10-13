@@ -75,11 +75,23 @@ Full write-up in [`P2P_PROTOCOL.md`](./P2P_PROTOCOL.md) **§5e**. Headlines:
 6. **Session lifecycle mapped**: `iv_on_rcv_calling` → `iv_mtp_session_new` → `iv_create_kcb`
    ×2 → `ivkcp_create(conv, 0)`; `ivkcp_update` runs from a 10 ms timer.
 
-**Next gate: making KCP actually start.** The camera answers our control frames and its
-session/`session+0x10` provably match ours, but **no `C0 10` packet has ever come back**, so
-`WASK → WINS` fails. Two suspects left, in order: `session+0x330/0x334` still NULL because
-`iv_create_kcb`'s channel-array lookup only accepts channel **type 135/136**; or
-`ivkcp_update` not running yet for this session. Then `AVSTREAMCTL` → H.264/H.265.
+**Next gate: the relay rendezvous (`gat` layer) — not the LAN handshake.**
+
+**Why the LAN route is a dead end for KCP (solved 2026-10-13, [`P2P_PROTOCOL.md`](./P2P_PROTOCOL.md) §5f):**
+`kcb->output` — a *static* function at `0x5c1d8` that `objdump` mislabels
+`iv_create_kcb+0x16c` — round-robins the session's channel pool and **only accepts
+channel type 135**. Type-135 channels are created by exactly one function,
+`gat_on_rcvpkt_MTP_RES_RESPONSE` (the relay rendezvous). LAN calling only ever adds
+types **1/2**. So the camera receives our KCP segments, buffers them, wants to answer —
+and then **discards every outgoing segment** because it has no relay channel. That is
+why not a single `C0 10` packet has ever come back, and it is *not* a bug in
+`p2p_call.py`.
+
+**So the remaining work is the relay route, and we already hold every card for it:**
+the `accessId` + per-device `accessToken` from `regist_gw_user` (§1), the relay
+endpoints from `LIST_RESP` (§3), and `cap_relay.py`, which already MITMs the app's
+entire relay dialogue end-to-end. Replay the `gat`/`MTP_RES` dialogue from the Mac the
+same way `p2p_call.py` replayed the LAN frames. Then `AVSTREAMCTL` → H.264/H.265.
 
 > [!] **The smali patch made our Mac the only list server.** Experiments now *require*
 > `cap_relay.py`; with it off the app gets no list at all (GDM = 0).
@@ -176,6 +188,8 @@ wyze-re/
 ├── mtp_frame.py                       # the 0xc0 MTP codec: header, chval, packet-class bit (§5e)
 ├── analyze_calls.py                   # decodes every captured frame (RC5 key rule)
 ├── find_fields.py  find_fields2.py     # session+0x1c..+0x28 tracker (negative result, kept)
+├── resolve_cb.py                      # resolves PC-relative callback literals -> static fns (§5f, §8)
+├── dump_frames.py                     # freezes /tmp/forge_in_*.bin -> wire/p2p_frames.json
 ├── netdump.sh                         # decode /proc/net/* for sockets to the camera LAN IPs
 ├── decode_lr.py                       # LIST_RESP payload decoder (prints the 4 relays)
 ├── probe_real.py                      # sends our packets to the real server, prints responses
@@ -211,13 +225,16 @@ wyze-re/
 > between A/B/C" list is retired. Route C is the only live path, and its first two stages are
 > done, so the list starts where the work now actually is.
 
-1. **Making the camera's KCP start** — every other gate on this layer is passed: our
-   `C0 90` control frames are acked, the session is created, `session+0x10` provably matches,
-   the `0x25` reaches `iv_rcv_kcp_create_msg` (which by design replies with nothing). But
-   **no `C0 10` packet has ever come back**, so `WASK → WINS` fails. Suspects, in order:
-   (a) `session+0x330/0x334` NULL because `iv_create_kcb` only creates a kcb when it finds a
-   channel of **type 135/136** in the `session+0x378` array; (b) `ivkcp_update` not running.
-   Then `iv_rcvpkt_AVSTREAMCTL_ACCEPT` (over KCP) → `gute_recv_fragment` (MTU 1032) → zlib →
+1. **The relay rendezvous (`gat` / `MTP_RES`)** — [OK] *diagnosed*, not yet built. Every
+   other gate on the LAN layer is passed (`C0 90` acked, session created, `session+0x10`
+   matches, `0x25` reaches `iv_rcv_kcp_create_msg`), but **KCP cannot run over LAN at all**:
+   `kcb->output` (`0x5c1d8`) accepts only channel **type 135**, which only
+   `gat_on_rcvpkt_MTP_RES_RESPONSE` creates; LAN calling adds only types 1/2. Full proof in
+   §5f, and the earlier "`iv_create_kcb` is the gate" belief is recorded as **disproved (D24)**
+   — same conclusion, wrong mechanism. **Work to do:** speak the relay protocol from the Mac
+   using the `regist_gw_user` creds (§1) + the endpoints from `LIST_RESP` (§3), replaying the
+   app's dialogue that `cap_relay.py` already captures. Then
+   `iv_rcvpkt_AVSTREAMCTL_ACCEPT` (over KCP) → `gute_recv_fragment` (MTU 1032) → zlib →
    `start_av_enc_dec AudioType=5 VideoType=0` → H.264/H.265. **This is the current gate.**
 2. ~~**The LAN calling handshake**~~ — [OK] **solved.** The bytes were recovered by capturing the
    app's frames and replaying them straight at the camera; see §5e for the layouts of the
@@ -265,7 +282,7 @@ wyze-re/
 | 3 | `init_info` → `GDM_JDAT_RPT` (did↔TID, camera LAN IPs) | [OK] **DONE live** — `online_cnt=4`, `did↔wyze_id`, per-cam LAN IP/MAC/ssid, through our own MITM (§5b, §5c) |
 | 4 | Relay dial: transport + byte-exact type `0x0c` finalizer | [OK] **DONE live** — UDP **and TCP** both relayed; `certify`/`init_info`/`GDM` complete against our Mac. `Detect` 0x01/0x02 formats captured (§5b). Type `0x0c` bytes still not byte-verified. |
 | 4b | **LAN discovery → camera P2P port** | [OK] **DONE standalone** — `discover.py`, all 4 cameras in 3 s, no app, no phone (§5d) |
-| 5 | LAN calling handshake + KCP config + AV channel framing → H.264/H.265 | [~] **Handshake replayed from the Mac** — all three outbound frames replayed, camera acks both, MTP layer + command table + KCP wire format reversed (§5e). **Blocked on the camera starting KCP** (no `C0 10` packet yet). Left: unblock KCP, KCP config, framing/codec extraction |
+| 5 | LAN calling handshake + KCP config + AV channel framing → H.264/H.265 | [~] **Handshake replayed from the Mac; LAN route now proven a dead end for KCP.** All three frames replayed, camera acks both, MTP + command table + KCP wire format reversed (§5e). **Root cause of the missing KCP found (§5f): KCP output only emits over a type-135 *relay* channel, which only `gat_on_rcvpkt_MTP_RES_RESPONSE` creates.** Next: the relay `gat`/`MTP_RES` dialogue |
 | 6 | Auth to camera (`accessToken` vs LAN password) | [ ] not started |
 | 7 | Python client → `ffmpeg` → HLS/WebRTC → browser grid of 4 → `server.py` | [ ] not started |
 

@@ -11,6 +11,22 @@ have never seen the camera's reply.  This tool removes the phone entirely:
     send      ->  the app's own frames    (captured by forge_call.py)
     receive   ->  whatever the camera says
 
+[!]  LIMIT, PROVEN 2026-10-13 - DO NOT KEEP DEBUGGING THIS PATH FOR VIDEO
+-----------------------------------------------------------------------
+The control plane here is COMPLETE and correct: the camera acks the CALLING and
+the AvStreamCtl, and its session+0x10 provably matches ours.  But **KCP will
+never start over plain LAN**, on either side.  kcb->output (a static at
+0x5c1d8 that objdump mislabels iv_create_kcb+0x16c) round-robins the session's
+channel pool and only accepts channel **type 135** - and type-135 channels are
+created by exactly one function, gat_on_rcvpkt_MTP_RES_RESPONSE, i.e. by the
+**relay rendezvous**.  LAN calling only adds types 1/2.  So the camera eats our
+WASK, wants to answer WINS, and then throws the answer away.
+
+`--kcp` is therefore kept as a *negative* control, not a path to video.  The
+video route goes through the relay (see P2P_PROTOCOL.md 5f and STATUS.md).
+Keep this tool: it is the byte-exact proof of everything above, and the
+discovery + frame-replay machinery is reusable.
+
 The three frames the app sends, in order (P2P_PROTOCOL.md 5e):
 
     74 B  c0 90 02 09   cleartext session hello: d_log + TID + tick

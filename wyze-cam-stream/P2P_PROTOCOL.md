@@ -949,11 +949,10 @@ chk_new = chk_tmpl ^ fold_tmpl[24:] ^ fold_new[24:]      (BE u32 words)
 
 ### [!] Still open on this layer
 
-* **KCP never starts.** `C0 90` control frames are answered, the session is
-  created, `session+0x10` matches — but no `C0 10` packet has ever come back,
-  so `WASK → WINS` fails. Remaining suspects, in order: `session+0x330/0x334`
-  still NULL because the channel-array type-135 lookup in `iv_create_kcb` finds
-  nothing; or `ivkcp_update` not yet running for this session.
+* ~~**KCP never starts.**~~ → [OK] **Explained. See §5f.** It is not a bug in our
+  bytes: the camera's KCP output callback only ever transmits over a
+  **type-135 UDP-relay channel**, and that channel only exists after a relay
+  rendezvous. Pure LAN calling can never carry KCP.
 * `iv_send_av_stream_ctl_frm` has not been shown to emit over GUTES vs KCP;
   `iv_rcvpkt_AVSTREAMCTL_ACCEPT` is definitely reached from
   `iv_on_rcv_kcp_cmdfrm` (`0x58008`, called by `iv_rcv_tlvfrm` `0x628e8`), so
@@ -964,11 +963,169 @@ chk_new = chk_tmpl ^ fold_tmpl[24:] ^ fold_new[24:]      (BE u32 words)
 * Discovery-reply checksum rule still unknown (sidestepped with identical
   clones).
 
+---
+
+## 5f. Why KCP never starts — the type-135 relay channel  [SOLVED — DISASSEMBLED]
+
+This was the last "why is the camera silent?" question on §5e, and the answer is
+**architectural, not a mistake in our bytes**. It redirects the whole strategy, so read this
+before touching `p2p_call.py`.
+
+### The short version
+
+> **KCP output is hard-wired to a *relay* channel (type 135). The type-135 channel is created
+> by exactly one function — `gat_on_rcvpkt_MTP_RES_RESPONSE`. So without a relay rendezvous,
+> `kcb->output` finds nothing, returns `-1`, and the camera drops every KCP segment on the
+> floor, silently. That is why we have never seen a single `C0 10` packet.**
+
+Our LAN replay is therefore doing everything right — the camera *did* get our `WASK`, *did*
+set `probe |= 2`, *did* want to answer `WINS` — and then threw the answer away.
+
+### The evidence, step by step
+
+**1. `iv_create_kcb` is *not* the gate — it always succeeds.**
+
+It ends at `0x5c1ac`:
+
+```
+0x5c0a0  ldr r0, [r11,#-0x10]      ; arg0
+0x5c0a4  mov r1, #0
+0x5c0a8  bl  ivkcp_create          ; ikcp_create(conv, user=0)
+...
+0x5c158  str lr, [r4,#0xfc]        ; kcb->output = local fn @0x5c1d8   <-- §below
+0x5c160  str r12, [lr,#0x104]      ; kcb->log    = local fn @0x5c3d0
+0x5c16c  str r1, [r2,#0xe8]        ; kcb->user   = arg1 (the session)
+0x5c184  bl  ivkcp_nodelay
+0x5c194  bl  0x5c43c               ; a second local helper
+0x5c1ac  pop {r4, r5, r11, pc}     ; return kcb
+```
+
+`0x5c1b0..0x5c1cc` is just the literal pool. The `return -1` and the type-135 loop people
+(including us, earlier) attribute to `iv_create_kcb` actually live in **a separate unexported
+function at `0x5c1d8`**. `objdump` labels it `iv_create_kcb+0x16c` because `nm` has no symbol
+for it — a classic mis-attribution trap: *objdump annotates with the nearest preceding
+exported symbol, so any static function inherits the previous one's name.*
+
+**2. That function at `0x5c1d8` IS the KCP output callback.**
+
+Confirmed by resolving the PC-relative literal pool:
+
+```
+kcb->output (+0xfc) = 0x5c1d8      # add lr,pc,lr @0x5c150 + word@0x5c1c4 (=0x80)
+kcb->log    (+0x104)= 0x5c3d0      # add r12,pc,r12 @0x5c148 + word@0x5c1c0 (=0x280)
+```
+
+`0x5c3d0` is the first byte after `iv_create_kcb`'s `pop` and before
+`iv_find_mtp_session_by_term_id @ 0x5c4e0` — i.e. another unexported static. Both resolve to
+real code starts.
+
+Its signature is the IKCP one: `output(buf, len, kcb, user)`, where `user` was set to the
+**session** in step 1.
+
+**3. The output callback round-robins a channel pool and only accepts type 135.**
+
+```
+0x5c1e8  str r0, [r11,#-0x8]                ; buf
+0x5c1ec  str r1, [r11,#-0xc]                ; len
+0x5c1f0  str r2, [r11,#-0x10]               ; kcb
+0x5c1f4  str r3, [r11,#-0x14]               ; user = the session
+0x5c1f8  ldr r0, [r11,#-0x14]
+0x5c1fc  str r0, [r11,#-0x18]               ; base = session
+0x5c204  add r1, r0, #300                   ; base + 0x12c
+0x5c208  ldr r0, [r0, #0x48c]               ; idx = session->0x48c
+0x5c20c  add r0, r1, r0, lsl #2
+0x5c210  ldr r0, [r0]
+0x5c214  str r0, [r11,#-0x1c]               ; ch = pool[idx]
+0x5c220  ldr r1, [r0, #0x48c]
+0x5c224  add r1, r1, #1
+0x5c228  str r1, [r0,#0x48c]                ; idx = (idx + 1)
+0x5c230  cmp r0, #128
+0x5c238  blt 0x5c248                        ; 128-entry pool, wrapping
+...
+        if (ch == 0)   continue
+        if (ch->0x10 != 135) continue      ; 0x5c2f8  ldrb r1,[r1,#0x10] / 0x5c2fc cmp r1,#135
+...
+0x5c340  movw r0, #0x0
+0x5c344  ldr  r1, [r11,#-0x1c]             ; ch
+0x5c348  cmp  r0, r1
+0x5c34c  bne  0x5c360                      ; found -> send
+0x5c350  mvn  r0, #0                       ; <-- NO CHANNEL: return -1, send nothing
+0x5c37c  bl   iv_mtp_chnnel_send_mtp_frm   ; (ch, buf, len, flag=0) -> C0 10
+```
+
+`flag = 0` is exactly the `C0 10` KCP class from §5e. So a found type-135 channel is what
+turns a KCP segment into an actual datagram.
+
+**4. Channel types 1, 2 and 135 all live in the *same* session pool.**
+
+```
+iv_mtp_session_add_udp_relay   0x5e5e4   -> 0x5e738  movw r0,#0x87   (135)
+iv_mtp_session_add_tcp_relay   0x5f500   -> 0x5f840/0x5f954  (135/136)
+iv_mtp_session_add_lan_or_nat  0x5ffcc   -> type = its arg1
+```
+
+Both the relay and the LAN builders register in the **same** place —
+`session+0x374` (count) and `session+0x378` (pointer array), the very array the output
+callback walks:
+
+```
+iv_mtp_session_add_udp_relay :  0x5e7c8 ldr r0,[r0,#0x374] ... 0x5e7ec str lr,[r2,#0x374]
+iv_mtp_session_add_lan_or_nat:  0x601c4 ldr r0,[r0,#0x374] ... 0x601e8 str lr,[r2,#0x374]
+```
+
+The LAN builders pass a *small* type: `1` (`0x4bd4c`, `session+76`), `2` (`0x4d474`, the
+incoming sockaddr when `sin_family == 2`). **`iv_create_kcb`'s predecessor check at `0x4d458`
+is literally `ldrh r0,[r0,#16]; cmp r0,#2` — an `AF_INET` test.** So LAN calling can only ever
+add type 1/2 channels.
+
+**5. Only the relay creates type 135.**
+
+```
+$ grep "bl.*0x13800"   # PLT of iv_mtp_session_add_udp_relay
+0004bafc <gat_on_rcvpkt_MTP_RES_RESPONSE>:  4c944
+$ grep "bl.*0x137e8"   # PLT of iv_mtp_session_add_tcp_relay
+0004bafc <gat_on_rcvpkt_MTP_RES_RESPONSE>:  4c76c
+```
+
+`gat_on_rcvpkt_MTP_RES_RESPONSE @ 0x4bafc` is the **relay rendezvous response handler**. It
+parses the peer address the relay reports and hands it to `iv_mtp_session_add_udp_relay`.
+Before doing so it de-duplicates with `iv_find_udpNode_by_addr` (`0x4c904`).
+
+### What this means for the client
+
+* `p2p_call.py`'s LAN replay is **complete and correct for the control plane** — it will keep
+  getting `C0 90` acks forever, and it will **never** get KCP. Do not keep debugging it.
+* The kcb **is** created (`session+0x330` = `word & MASK`, `session+0x334` =
+  `word | 0x80000000`, see §5e) — so `iv_on_rcv_kcpdata_pkt` → `iv_find_mtp_session` →
+  `ivkcp_input` all work on the camera. The segment is consumed. It is the *reply* that dies.
+* **The relay is not optional.** It is the rendezvous that mints the type-135 channel; the
+  AV payload may still end up flowing LAN-direct after that (the channel's sockaddr is whatever
+  the relay reported, which on one subnet is the peer's LAN address), but you cannot get there
+  without it.
+* **Good news:** we already have everything the relay route needs — the `accessId` +
+  per-device `accessToken` from `regist_gw_user` (§1), the relay endpoints from `LIST_RESP`
+  (§3), and a full relay MITM (`cap_relay.py`) that already carries the app's dialogue
+  end-to-end. The next job is to replay the `gat`/`MTP_RES` dialogue from the Mac, exactly as
+  `p2p_call.py` did for the LAN frames.
+
+### Correction to earlier notes
+
+`iv_create_kcb` was previously described as "loops the channel array for type 135/136 and
+returns -1 if absent". That was **wrong**: the loop belongs to the static output callback at
+`0x5c1d8`. `iv_create_kcb` never fails and never looks at a channel. The *consequence* is the
+same (no type-135 channel ⇒ no KCP), but the mechanism is in the output path, which matters
+because it means the camera **accepts and buffers** our KCP segments regardless — it just can
+never emit.
+
+
 ## 6. Transport [CONFIRMED]
 
 - **KCP over UDP.** Steady state emits `iv_cal_kcp_rate sta_cur->real_snd=… resend_frm=0
   lost_ratio=0.000000` per channel and `ivkcp_interval/nodelay/wndsize/waitsnd` exist as API
   (`0x7c03c`…`0x7c1dc`).
+  > [!] **But KCP only ever runs over a *type-135 relay channel*** (§5f). LAN calling adds
+  > type 1/2 channels only, which `kcb->output` refuses. So "KCP over UDP" is true, yet a
+  > pure-LAN peer can never carry it.
 - **No TCP anywhere.** `adb shell cat /proc/net/tcp` on the phone while streaming shows **no**
   connection to any `192.168.0.x`; the only camera-adjacent sockets are UDP, and the app binds
   `0.0.0.0:8900` (uid 10086).
@@ -1028,11 +1185,24 @@ LAN call chain (what our client must reproduce next)
   iv_init_frm_CALLING         0x542c0   frame carries the *client's* lan_ipv4
   iv_process_calling          0x545f8   reads ctx+0x22c (cam IPv4), ctx+0x230 (cam port, strh)
   iv_mtp_session_add_lan_or_nat 0x5ffcc  logs "lan dstAddr:<ip> port:<p>"
+                                          type = arg1; LAN sites pass 1 or 2
+  iv_mtp_session_add_udp_relay  0x5e5e4  *** creates channel type 135 ***
+  iv_mtp_session_add_tcp_relay  0x5f500  *** creates channel type 135/136 ***
+  gat_on_rcvpkt_MTP_RES_RESPONSE 0x4bafc *** ONLY caller of both add_*_relay ***
+                                          -> the relay rendezvous (see 5f)
   gutes_on_ackfrm_Lan_Calling 0x5456c
   iv_on_ackfrm_Calling        0x54e24
   iv_mtp_session_new          0x5da08
   iv_mtp_kcp_create           0x61798   <-- KCP session
-  iv_create_kcb               0x5c06c   <-- KCP control block
+  iv_create_kcb               0x5c06c   <-- KCP control block; ALWAYS succeeds
+                                          (ends 0x5c1ac, no channel check)
+  [static] kcb->output        0x5c1d8   *** THE GATE *** round-robins
+                                          session->0x12c[idx] (128 entries,
+                                          counter at +0x48c); accepts ONLY
+                                          channel type 135, else returns -1
+  [static] kcb->log           0x5c3d0
+  iv_mtp_chnnel_new           0x59ea8   (session, type_byte, sockaddr)
+  iv_mtp_chnnel_send_mtp_frm  0x5b148   dispatch on ch->0x10; flag=0 -> C0 10
   iv_init_frm_AvStreamCtl     0x53274
 ```
 
@@ -1061,6 +1231,15 @@ LAN call chain (what our client must reproduce next)
   *Flag:* the app takes ~45 s to reach the home screen, so the listener must outlive it.
 - `uber-apk-signer` flag is `--ksKeyPass` (not `--keyPass`); `adb install` of a 244 MB APK
   needs ~1 GB free — run `adb shell pm trim-caches 4G` first.
+- **[!] `objdump` annotates every address with the nearest *preceding* exported symbol**, so
+  any unexported static function is silently reported as `prevSymbol+offset`. This bit us:
+  `0x5c1d8` is a distinct function (a `push {r11, lr}` immediately after the previous one's
+  literal pool) that `objdump` insisted was `iv_create_kcb+0x16c`, and we built a whole wrong
+  theory on it. **Rule: treat a `bl 0x????` target as a real function boundary even when
+  `objdump` names it `+something`, and confirm with the literal pool + the `pop {…, pc}`.**
+  To resolve a PC-relative callback, read the literal word `w` and compute
+  `target = (add_instruction_addr + 8) + word`. Use **`resolve_cb.py`** for this
+  (`--pool` dumps a literal pool, `--sym` names an address).
 - **The `execute` harness kills a PTY that goes silent** — long-running listeners need a
   heartbeat print or a large `idle_timeout_ms`. Also `normalization.ports` masks port numbers
   in output unless disabled, and `terminal.columns × (rows+scrollback) ≤ 1,000,000`.
@@ -1080,6 +1259,7 @@ LAN call chain (what our client must reproduce next)
 | D21 | Camera P2P port might live in `ProReadonly.netInfo`, the GDM blob, the relay frames, or be NAT-mapped back by the relay | **All false.** It is advertised by the camera over **UDP/8899 discovery, reply offset 44** (§5d). |
 | D22 | Sniffing `0.0.0.0:8900` proves discovery is not IPv4 | **False methodology.** The bind port and the destination port differ. Always ICMP-probe first (8900 closed, 8899 open) before concluding a protocol is absent. |
 | D23 | The advertised P2P port changes between runs | **False so far.** `.217→59239` and `.169→63011` reproduced byte-identically across an app restart and independent probes (cameras not rebooted). |
+| D24 | `iv_create_kcb` is the KCP gate — it loops the session's channel array for **type 135/136** and returns `-1` when it finds none, so `session+0x330/0x334` must be NULL | **Wrong function, right conclusion.** `iv_create_kcb` ends at `0x5c1ac` and never inspects a channel — it always succeeds. The type-135 loop belongs to an **unexported static at `0x5c1d8`, which is `kcb->output`**, mislabelled by `objdump` as `iv_create_kcb+0x16c`. The consequence stands: no type-135 channel ⇒ `kcb->output` returns `-1` ⇒ **every KCP segment the camera produces is silently discarded** (§5f). The kcb itself is fine, and so is everything `p2p_call.py` sends. |
 
 ## 10. Confirmed today
 
