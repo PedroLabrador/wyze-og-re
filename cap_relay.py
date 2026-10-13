@@ -8,11 +8,18 @@ cap_listsrv2.py: instead of just *logging* the LIST_REQUEST, it
 
   1. forwards the request to the genuine list server,
   2. takes the real LIST_RESP, RC5-decrypts it,
-  3. rewrites every relay record's IPv4 (record+0) and port (record+24) to THIS Mac,
-  4. re-checksums, re-encrypts, and hands the modified response back to the app,
-  5. then listens on the relay port and forwards the app's UDP traffic to the real
-     relay (3.13.212.24:28800), capturing certify / init_info / GDM in the clear
-     on both legs.
+  3. rewrites every relay record's IPv4 (record+0) and ports (record+24/+26/+28)
+     to THIS Mac -- **one distinct local port per record** so the app can still
+     tell the servers apart,
+  4. re-checksums fold-neutral (see rewrite_relays), re-encrypts, and hands the
+     modified response back to the app,
+  5. then listens on **both UDP and TCP** for every local port it handed out and
+     forwards to the genuine relay each record came from, capturing
+     Detect / certify / init_info / GDM in the clear on both legs.
+
+  The TCP leg is not optional: the app also runs
+  gat_start_tcp_connect_p2psrv -> ivtcp_start_connect addr=<relay> port=<p>
+  and gives up if nothing accepts.
 
 Frame rules (P2P_PROTOCOL.md §3a, §4, §5):
     key   = frame[0:4] || frame[0x14:0x17] || 0x00
@@ -26,6 +33,7 @@ import select
 import socket
 import struct
 import sys
+import threading
 import time
 
 from listreq import MASK, rc5_setup, rc5_encrypt_block, rc5_decrypt_block, payload_len, checksum
@@ -43,18 +51,20 @@ t0 = time.time()
 f = None
 n = [0]
 app_addr = None
+_log_lock = threading.Lock()
 
 
 def emit(kind, addr, data, note=""):
-    n[0] += 1
-    asc = "".join(chr(b) if 32 <= b < 127 else "." for b in data)
-    block = ("[%7.2fs] %-6s %-21s len=%-5d %s\n  HEX %s\n  ASC %s\n"
-             % (time.time() - t0, kind, "%s:%d" % addr, len(data), note,
-                data.hex(), asc))
-    print(block, end="", flush=True)
-    if f:
-        f.write(block)
-        f.flush()
+    with _log_lock:
+        n[0] += 1
+        asc = "".join(chr(b) if 32 <= b < 127 else "." for b in data)
+        block = ("[%7.2fs] %-6s %-21s len=%-5d %s\n  HEX %s\n  ASC %s\n"
+                 % (time.time() - t0, kind, "%s:%d" % addr, len(data), note,
+                    data.hex(), asc))
+        print(block, end="", flush=True)
+        if f:
+            f.write(block)
+            f.flush()
 
 
 def key_of(buf):
@@ -77,7 +87,7 @@ def rc5_apply(buf, decrypt=False):
     return bytes(buf)
 
 
-def rewrite_relays(resp, mac_ip, relay_port):
+def rewrite_relays(resp, mac_ip, base_port):
     """Point every LIST_RESP record at us, XOR-FOLD-NEUTRAL.
 
     WHY THE BALANCING ACT
@@ -101,14 +111,21 @@ def rewrite_relays(resp, mac_ip, relay_port):
 
     We therefore XOR the total delta of every field we rewrite back out
     through one sacrificial word, keeping the fold identical.
+
+    Each record gets ITS OWN local port (base_port + i for the primary pair,
+    base_port + 100 + i for the record's secondary/backup port).  Collapsing
+    all four onto a single address made them duplicates -- the app dropped
+    three of them with `NET64 IPV4_TO_IPV6 FAIL` and could no longer tell
+    which server answered a `Detect` (`iv_gutes_on_respfrm_Detect not find
+    p2p...`).  Returns (plain, notes, mapping) where mapping maps each local
+    port to the genuine (ip, port) it must be forwarded to.
     """
     plain = bytearray(resp)
     total = struct.unpack_from("<H", plain, 2)[0]
     nrec = (total - 32) // 36
     notes = []
+    mapping = {}
     ipb = socket.inet_aton(mac_ip)          # network byte order == wire order
-    new_ip = struct.unpack(">I", ipb)[0]
-    port12 = struct.pack(">HH", relay_port, relay_port)   # ports are big-endian
     delta = 0
 
     def flip(off, new):
@@ -120,13 +137,22 @@ def rewrite_relays(resp, mac_ip, relay_port):
     for i in range(nrec):
         off = 32 + i * 36
         old_ip = socket.inet_ntoa(plain[off:off + 4])
-        old_p = struct.unpack_from(">H", plain, off + 24)[0]
+        old_p1 = struct.unpack_from(">H", plain, off + 24)[0]
+        old_p2 = struct.unpack_from(">H", plain, off + 26)[0]
+        old_p3 = struct.unpack_from(">H", plain, off + 28)[0]
         srv = struct.unpack_from("<H", plain, off + 22)[0]
+        prim, sec = base_port + i, base_port + 100 + i
+        mapping[prim] = (old_ip, old_p1)
+        if old_p3:
+            mapping[sec] = (old_ip, old_p3)
+        p_b = struct.pack(">H", prim)
+        s_b = struct.pack(">H", sec)
         flip(off, ipb)                              # +0  IPv4
-        flip(off + 24, port12)                      # +24/+26 ports 1,2
-        flip(off + 28, struct.pack(">H", relay_port) + plain[off + 30:off + 32])
-        notes.append("rec%d srv=%d %s:%d -> %s:%d"
-                     % (i, srv, old_ip, old_p, mac_ip, relay_port))
+        flip(off + 24, p_b + p_b)                   # +24/+26 ports 1,2 (primary)
+        flip(off + 28, s_b + plain[off + 30:off + 32])   # +28 port3 (secondary)
+        notes.append("rec%d srv=%d %s:%d -> %s:%d  (sec %s:%d -> %s:%d)"
+                     % (i, srv, old_ip, old_p1, mac_ip, prim,
+                        old_ip, old_p3, mac_ip, sec))
 
     if delta:
         # Sacrificial word: rec3's trailing 4 bytes (offset 172), last word of
@@ -144,7 +170,7 @@ def rewrite_relays(resp, mac_ip, relay_port):
                          "(chk word @16 left untouched)" % (delta, sacr))
         else:
             notes.append("WARNING: could not balance delta 0x%08x" % delta)
-    return bytes(plain), notes
+    return bytes(plain), notes, mapping
 
 
 def transform_list_resp(resp):
@@ -153,23 +179,25 @@ def transform_list_resp(resp):
     The stored checksum (offset 16) and the flags word are left byte-for-byte
     as the genuine server sent them: rewrite_relays() keeps the payload's XOR
     fold identical, so the app recomputes exactly that checksum.
+
+    Returns (frame, notes, mapping) -- mapping is local_port -> (real_ip, real_port).
     """
     try:
         plain = rc5_apply(resp, decrypt=True)
     except Exception as e:                  # noqa: BLE001
         emit("LIST", ("?", 0), resp, "decrypt failed: %r" % e)
-        return None, []
+        return None, [], {}
     magic, typ = plain[0], plain[1]
     if magic != 0x7F or typ != 0x16:
         emit("LIST", ("?", 0), plain, "not a LIST_RESP (magic=%02x type=%02x)" % (magic, typ))
-        return None, []
+        return None, [], {}
     stored = struct.unpack_from("<I", plain, 16)[0]
-    plain, notes = rewrite_relays(plain, MAC_IP, RELAY_PORT)
+    plain, notes, mapping = rewrite_relays(plain, MAC_IP, RELAY_PORT)
     plain = bytearray(plain)
     now = struct.unpack_from("<I", plain, 16)[0]
     assert now == stored, "checksum word was disturbed: %08x != %08x" % (now, stored)
     notes.append("chk @16 kept = 0x%08x (fold-neutral edit)" % stored)
-    return rc5_apply(bytes(plain), decrypt=False), notes
+    return rc5_apply(bytes(plain), decrypt=False), notes, mapping
 
 
 # ---------------------------------------------------------------- list server
@@ -189,29 +217,106 @@ def probe_list_server(req):
 
 
 # --------------------------------------------------------------------- sockets
+def pipe_tcp(lport, client, mapping):
+    """Bidirectionally relay one app->relay TCP connection."""
+    dst = mapping.get(lport)
+    if dst is None:
+        client.close()
+        return
+    try:
+        up = socket.create_connection(dst, 5)
+    except OSError as e:
+        emit("TFAIL", dst, b"", "local %d: connect failed: %r" % (lport, e))
+        client.close()
+        return
+    emit("TOPEN", dst, b"", "TCP local %d <-> %s:%d" % (lport, dst[0], dst[1]))
+    nlog = [0]
+    try:
+        while time.time() - t0 < DUR:
+            r, _, _ = select.select([client, up], [], [], 1.0)
+            if not r:
+                continue
+            for x in r:
+                d = x.recv(65535)
+                if not d:
+                    raise OSError("peer closed")
+                if x is client:
+                    up.sendall(d)
+                    if nlog[0] < 60:
+                        emit("T->R", dst, d, "TCP local %d" % lport)
+                        nlog[0] += 1
+                else:
+                    client.sendall(d)
+                    if nlog[0] < 60:
+                        emit("T<-R", (MAC_IP, lport), d, "TCP local %d" % lport)
+                        nlog[0] += 1
+    except OSError:
+        pass
+    finally:
+        for s in (client, up):
+            try:
+                s.close()
+            except OSError:
+                pass
+
+
 def main():
-    global f, app_addr
+    global f
     lsn = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     lsn.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     lsn.bind(("0.0.0.0", LIST_PORT))
 
-    rl = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    rl.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    rl.bind(("0.0.0.0", RELAY_PORT))
+    udp = {}      # local port -> bound UDP socket
+    tcp = {}      # local port -> listening TCP socket
+    mapping = {}  # local port -> (real ip, real port)
+    app_by_port = {}   # local port -> last app source addr
+
+    def ensure_ports():
+        """Bind a UDP + TCP socket for every local port the rewrite created."""
+        for lp in sorted(mapping):
+            if lp not in udp:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    s.bind(("0.0.0.0", lp))
+                    udp[lp] = s
+                except OSError as e:
+                    print("[!] udp bind %d: %r" % (lp, e), flush=True)
+            if lp not in tcp:
+                t = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                t.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    t.bind(("0.0.0.0", lp))
+                    t.listen(8)
+                    t.setblocking(False)
+                    tcp[lp] = t
+                except OSError as e:
+                    print("[!] tcp bind %d: %r" % (lp, e), flush=True)
 
     f = open(OUT, "w")
-    f.write("# list udp 0.0.0.0:%d, relay udp 0.0.0.0:%d -> %s:%d, %.0fs\n"
-            % (LIST_PORT, RELAY_PORT, REAL_RELAY[0], REAL_RELAY[1], DUR))
-    print("[listen] list:%d  relay:%d -> real %s:%d  (%.0fs)"
-          % (LIST_PORT, RELAY_PORT, REAL_RELAY[0], REAL_RELAY[1], DUR), flush=True)
+    f.write("# list udp 0.0.0.0:%d, relay udp+tcp on %d..  %.0fs\n"
+            % (LIST_PORT, RELAY_PORT, DUR))
+    print("[listen] list udp %d, relay udp+tcp %d.. (map filled on first LIST_RESP)  %.0fs"
+          % (LIST_PORT, RELAY_PORT, DUR), flush=True)
 
     cache = {}
     while time.time() - t0 < DUR:
+        socks = [lsn] + list(udp.values()) + list(tcp.values())
         try:
-            r, _, _ = select.select([lsn, rl], [], [], 0.5)
+            r, _, _ = select.select(socks, [], [], 0.5)
         except OSError:
             continue
         for s in r:
+            if s in tcp.values():
+                lp = [k for k, v in tcp.items() if v is s][0]
+                try:
+                    client, _ = s.accept()
+                except OSError:
+                    continue
+                threading.Thread(target=pipe_tcp, args=(lp, client, mapping),
+                                 daemon=True).start()
+                continue
+
             data, addr = s.recvfrom(65535)
             if not data:
                 continue
@@ -225,23 +330,30 @@ def main():
                     emit("REPLAY", REAL_LIST, resp, "cached genuine LIST_RESP")
                 cache["raw"] = resp
                 emit("RESP", REAL_LIST, resp, "genuine LIST_RESP")
-                out, notes = transform_list_resp(resp)
+                out, notes, mapping = transform_list_resp(resp)
                 if out is None:
                     continue
+                ensure_ports()
                 for nt in notes:
                     print("       * %s" % nt, flush=True)
                     f.write("       * %s\n" % nt)
-                emit("MOD", addr, out,
-                     "LIST_RESP repointed at %s:%d" % (MAC_IP, RELAY_PORT))
+                emit("MOD", addr, out, "LIST_RESP repointed at %s:%d.." % (MAC_IP, RELAY_PORT))
                 lsn.sendto(out, addr)
-            elif addr[0] == REAL_RELAY[0]:
-                emit("<-AWS", addr, data, "relay response")
-                if app_addr:
-                    rl.sendto(data, app_addr)
+                continue
+
+            lp = s.getsockname()[1]
+            target = mapping.get(lp)
+            if target is None:
+                continue
+            if addr[0] == target[0]:
+                emit("<-AWS", addr, data, "relay resp udp:%d" % lp)
+                back = app_by_port.get(lp)
+                if back:
+                    s.sendto(data, back)
             else:
-                app_addr = addr
-                emit("APP->", addr, data, "relay leg")
-                rl.sendto(data, REAL_RELAY)
+                app_by_port[lp] = addr
+                emit("APP->", addr, data, "relay udp:%d -> %s:%d" % (lp, target[0], target[1]))
+                s.sendto(data, target)
 
     f.write("# total %d chunk(s)\n" % n[0])
     f.close()

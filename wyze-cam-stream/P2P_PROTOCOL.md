@@ -584,15 +584,25 @@ gat_on_rcv_GDM_JDAT_RPT_REQ … content={"ProReadonly":{"_online":…,"netInfo":
 > Cameras: `.217` D03F27747BB0 · `.224` D03F27EBFB10 · `.169` D03F2776110C · `.117` D03F277576D8.
 > [!] `netInfo` still has **no TCP/UDP port** — that comes from the KCP/GDM layer, not here.
 
-### [!] Two things the MITM does NOT yet reproduce
+### [!] Imperfections — real, but no longer blocking
 
 1. **The app restores the real relays from a disk cache at startup** (`ip_env=0`), *before* our
-   `LIST_RESP` arrives, so `certify`/`init_info`/`GDM` can complete against the genuine AWS
-   relays while our leg only carries `Detect`. Our relays are added with `ip_env=1` afterwards.
-   Clearing that cache (find it via `run-as com.hualai`) is the untried fix.
-2. **`NET64 IPV4_TO_IPV6 FAIL`** — only record 0 of our four rewritten relays is added; records
-   1–3 fail conversion (they arrive with `ip_version_env=1` and, for records 1/3, a real IPv6
-   still present). So `srv_num=3` in the log counts the *cached* servers, not ours.
+   `LIST_RESP` arrives, so `iv_fast_connect_srv srv_num=3` initially describes the genuine AWS
+   relays. Our relays are added afterwards with `ip_env=1`. The cache is **not** a file under
+   `/data/data/com.hualai` (searched for both the text `3.13.212.24` and the raw bytes
+   `03 0d d4 18` — nothing), so it is either in `com.hualai_wyze_sp_secure.xml` (encrypted) or
+   supplied by the Java layer at SDK init.
+2. **`NET64 IPV4_TO_IPV6 FAIL`** still fires ~37×/run for the records other than the first one.
+   With one shared address they were *duplicates*; with per-record ports the first record is
+   always added (`add udp_addr 192.168.77.13:28800 28900 srv_id=49`) and only the rest fail.
+   **Benign** — one relay is enough; the whole control plane completes on `srv_id=49`.
+3. **`iv_gutes_on_respfrm_Detect not find p2p...`** fires repeatedly and is **also benign** —
+   `certify_resp` / `init_info` / `GDM` / the AV link all proceed despite it.
+
+> [!] **Our smali patch made the Mac the ONLY list server.** With `cap_relay.py` not running the
+> app gets *no* list response at all (GDM count = 0, every request times out on
+> `192.168.77.13:51701`, including the HTTP fallback). So the MITM is now mandatory for any
+> experiment — there is no "genuine" baseline without rebuilding the APK with the original URL.
 
 **Relay wire formats captured in the clear** (both legs, `cap_relay.py` transcript):
 
@@ -602,10 +612,78 @@ gat_on_rcv_GDM_JDAT_RPT_REQ … content={"ProReadonly":{"_online":…,"netInfo":
 - `Detect` response — **type `0x02`, 56 B**, plaintext-looking: `d_log` (`a3601200 d6860184`)
   at `+4..+11`, varying `+12..+19`, `0x0000855c` at `+20`, `1` at `+24`, a counter at `+36`,
   and **Unix time at `+48`** (`f1c4cd6a` = 2026-10-13).
-- [!] With all four records collapsed onto one address, the app sometimes logs
-  `iv_gutes_on_respfrm_Detect not find p2p...` — the response can't be correlated back to a
-  server. Giving each record its **own local port** (28800/1/2/3, each forwarding to its real
-  relay) is the untried fix.
+- [!] `iv_gutes_on_respfrm_Detect not find p2p...` fires regardless. It was first blamed on
+  collapsing all four records onto one address; giving each record its own local port
+  (28800/1/2/3 primary, 28900/1/2/3 secondary, each forwarding to its genuine relay) **did not
+  remove it** — and it turned out not to matter.
+
+### The app also dials the relay over **TCP**
+
+`gat_start_tcp_connect_p2psrv -> ivtcp_start_connect addr=<relay> port=<p>` runs alongside the
+UDP Detect. With only a UDP listener the app logged `on_p2psrv_tcp_connect_finished
+conn_status=CONNECTING` then `ivtcp_close_socket: fd=-1` and stalled. **All four genuine relays
+accept TCP** (`3.13.212.24:28800`, `44.238.104.252:443`, `54.208.16.245:443`,
+`52.40.221.253:51705` — probed from the Mac, 90–166 ms) so `cap_relay.py` now runs a thread per
+accepted TCP connection and pipes bytes both ways. After that: `conn_status=CONNECTED`.
+
+---
+
+## 5c. The AV leg is **LAN-direct** [WIRE — live logcat]
+
+Chain observed, in order, with `cap_relay.py` carrying the control plane:
+
+```
+gat_rcv_init_info_msg_resp srv_id=49 frm_len=209 offline_cnt=0 online_cnt=4
+   did=429728658691722 <-> wyze_id:CAM-1_D03F27747BB0   srv_relation=1   (×4)
+gat_rcv_init_info_msg_resp opt_with_gdm_SP=0
+gat_rcv_init_info_msg_resp IV_ACCESS_SRV_LINK_ONLINE
+gat_on_rcv_GDM_JDAT_RPT_REQ … content={"ProReadonly":{"netInfo":
+   {"stVal":{"ssid":"Jose","ip":"192.168.77.12","mac":"00:00:00:00:00:01"}}}} … content_len=880
+iv_start_av_link entry=… dst_id=… srv_relation=1
+iv_start_av_link allow_srv_call=1 / lastChannelID=0 allocateid=1 / lanCall
+CH1: iv_start_process_calling … session_id=… dev_id=… camera_id=0
+iv_mtp_session_new link_id=…
+iv_create_kcb                                          ← KCP control block ×2
+iv_init_frm_CALLING dstID=… reqfrm->mtp_link.link_id=… lan_ipv4=<phone>
+iv_process_calling lanCallIp=<camera>
+iv_mtp_session_add_lan_or_nat lan dstAddr:192.168.77.12 port:59239   ← 
+gutes_on_ackfrm_Lan_Calling
+iv_on_time_out_check_into_transfer → iv_start_process_transfer
+iv_rcvpkt_AVSTREAMCTL_ACCEPT mtps->link_id=…  →  0 0 0 0
+CH1: iv_notify_p2pconnReady normal_sqn=2
+start_av_enc_dec chnnelid=1 conn_type=1 / avctl_start_recv_and_dec
+CH1: start_video_dec_proc… / video_decode_proc…        ← decoder running
+start_av_enc_dec AudioType=5 VideoType=0                ← audio PCM(5), video raw(0)
+```
+
+**The relay is only a rendezvous.** After `init_info` gives the `did ↔ wyze_id` map and `GDM`
+gives each camera's LAN IP + MAC + ssid, the client calls the camera **directly on the LAN**
+(`lanCall`), and KCP runs phone→camera, not phone→relay.
+
+**The camera endpoint** is logged as `iv_mtp_session_add_lan_or_nat lan dstAddr:<cam>
+port:<p>`. Two observations, two different cameras:
+
+| camera | endpoint seen |
+|---|---|
+| `192.168.77.17` | `port:63011` |
+| `192.168.77.12` | `port:59239` |
+
+[!] **The port is NOT in `ProReadonly.netInfo`** (it carries ip + mac + ssid only), it is **not**
+stable across the two observations, and it did **not** come from `:8900` — sniffing `0.0.0.0:8900`
++ `[::]:8900` while the app started captured **0 packets**, even though the app runs
+`broadcast_init` / `send_loop addr_len=28 multicast=ff02::1`. Its origin is the **current
+unknown**: either `lst_devinfo_proc` (the broadcast receiver), an `MTP`/GDM field we have not
+isolated, or a NAT-mapped port handed back by the relay. **Next RE target:
+`iv_mtp_session_add_lan_or_nat` and `iv_process_calling`.**
+
+Other AV-leg facts already pinned from these logs:
+
+- **Fragmentation**: `gute_recv_fragment_init mtu=1032 … all_cnt=2 … fragdata_size=1008`
+  → payloads are split at **MTU 1032**, reassembled (`rcv frag_idx=… rcv_cnt=…`).
+- **Compression**: `unzip ok ! origlen 2482 , ziplen 1565` → **zlib** over the GDM blob.
+- GDM data objects are queried over the AV link too:
+  `giot_get_gdm_data_object_resp tid=CAM-1_D03F27747BB0 … error_code=0 … renew json tree`.
+- Channel types seen: `start_av_enc_dec AudioType=5 VideoType=0`, `conn_type=1`.
 
 ---
 

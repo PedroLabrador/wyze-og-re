@@ -18,11 +18,20 @@
    the sacrificial word at offset 172). Verified offline *and* live: zero `chkval fail chk_val=`.
 3. **`cap_relay.py`** now relays the whole list + relay conversation. The app prints
    `set current ListSrv to 192.168.77.13.` and `add udp_addr 192.168.77.13:28800 srv_id=49`.
-4. **`init_info` → `GDM_JDAT_RPT` decoded from live logcat** — it delivers `online_cnt=4`, the
-   `did ↔ wyze_id` map, and each camera's **LAN IP + MAC + ssid**. Open problem #1 is answered
-   at the payload level; the frame formats still need reversing.
-5. Still open (§5b): the app restores the real relays from a **disk cache** before our response
-   arrives, and only 1 of our 4 rewritten records survives (`NET64 IPV4_TO_IPV6 FAIL`).
+4. **`init_info` → `GDM_JDAT_RPT` decoded and delivered through our own MITM** —
+   `online_cnt=4`, the `did ↔ wyze_id` map, and each camera's **LAN IP + MAC + ssid**.
+5. **The relay is only a rendezvous: the AV leg is LAN-direct.** After GDM the app calls the
+   camera straight on the LAN (`iv_mtp_session_add_lan_or_nat lan dstAddr:<cam> port:<p>`),
+   creates a KCP session, and reaches `video_decode_proc`. The whole chain
+   `certify → init_info → GDM → lanCall → AVSTREAMCTL_ACCEPT → decode` now runs through
+   `cap_relay.py`.
+6. **The relay dials over TCP as well as UDP** — `ivtcp_start_connect` must be satisfied or the
+   session stalls; all four genuine relays accept TCP.
+7. **Remaining gate**: where the camera's P2P port comes from (not in `netInfo`, not `:8900`,
+   not stable). See `P2P_PROTOCOL.md` §5c.
+
+> [!] **The smali patch made our Mac the only list server.** Experiments now *require*
+> `cap_relay.py`; with it off the app gets no list at all (GDM = 0).
 
 ## [!] READ THIS FIRST — big update (2026-10-12, late session)
 
@@ -107,8 +116,10 @@ wyze-re/
 ├── uber-apk-signer.jar
 ├── wire/                              # captured LIST_REQUEST/LIST_RESP + README (ground truth)
 ├── listreq.py                         # byte-exact LIST_REQUEST builder (checksum + RC5-32/6/8)
-├── cap_relay.py                       # list-server impersonator + relay MITM (fold-neutral rewrite)
+├── cap_relay.py                       # list-server impersonator + relay MITM (UDP+TCP, fold-neutral)
 ├── chk_probe.py                       # app-as-checksum-oracle (proved §4a)
+├── lansniff.py                        # UDP/8900 + [::]:8900 discovery sniffer (negative result, §5c)
+├── netdump.sh                         # decode /proc/net/* for sockets to the camera LAN IPs
 ├── decode_lr.py                       # LIST_RESP payload decoder (prints the 4 relays)
 ├── probe_real.py                      # sends our packets to the real server, prints responses
 ├── cap_listsrv2.py                    # UDP+TCP list-server impersonator (app redirect target)
@@ -141,18 +152,20 @@ wyze-re/
 > between A/B/C" list is retired. Route C is the only live path, and its first two stages are
 > done, so the list starts where the work now actually is.
 
-1. **`init_info` → `GDM_JDAT_RPT` — frame formats.** Payload level is [OK] decoded from live
-   logcat (§5b: `online_cnt=4`, `did↔wyze_id`, camera LAN IP/MAC/ssid). What's left is the
-   byte-exact framing: reverse `gat_send_init_info_msg` (`0x3eac4`),
-   `gat_rcv_init_info_msg_resp` (`0x46960`), `gat_on_rcvpkt_GDM_JDAT_RESP` (`0x44a14`) and
-   `gat_on_rcvpkt_GDM_JDAT_REQ` (`0x43790`) — or just read them off the `cap_relay.py` capture
-   now that the relay leg is in the clear. **This is the current gate.**
-2. **How `certify_req` is actually dialled** — transport to the relay (TCP or UDP) and the
-   byte-exact finalizer for type `0x0c` (checksum + RC5 over `[24:…]`). Assumed to follow
-   §4/§5; not yet byte-verified because there is no `certify` capture.
-3. **KCP configuration + AV channel framing**, then H.264/H.265 extraction.
+1. **The camera's P2P port** — `iv_mtp_session_add_lan_or_nat lan dstAddr:<cam> port:<p>` gives
+   `192.168.77.17:63011` and `192.168.77.12:59239`, but the port is **not** in
+   `ProReadonly.netInfo`, is not stable, and did not come from `:8900` (sniffed — 0 packets).
+   Reverse `iv_mtp_session_add_lan_or_nat` / `iv_process_calling`, or find the
+   `lst_devinfo_proc` broadcast response. **This is the current gate.**
+2. **KCP + AV framing** — `iv_create_kcb`, `iv_start_process_transfer`,
+   `iv_rcvpkt_AVSTREAMCTL_ACCEPT`, `gute_recv_fragment` (MTU 1032), zlib, then
+   `start_av_enc_dec AudioType=5 VideoType=0`. Get from there to actual H.264/H.265 NAL units.
+3. **Byte-exact `certify_req` (type `0x0c`) finalizer** — the format is known from §5a and the
+   handshake completes live through our MITM, but no capture has been decrypted to verify the
+   bytes (session RC5 key = client nonce, so it is now decryptable — just do it).
 4. **Auth to the camera** — `accessId`/`accessToken` vs a LAN password
-   (`iv_check_set_lan_device_pwd` / `giot_eif_send_check_lan_pwd`, unreversed).
+   (`iv_check_set_lan_device_pwd` / `giot_eif_send_check_lan_pwd`, unreversed). The app reaches
+   `video_decode_proc` without an obvious auth step, so this may be a non-issue — verify.
 5. [?] POST `Signature2` content rule — blocked on runtime-injected
    `cg01_f3c397620f853b12` secret (only needed to refresh tokens).
 6. Wire frames → `ffmpeg` → HLS/WebRTC → browser UI (grid of 4), into
@@ -185,9 +198,9 @@ wyze-re/
 |---|---|---|
 | 1 | `LIST_REQUEST` / `LIST_RESP` → relay list | [OK] **DONE** — byte-exact builder, real server answers, payload decoded (§3, §3a) |
 | 2 | GUTES `certify` → session key | [OK] **DONE** — frame format + `rc5_ctx_setkey(nonce, 32)` (§5a) |
-| 3 | `init_info` → `GDM_JDAT_RPT` (did↔TID, camera LAN IPs) | [~] **payload decoded live** — logcat gives `online_cnt=4`, `did↔wyze_id`, LAN IP/MAC/ssid per cam (§5b). Frame format still to reverse. |
-| 4 | Relay dial: transport + byte-exact type `0x0c` finalizer | [~] **MITM live** — `cap_relay.py` relays Detect/certify/init_info/GDM in the clear (§5b); `Detect` type 0x01/0x02 formats captured. `0x0c` finalizer still assumed. |
-| 5 | KCP config + AV channel framing → H.264/H.265 | [ ] not started |
+| 3 | `init_info` → `GDM_JDAT_RPT` (did↔TID, camera LAN IPs) | [OK] **DONE live** — `online_cnt=4`, `did↔wyze_id`, per-cam LAN IP/MAC/ssid, through our own MITM (§5b, §5c) |
+| 4 | Relay dial: transport + byte-exact type `0x0c` finalizer | [OK] **DONE live** — UDP **and TCP** both relayed; `certify`/`init_info`/`GDM` complete against our Mac. `Detect` 0x01/0x02 formats captured (§5b). Type `0x0c` bytes still not byte-verified. |
+| 5 | KCP config + AV channel framing → H.264/H.265 | [~] **AV LINK UP** — LAN-direct call + KCP + `video_decode_proc` reached (§5c). Left: how the camera port is obtained, `iv_mtp_session_add_lan_or_nat`, framing/codec extraction |
 | 6 | Auth to camera (`accessToken` vs LAN password) | [ ] not started |
 | 7 | Python client → `ffmpeg` → HLS/WebRTC → browser grid of 4 → `server.py` | [ ] not started |
 
