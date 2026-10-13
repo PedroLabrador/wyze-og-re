@@ -1179,6 +1179,146 @@ remain and both are cheap to settle by experiment:
 
 The relay route (§5f) is the fallback if peer-to-peer rendezvous turns out to be refused.
 
+> [X] **Both questions are now answered — and the peer-to-peer hope is DISPROVED. See §5h.**
+
+---
+
+## 5h. The GUTES type table — and proof the rendezvous needs the relay  [SOLVED]
+
+§5g ended with a hopeful question: maybe the `MTP_RES` rendezvous can be spoken peer-to-peer
+over the LAN, so the AWS relay is unnecessary. **No.** Decoded from the dispatcher, then
+cross-checked against the wire.
+
+### The dispatcher
+
+`giot_on_rcvpkt @ 0x520c8` is the top-level GUTES router, and it is a plain jump table:
+
+```
+0x520fc  ldr  r0, [sp, #0x14]      ; &frame
+0x52100  ldrb r0, [r0, #0x1]       ; r0 = frame[1]        <-- the GUTES type byte
+0x52104  sub  r0, r0, #1           ; zero-based index
+0x52108  cmp  r0, #219             ; types 1..220 only
+0x52110  bhi  0x52678              ;      -> default / ignore
+0x5211c  add  r2, pc, #4           ; r2 = 0x5211c+8+4 = 0x52128  <-- BASE and TABLE
+0x52120  ldr  r1, [r1, r2]         ; r1 = table[idx]
+0x52124  add  pc, r1, r2           ; pc  = 0x52128 + table[idx]
+```
+
+`objdump` renders the table words as junk ARM (`andeq r0, r0, r0, ror r3`), so they have to be
+read straight out of the ELF. **`jumptab.py` does this** and prints `type -> handler`.
+
+> [!] **ARM `pc` reads as instruction+8.** `add r2, pc, #4` at `0x5211c` gives
+> `0x5211c + 8 + 4 = 0x52128`, *not* `0x52124`. Getting this wrong off-by-4 resolves every
+> target to the last instruction of the preceding block — usually its `b epilogue` — which
+> makes a real handler look dead. I shipped `jumptab.py` wrong and caught it because the
+> targets sat 4 bytes before an `ldr/ldr/bl/b` block. Fixed and re-verified against 5 known
+> handlers (163→`MTP_RES_RESPONSE`, 164→`CALLING_REQ`, 165→`CALLING_ERR`, 168→`ONLINE_MSG`,
+> 162→ignore).
+
+### The map (non-default entries only)
+
+| type | handler | | type | handler |
+|---|---|---|---|---|
+| 1 | `gat_on_rcvpkt_DetectReq` | | 187 | `gat_on_rcvpkt_USER_MESG_ERR` |
+| 10 | `gat_on_rcvpkt_Session_KickOff` | | 191 | `GATFRM_PUBLISH_GDMSP` |
+| 22 | `gat_on_rcvpkt_LIST_RESP` | | 195 | `gat_on_rcvpkt_ASSOCIATEDID` |
+| 24 | `gat_on_rcvpkt_ListNatRsp` | | 200 | `GATFRM_ChecklanpwdReq` |
+| **162 (`0xa2`)** | **→ default: IGNORED** | | 201 | `GATFRM_ChecklanpwdRsp` |
+| **163 (`0xa3`)** | **`gat_on_rcvpkt_MTP_RES_RESPONSE`** | | 202 | `GATFRM_PortStatReq` |
+| 164 | `gat_on_rcvpkt_CALLING_REQ` | | 203 | `GATFRM_PortStatResp` |
+| 165 | `gat_on_rcvpkt_CALLING_ERR` | | 206 | `gat_on_rcvpkt_WakeUp` |
+| 168 | `gat_on_rcvpkt_ONLINE_MSG` | | 217 | `gat_on_rcvpkt_APP_ONLINE_MSG` |
+| 170 | `gat_on_rcv_GDM_JDAT_RPT_REQ` | | 218 | `NOTICE_TO_TERMINAL` |
+| 172, 174 | `gat_on_rcvpkt_GDM_JDAT_REQ` | | 220 | `GATFRM_TermDnsResp` |
+| 178 | `GATFRM_DevEventRpt` | | 182 | `GATFRM_JsonCmd_Evt` |
+| 184 | `GATFRM_GetDevGdmDatResp` | | 185/186 | `PASSTHROUGH_MSG` / `_ACK` |
+
+### The two lines that matter
+
+* **`MTP_RES_REQUEST` = type 162 = `0xa2` → `0x5267c` → `b 0x52680` → `mov sp, r11` /
+  `pop {r11, pc}`.** It falls straight out of the function. Nothing is decoded, nothing is
+  called, nothing is logged. **An incoming `7f a2` is dropped on the floor.**
+* **`MTP_RES_RESPONSE` = type 163 = `0xa3` → `gat_on_rcvpkt_MTP_RES_RESPONSE @ 0x4bafc`.**
+
+And the wire independently agrees on both. `/tmp/cap_relay.log` contains `7e a3` frames
+received **from AWS** (len 32 ×4, 193, 203) — the app getting its rendezvous answer from the
+relay. Meanwhile across all 294 direct-camera captures there are **zero `7f` frames**, even
+though the camera runs `iv_on_rcv_calling` on every one of our CALLINGs and that is the only
+caller of `init_frm_mtp_res_request`.
+
+### The direction, corrected
+
+My first reading of §5g had us *sending* `7f a2` at the camera. That is wrong, and the
+absence of `7f` in our captures is the proof.
+
+`init_frm_mtp_res_request` is built by `iv_on_rcv_calling`, i.e. by the **called** side. We
+are the caller, so the camera builds it — and then sends it to the **relay**, not to us. If it
+were addressed to the peer it would appear in our capture window; it never does. Type 162 has
+no handler in `giot_on_rcvpkt` because no peer ever receives one — it is a message *for the
+relay*.
+
+So the rendezvous runs like this:
+
+```
+  us (caller)                    relay                     camera (called)
+      |  7e a4 CALLING  ---------> |  -------------------> |  iv_on_rcv_calling
+      | |                       |- send 7e a4 ack  --> us
+      | | <---- 7f a2 MTP_RES -|   (to the RELAY, not us)
+      | <---- 7e a3 MTP_RES_RESP --| <--------------------|   carries the camera's address
+      |  gat_on_rcvpkt_MTP_RES_RESPONSE                    |
+      |    -> add_udp_relay(cam_addr)  == TYPE 135         |  (camera gets its own
+      |    -> add_lan_or_nat(cam_addr) == TYPE 1           |   135 channel the same way)
+      |  kcb->output (5f gate) now finds a 135 channel      |
+      |  C0 10 KCP ------------------------ LAN-direct --> |
+```
+
+This also explains two previously-separate observations at once: why the camera acks our
+CALLING **directly** (source-address reply, we capture it) while sending **no** `7f` to us
+(the `MTP_RES` goes to the relay), and why a *working* app session shows **zero `C0` frames
+on the relay** — the relay is only ever a postman for `7f a2` / `7e a3`.
+
+### Which channels exist, and why only one of them emits
+
+| built by | fn | type | can `kcb->output` use it? |
+|---|---|---|---|
+| `iv_on_rcv_calling` (LAN, AF_INET) | `add_lan_or_nat` | **2** | [X] |
+| `gat_on_rcvpkt_MTP_RES_RESPONSE` | `add_lan_or_nat` | **1** | [X] |
+| `gat_on_rcvpkt_MTP_RES_RESPONSE` | `add_udp_relay` | **135** | [OK] |
+| `gat_on_rcvpkt_MTP_RES_RESPONSE` | `add_tcp_relay` | **135 / 136** | [OK] |
+
+`kcb->output @ 0x5c1d8` accepts **only** `ch->0x10 == 135`. The camera *does* create a type-2
+LAN channel from our CALLING (the `cmp r0, #2` AF_INET test at `0x4d458`) — but type 2 cannot
+emit, which is exactly why we never saw a `C0 10` despite a working handshake. **A type-135
+channel exists only after a `7e a3` arrives from the relay.** That is the gate, and it is
+genuinely closed until we speak to the relay.
+
+### The plan this produces (concrete)
+
+1. Connect to a relay from LIST_RESP (`3.13.212.24:28800`, srv 49) using the `regist_gw_user`
+   `accessId`/`accessToken` (§1).
+2. Run the GUTES `certify` handshake (§5a — already reversed; session key = our own 32-byte
+   nonce) then `init_info` → `init_info_msg_resp` → `GDM_JDAT_RPT_REQ` (device list, §2).
+3. Send the app's `7e a4` CALLING **through the relay** — the exact bytes `cap_relay.py`
+   already captured.
+4. Read the camera's `7f a2` off the relay, then receive `7e a3`. Feed it to
+   `gat_on_rcvpkt_MTP_RES_RESPONSE` (or construct the equivalent `add_udp_relay(camera_lan_addr)`).
+5. Type-135 channel exists → §5f's gate opens → **KCP runs LAN-direct**, which §5f proved is
+   how the AV leg actually travels.
+6. `AVSTREAMCTL` over KCP → `start_av_enc_dec` → H.264/H.265.
+
+**The relay carries control frames and never a single byte of video.** Everything downstream
+of step 4 is LAN, and we already have every byte of that half — the CALLING, the ack, the
+AvStreamCtl dialogue, the `C0 90`/`C0 10` codec, the KCP segment format, and the gate itself.
+What we are adding is a postman, not a stream.
+
+> [X] **`jumptab.py` shipped with `base = 0x52124`; the correct value is `0x52128`** because
+> ARM reads `pc` as *instruction + 8*, so `add r2, pc, #4` at `0x5211c` gives `+8+4`. The
+> wrong base resolved every target 4 bytes early — landing on the previous block's
+> `b epilogue`. The giveaway is that targets sat just before an
+> `ldr r0, [r11, #-0x10] / ldr r1, [r11, #-0xc] / bl handler / b epilogue` block.
+> Fixed; re-verified against 5 known handlers.
+
+
 
 
 ## 6. Transport [CONFIRMED]

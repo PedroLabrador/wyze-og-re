@@ -87,22 +87,40 @@ and then **discards every outgoing segment** because it has no relay channel. Th
 why not a single `C0 10` packet has ever come back, and it is *not* a bug in
 `p2p_call.py`.
 
-**So the remaining work is the relay rendezvous — and it may not even need AWS (§5g).**
-`init_frm_mtp_res_request` builds a GUTES **`7f a2` MTP_RES** frame (122 B) and it is called
-from **`iv_on_rcv_calling`**, i.e. from the *LAN* calling path. Meanwhile the receive router's
-`C0`-`bit4=0` branch feeds `iv_on_rcv_pkt_as_relay` → `giot_on_rcvpkt` →
-`gat_on_rcvpkt_MTP_RES_RESPONSE` **on the same LAN socket**. And the wire agrees we never did
-it: across 294 captured camera replies there are only `c0 90` / `7e b9` / `7e a4` — **no `7f`
-frame at all, and no KCP** — while the relay leg of the `cap_relay.py` session carried **zero
-`C0` frames** even when the control plane ran end-to-end.
+**So the remaining work is the relay rendezvous — and the hope that we could skip AWS (§5g)
+is DISPROVED (§5h).**
 
-**Immediate next experiment (cheap):** send our own `7f a2` `MTP_RES` at a camera from
-`p2p_call.py`. It is an ordinary GUTES frame, so the §4 request checksum + §5 RC5 rule
-(both already byte-exact for outgoing frames) cover it. If the rendezvous is peer-to-peer,
-that is the *one* missing frame and the relay is unnecessary. Fallback, if it is refused:
-the full relay route — we already hold the `accessId` + per-device `accessToken` from
-`regist_gw_user` (§1), the relay endpoints from `LIST_RESP` (§3), and `cap_relay.py`, which
-already MITMs the app's entire relay dialogue. Then `AVSTREAMCTL` → H.264/H.265.
+`giot_on_rcvpkt @ 0x520c8` is a 220-entry jump table on `frame[1]` (decoded with
+[`jumptab.py`](../jumptab.py)), and it settles both questions at once:
+
+- **type 162 = `7f a2` (`MTP_RES_REQUEST`) → `0x5267c` → immediate `pop {r11, pc}`.**
+  It is never handled by any peer. That is *why* our 294 direct-camera captures contain
+  zero `7f` frames — the camera builds it in `iv_on_rcv_calling` and sends it **to the
+  relay**, not to us. It was never a message we could answer.
+- **type 163 = `7e a3` (`MTP_RES_RESPONSE`) → `gat_on_rcvpkt_MTP_RES_RESPONSE @ 0x4bafc`**,
+  the *only* caller of `iv_mtp_session_add_udp_relay` — the sole producer of type-135
+  channels. `/tmp/cap_relay.log` contains `7e a3` arriving **from AWS**, which closes the
+  loop independently of the disassembly.
+
+And it explains §5f's channel table in one stroke: `iv_on_rcv_calling` does give us a working
+LAN channel, but **type 2**, which `kcb->output` rejects; only `add_udp_relay`/`add_tcp_relay`
+produce **135/136**, and only a `7e a3` from the relay triggers them. The camera acks our
+CALLING directly (source-address reply, we capture it) while its `MTP_RES` goes to the relay —
+two behaviours that looked contradictory until the type table explained them.
+
+**Immediate next work (no longer an experiment — a build):** write the relay client.
+
+1. TCP/UDP to a relay from `LIST_RESP` (`3.13.212.24:28800`, srv 49) with the `regist_gw_user`
+   `accessId` + per-device `accessToken` (§1).
+2. GUTES `certify` (§5a, already byte-exact; session key = our own 32-byte nonce) →
+   `init_info` → `init_info_msg_resp` → `GDM_JDAT_RPT_REQ`.
+3. Send the app's `7e a4` CALLING **through the relay** — `cap_relay.py` already captures the
+   exact bytes — then receive the camera's `7f a2` and the `7e a3` naming its LAN address.
+4. `add_udp_relay` → type-135 exists → §5f's gate opens → **KCP runs LAN-direct** (§5f proved
+   the relay never carries a `C0` frame).
+
+Then `AVSTREAMCTL` → H.264/H.265. The relay is a postman for control frames only; every byte
+of video travels the LAN, and that half of the protocol is already reversed.
 
 > [!] **The smali patch made our Mac the only list server.** Experiments now *require*
 > `cap_relay.py`; with it off the app gets no list at all (GDM = 0).
@@ -200,7 +218,9 @@ wyze-re/
 ├── analyze_calls.py                   # decodes every captured frame (RC5 key rule)
 ├── find_fields.py  find_fields2.py     # session+0x1c..+0x28 tracker (negative result, kept)
 ├── resolve_cb.py                      # resolves PC-relative callback literals -> static fns (§5f, §8)
+├── jumptab.py                         # decodes ARM jump tables -> GUTES type map (§5h) — reads the ELF
 ├── dump_frames.py                     # freezes /tmp/forge_in_*.bin -> wire/p2p_frames.json
+├── re_run.sh                          # fallback: run RE cmds -> /tmp/re_out.txt when the shell is wedged
 ├── netdump.sh                         # decode /proc/net/* for sockets to the camera LAN IPs
 ├── decode_lr.py                       # LIST_RESP payload decoder (prints the 4 relays)
 ├── probe_real.py                      # sends our packets to the real server, prints responses
@@ -247,6 +267,11 @@ wyze-re/
    app's dialogue that `cap_relay.py` already captures. Then
    `iv_rcvpkt_AVSTREAMCTL_ACCEPT` (over KCP) → `gute_recv_fragment` (MTU 1032) → zlib →
    `start_av_enc_dec AudioType=5 VideoType=0` → H.264/H.265. **This is the current gate.**
+   **§5h now pins the exact wire direction** — we *receive* `7e a3` from the relay (we do not
+   send `7f a2`), and type **162/163/164** are confirmed against bytes we already hold
+   (`7e a3` seen arriving from AWS; `7e a4` = `CALLING_REQ` matches every CALLING capture).
+   Build order: `certify` → `init_info` → CALLING **through** the relay → read `7f a2` →
+   receive `7e a3` → `add_udp_relay` → type 135 → KCP LAN-direct.
 2. ~~**The LAN calling handshake**~~ — [OK] **solved.** The bytes were recovered by capturing the
    app's frames and replaying them straight at the camera; see §5e for the layouts of the
    74 B hello, 128 B CALLING and 76 B AvStreamCtl, the three camera replies, the byte-23
@@ -271,6 +296,14 @@ wyze-re/
   is real and now fully reversed — it is **IPv4 broadcast to :8899**, not IPv6-only, and it is
   exactly how our client gets the P2P port. See `P2P_PROTOCOL.md` §5d. What the relay (`GDM`)
   hands the app and what discovery hands us are two views of the same data; **use discovery**.
+- [X] **D25 — *"the `MTP_RES` rendezvous can be done peer-to-peer over the LAN, so AWS is
+  unnecessary."*** **DISPROVED.** `giot_on_rcvpkt`'s jump table has **no handler for type 162
+  (`7f a2`)** — it falls straight through to `pop {r11, pc}`. No peer can answer it, because it
+  is a message *for the relay*. Only type **163 (`7e a3`)** reaches
+  `gat_on_rcvpkt_MTP_RES_RESPONSE`, the sole producer of the type-135 channels that
+  `kcb->output` requires. The AWS relay is **mandatory** — but only for control frames.
+  (Caught in §5g as a hopeful experiment and killed by reading the table first; this saved a
+  session that would have been spent sending frames into a void.)
 
 ## DECISION (locked, from user)
 > **"I do not want an app running. I want to run a webserver, log in, and see all
