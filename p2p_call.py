@@ -77,6 +77,8 @@ from analyze_calls import decrypt, hexdump
 from discover import build_probe, parse_reply, BROADCAST, BROADCAST_PORT
 from listreq import rc5_decrypt_block, rc5_encrypt_block, rc5_setup
 from mtp_frame import wrap as mtp_wrap, unwrap as mtp_unwrap
+import mtp_res
+import portstat_resp
 
 CALLING_PORT = 48171        # the port embedded at [54:56] of the CALLING
 SIMPLE_HELLO = 74           # the c0900209 frame
@@ -89,6 +91,7 @@ D_LOG = 0x840186d6001260a3  # the phone's own id, as embedded in hello/CALLING
 _args = [a for a in sys.argv[1:] if not a.startswith("--")]
 REWRITE = "--rewrite" in sys.argv
 KCP = "--kcp" in sys.argv
+MTPRES = "--mtpres" in sys.argv
 DUR = float(_args[0]) if _args else 30.0
 
 
@@ -364,6 +367,61 @@ def main():
                 seq.append(("kcp", "%-40s" % lbl, frm))
             for lbl, frm in kcp_variants(word):
                 seq.append(("kcpw", "%-40s" % lbl, frm))
+        if MTPRES:
+            # conv: prefer the hello (an MTP `c0` frame -- no RC5, so inner[4:8]
+            # is the session word whatever the key mode).  Cameras with no
+            # captured hello instead take it from their CALLING, which stores it
+            # at [0x1c] -- that is the very field iv_mtp_session_new copies into
+            # session+0x10.  Only readable for mode-1 CALLINGs, and the app's
+            # own are always mode 1.
+            # The CALLING's 8 B id at [4:12] is likewise outside the cipher.
+            word = None
+            if SIMPLE_HELLO in frames:
+                r = mtp_unwrap(frames[SIMPLE_HELLO])
+                if r:
+                    word = struct.unpack_from("<I", r[0], 4)[0]
+            if word is None and CALLING_LEN in frames:
+                cl = frames[CALLING_LEN]
+                if (struct.unpack_from("<I", cl, 20)[0] >> 16) & 3 == 1:
+                    word = struct.unpack_from("<I", decrypt(cl), 28)[0]
+            id8 = frames[CALLING_LEN][4:12] if CALLING_LEN in frames else b"\x00" * 8
+            if word is None:
+                print("  %-16s no hello and no mode-1 CALLING -> no conv, "
+                      "skipped" % ip, flush=True)
+            else:
+                # iv_gutes_pkt_isDuplicate (0x30180) keys its receive cache on
+                # (frame[4:12], frame[12:16]) -- id8 and seq -- with NO expiry
+                # (iv_gutes_find_rcvpkt walks the whole list, no time test), and
+                # switch case 1 drops a hit at 0x2c5b8 *before* dispatching it.
+                # We deliberately reuse the CALLING's id8, so every forged frame
+                # needs its own seq or only the first conv variant is ever
+                # looked at.  Real seqs are millisecond ticks (the three
+                # captured CALLINGs carry 0x2df83644/46/48, +2 per camera), so
+                # seed from the CALLING's own seq: a value this camera already
+                # accepted in this very session.
+                base = struct.unpack_from("<I", decrypt(frames[CALLING_LEN]),
+                                          12)[0]
+                combos = []
+                for conv in dict.fromkeys(
+                        [word, word | 0x80000000, word & 0x7FFFFFFF]):
+                    combos.append((conv, mtp_res.FLAGS1))
+                    combos.append((conv, 0xD2050000))  # observed high byte
+                for n, (conv, fl) in enumerate(combos):
+                    seq.append(("mtpres",
+                                "mtp_res conv=0x%08x fl=%08x" % (conv, fl),
+                                mtp_res.build(conv, myip, CALLING_PORT, id8,
+                                              seq=base + n, flags=fl)))
+                # Phase E2 (KCP unblock): the 7e a3 adds the relay + arms the
+                # send_rcv_map_port watchdog, but that timer re-arms forever
+                # until obj+0x4ec is set, and the ONLY writer of that byte is
+                # PortStatResp (7f cb).  Send it for every conv variant, right
+                # after the 7e a3 that created the session it must key on.
+                for n, conv in enumerate(dict.fromkeys(
+                        [word, word | 0x80000000, word & 0x7FFFFFFF])):
+                    seq.append(("portstat",
+                                "portstat_resp conv=0x%08x" % conv,
+                                portstat_resp.build(conv, seq=base + n,
+                                                    id8=id8)))
         plan.append((ip, dev, seq))
         print("  %-16s -> %s   local_ip=%s"
               % (ip, " ".join(lbl for _, lbl, _ in seq), myip), flush=True)
@@ -462,6 +520,25 @@ def main():
     n_sent += drain(2.0)
     n_sent += send_step("calling")
     n_sent += drain(2.0)
+
+    # The camera only has a session to look up once it has processed our
+    # CALLING, so the forged MTP_RES has to go strictly after phase A.  If the
+    # field map is right this gives the camera a type-135 channel pointing at
+    # us, which is the one thing its kcb->output gate requires before it will
+    # emit a single `C0 10` KCP packet.
+    if MTPRES:
+        print("\n[phase E] forge 7e a3 MTP_RES_RESPONSE -> type-135 channel",
+              flush=True)
+        n_sent += send_step("mtpres")
+        n_sent += drain(3.0)
+        # Phase E2 (KCP unblock): 7e a3 adds the relay + arms the
+        # send_rcv_map_port watchdog, but that timer re-arms forever until
+        # obj+0x4ec is set, and the ONLY writer of that byte is PortStatResp
+        # (7f cb).  Without this the camera never starts KCP.
+        print("[phase E2] forge 7f cb PortStatResp -> set obj+0x4ec (KCP gate)",
+              flush=True)
+        n_sent += send_step("portstat")
+        n_sent += drain(3.0)
     if KCP:
         tags = list(dict.fromkeys(lbl for k, lbl, _ in plan[0][2]
                                   if k == "kcp"))
