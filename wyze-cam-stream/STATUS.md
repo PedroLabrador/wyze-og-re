@@ -47,10 +47,39 @@ The last unknown blocking our own client is gone, and it was hiding in plain sig
 - The advertised ports match the logcat exactly: `.217→59239`, `.169→63011` — so
   `iv_mtp_session_add_lan_or_nat` was reading this reply all along.
 
-**Next gate: the LAN calling handshake + KCP** — `iv_process_calling` reads `ctx+0x22c`
-(camera IPv4) and `ctx+0x230` (camera port, `strh`), then `iv_mtp_session_add_lan_or_nat`
-→ `iv_mtp_kcp_create`. Our client now knows *where* to dial; it still needs to learn
-*what to send*.
+### MTP layer + direct camera dialogue — solved (2026-10-13, later session)
+
+Full write-up in [`P2P_PROTOCOL.md`](./P2P_PROTOCOL.md) **§5e**. Headlines:
+
+1. **The phone is gone from the handshake.** `p2p_call.py` discovers a camera, replays the
+   app's own captured frames from local port 48171, and the camera answers. Three frames are
+   all it sends: **74 B `C0 90 02 09` session hello, 128 B `7e a4 80 00` CALLING, 76 B
+   `7e b9 4c 00` AvStreamCtl**. The camera replies with `7e a4 20 00` (CALLING ack) and
+   `7e b9 20 00` (AvStreamCtl ack), plus its own ~1 Hz 74 B hello.
+2. **`0xc0` is a *second*, unencrypted layer — the MTP layer.** 6-byte header +
+   `chval = XOR_{i=0..11} rotl16(u16LE(payload[2i:2i+2]), i)` over **payload[0:24] only**.
+   Verified **103/103** frames.
+3. **`wire[1]` bit7 is the packet class selector** — the whole blocker for the first
+   `0x25` probe. `C0 90` → `iv_on_rcv_mtpCtrl_pkt` (control), **`C0 10` →
+   `iv_on_rcv_kcpdata_pkt` (raw KCP segment)**, `C0 80/00` → relay. Sending a control
+   command with `flag=0` put it in the KCP bucket, where its first 4 bytes were read as a
+   `conv` id — hence the silent drop.
+4. **MTP command jump table decoded** (base `0x57f14`, table `0x57f18`): valid types **1..37**;
+   type 1 → `iv_rcv_meter_req` (answers type 2), **type 37 `0x25` →
+   `iv_rcv_kcp_create_msg`, which replies with nothing and creates nothing** — silence after
+   a `0x25` is *correct behaviour*, not rejection.
+5. **KCP wire format recovered**: `C0 10` + 6-byte MTP header + a **standard `ikcp` segment**
+   (24 B header, cmds 81/82/83/84). Two KCP objects per session selected by **conv bit31**
+   (`+0x330` / `+0x334`), and `iv_find_mtp_session` accepts *both* bit forms of the word —
+   send both. `WASK → WINS` is a zero-payload round-trip liveness probe.
+6. **Session lifecycle mapped**: `iv_on_rcv_calling` → `iv_mtp_session_new` → `iv_create_kcb`
+   ×2 → `ivkcp_create(conv, 0)`; `ivkcp_update` runs from a 10 ms timer.
+
+**Next gate: making KCP actually start.** The camera answers our control frames and its
+session/`session+0x10` provably match ours, but **no `C0 10` packet has ever come back**, so
+`WASK → WINS` fails. Two suspects left, in order: `session+0x330/0x334` still NULL because
+`iv_create_kcb`'s channel-array lookup only accepts channel **type 135/136**; or
+`ivkcp_update` not running yet for this session. Then `AVSTREAMCTL` → H.264/H.265.
 
 > [!] **The smali patch made our Mac the only list server.** Experiments now *require*
 > `cap_relay.py`; with it off the app gets no list at all (GDM = 0).
@@ -142,6 +171,11 @@ wyze-re/
 ├── chk_probe.py                       # app-as-checksum-oracle (proved §4a)
 ├── lansniff.py                        # UDP/8899 + :8900 discovery sniffer (found §5d; `55 replay`)
 ├── discover.py                        # STANDALONE camera discovery → P2P port (§5d), 3 s, no app
+├── forge_call.py                      # discovery-reply impersonator → captures the app's CALLING (§5e)
+├── p2p_call.py                        # phone-free camera dialogue: replay hello/CALLING/AvStreamCtl + KCP probe (§5e)
+├── mtp_frame.py                       # the 0xc0 MTP codec: header, chval, packet-class bit (§5e)
+├── analyze_calls.py                   # decodes every captured frame (RC5 key rule)
+├── find_fields.py  find_fields2.py     # session+0x1c..+0x28 tracker (negative result, kept)
 ├── netdump.sh                         # decode /proc/net/* for sockets to the camera LAN IPs
 ├── decode_lr.py                       # LIST_RESP payload decoder (prints the 4 relays)
 ├── probe_real.py                      # sends our packets to the real server, prints responses
@@ -177,14 +211,19 @@ wyze-re/
 > between A/B/C" list is retired. Route C is the only live path, and its first two stages are
 > done, so the list starts where the work now actually is.
 
-1. **KCP + AV framing** — `iv_create_kcb`, `iv_start_process_transfer`,
-   `iv_rcvpkt_AVSTREAMCTL_ACCEPT`, `gute_recv_fragment` (MTU 1032), zlib, then
-   `start_av_enc_dec AudioType=5 VideoType=0`. Get from there to actual H.264/H.265 NAL units.
-   **This is the current gate.**
-2. **The LAN calling handshake** — we now know the endpoint (discovery, §5d) but not the bytes:
-   `iv_init_frm_CALLING` (28 B? type?) → `iv_process_calling` → `iv_mtp_session_add_lan_or_nat`
-   → `gutes_on_ackfrm_Lan_Calling` → `iv_mtp_kcp_create`. Reverse
-   `iv_init_frm_CALLING @ 0x542c0` and `iv_process_calling @ 0x545f8` (both exported).
+1. **Making the camera's KCP start** — every other gate on this layer is passed: our
+   `C0 90` control frames are acked, the session is created, `session+0x10` provably matches,
+   the `0x25` reaches `iv_rcv_kcp_create_msg` (which by design replies with nothing). But
+   **no `C0 10` packet has ever come back**, so `WASK → WINS` fails. Suspects, in order:
+   (a) `session+0x330/0x334` NULL because `iv_create_kcb` only creates a kcb when it finds a
+   channel of **type 135/136** in the `session+0x378` array; (b) `ivkcp_update` not running.
+   Then `iv_rcvpkt_AVSTREAMCTL_ACCEPT` (over KCP) → `gute_recv_fragment` (MTU 1032) → zlib →
+   `start_av_enc_dec AudioType=5 VideoType=0` → H.264/H.265. **This is the current gate.**
+2. ~~**The LAN calling handshake**~~ — [OK] **solved.** The bytes were recovered by capturing the
+   app's frames and replaying them straight at the camera; see §5e for the layouts of the
+   74 B hello, 128 B CALLING and 76 B AvStreamCtl, the three camera replies, the byte-23
+   retransmit rule and the fold-neutral checksum recipe. What remains is *forward* progress
+   (KCP), not recovery of these bytes.
 3. **Byte-exact `certify_req` (type `0x0c`) finalizer** — the format is known from §5a and the
    handshake completes live through our MITM, but no capture has been decrypted to verify the
    bytes (session RC5 key = client nonce, so it is now decryptable — just do it).
@@ -226,7 +265,7 @@ wyze-re/
 | 3 | `init_info` → `GDM_JDAT_RPT` (did↔TID, camera LAN IPs) | [OK] **DONE live** — `online_cnt=4`, `did↔wyze_id`, per-cam LAN IP/MAC/ssid, through our own MITM (§5b, §5c) |
 | 4 | Relay dial: transport + byte-exact type `0x0c` finalizer | [OK] **DONE live** — UDP **and TCP** both relayed; `certify`/`init_info`/`GDM` complete against our Mac. `Detect` 0x01/0x02 formats captured (§5b). Type `0x0c` bytes still not byte-verified. |
 | 4b | **LAN discovery → camera P2P port** | [OK] **DONE standalone** — `discover.py`, all 4 cameras in 3 s, no app, no phone (§5d) |
-| 5 | LAN calling handshake + KCP config + AV channel framing → H.264/H.265 | [~] **AV LINK UP** — LAN-direct call + KCP + `video_decode_proc` reached (§5c). Endpoint now known (4b). Left: `iv_init_frm_CALLING` bytes, `iv_mtp_session_add_lan_or_nat`, KCP config, framing/codec extraction |
+| 5 | LAN calling handshake + KCP config + AV channel framing → H.264/H.265 | [~] **Handshake replayed from the Mac** — all three outbound frames replayed, camera acks both, MTP layer + command table + KCP wire format reversed (§5e). **Blocked on the camera starting KCP** (no `C0 10` packet yet). Left: unblock KCP, KCP config, framing/codec extraction |
 | 6 | Auth to camera (`accessToken` vs LAN password) | [ ] not started |
 | 7 | Python client → `ffmpeg` → HLS/WebRTC → browser grid of 4 → `server.py` | [ ] not started |
 

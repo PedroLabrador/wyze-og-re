@@ -785,6 +785,185 @@ All four advertised ports then pass the ICMP-open test (silent, no port-unreacha
 
 ---
 
+## 5e. The MTP layer (`0xc0`) and KCP — the session channel [WIRE + disassembled]
+
+Two encodings live side by side on the same UDP port:
+
+| magic | layer | encryption | used by |
+|---|---|---|---|
+| `0x7e` / `0x7f` | **GUTES** | RC5-32/6/8 + chk | `certify`, `CALLING` (0xa4), `AvStreamCtl` (0xb9) |
+| `0xc0` | **MTP** | **none** — only a 16-bit `chval` | session hello, meter, `create_kcp_session`, KCP |
+
+### The 6-byte MTP header
+
+```
+[0]     0xc0                    mov r1,#192 / strb
+[1]     0x10 | (class << 7)     p[1] = ((prev & 0x9f) | 0x10) & 0x7f | (flag << 7)
+[2]     (total & 7)             low 3 bits; upper 5 are preserved (& ~7)
+[3]     (total >> 3) & 0xff     total = (p[2] & 7) | (p[3] << 3)   -- 11 bits
+[4:6]   u16 LE = chval ^ u16LE(p[2:4])
+[6:]    payload                 total - 6 bytes
+```
+
+`chval` (`iv_mtpfrm_calc_chval` @ `0x5f110`) covers **only the first 24 bytes of
+payload**, rotating each u16 by its index:
+
+```python
+acc = 0
+for i in range(12):
+    acc ^= rotl16(u16le(payload[2*i:2*i+2]), i)
+```
+
+Verified **103/103 ok, 0 bad** against captured frames.
+
+### `wire[1]` bit7 is the PACKET CLASS selector — this was the blocker
+
+The UDP receive loop (the `recvfrom` driver whose objdump symbol lands on
+`iv_comm_exit`, at `0x340c4`) routes purely on two bits:
+
+```
+wire = pkt + 56
+if wire[0] == 0xc0:
+      bit7 == 1 && bit4 == 1  ->  iv_on_rcv_mtpCtrl_pkt    (C0 90)  MTP control
+      bit7 == 0 && bit4 == 1  ->  iv_on_rcv_kcpdata_pkt    (C0 10)  raw KCP segment
+      bit4 == 0               ->  iv_on_rcv_pkt_as_relay   (C0 80 / C0 00)
+else: GUTES path; if u16LE(wire[2:4]) > 1536 the packet is rejected (log line 0x93)
+```
+
+Sending a control command with `flag=0` puts it in the **KCP** bucket, where the
+first 4 payload bytes are read as a `conv` id — that is why the first type-0x25
+probe vanished without a trace.
+
+Bits 5..6 of `wire[1]` are an "extra 8-byte header" selector every handler reads
+as `(wire[1] >> 5) & 3`: 0 → payload at `+6`, nonzero → payload at `+14`. The
+send path masks those bits off (`& 0x9f`), so on the wire they are always 0.
+
+### MTP command dispatch — `iv_on_rcv_mtpCtrl_pkt` @ `0x57e58`
+
+1. `iv_find_mtp_session(ctx->0x8, payload[4])`; **drop if NULL**
+2. `type = payload[1] - 1`; `if (type > 36) -> default`  → **valid types are 1..37**
+3. jump table at `0x57f18`, PC-relative base `0x57f14`, `target = base + table[i]`
+
+Decoded straight out of the ELF (raw `s32` words):
+
+| inner type | handler | notes |
+|---|---|---|
+| **1** (`0x01`) | `iv_rcv_meter_req` @ `0x57fac` | replies with inner **type 2**, 68 B |
+| 2 (`0x02`) | `iv_rcv_meter_ack` @ `0x57fbc` | |
+| 34 (`0x22`) | `iv_rcv_tcp_link_close` @ `0x57fe8` | |
+| **37 (`0x25`)** | **`iv_rcv_kcp_create_msg`** @ `0x57fcc` | |
+| 3–33, 35, 36 | no-op | |
+
+**`iv_rcv_kcp_create_msg` @ `0x619f8` sends NO reply and creates nothing.** It
+compares `session+0x10` against `payload[4]` (exact, no bit masking), writes
+log line `0x6ce` (1742) on mismatch, and returns. **Silence after a `0x25` is the
+correct behaviour, not a rejection.** It never reads `payload[12:28]`.
+
+### KCP on the wire — `C0 10` + a standard `ikcp` segment
+
+```
+C0 10 <len> <chval> | conv u32 | cmd u8 | frg u8 | wnd u16 | ts u32
+                    | sn u32 | una u32 | len u32 | data...        (all LE)
+```
+
+`ivkcp_*` is **standard ikcp renamed**: `ivkcp_input` @ `0x79ca0` rejects
+anything with `remaining < 24`, and its dispatch tests `#81 #82 #83 #84`
+(`PUSH/ACK/WASK/WINS`).
+
+* `iv_on_rcv_kcpdata_pkt` @ `0x630c0` strips the 6-byte header and uses
+  **`recvfrom_length - 6`** for the payload length (the header length field is
+  not what drives it).
+* session lookup is `iv_find_mtp_session(ctx->0x8, conv)`.
+* **two KCP objects per session**: conv bit31 = 1 → `ivkcp_input(session+0x334)`,
+  bit31 = 0 → `session+0x330`.
+* `iv_find_mtp_session` @ `0x5d96c` matches
+  `conv == s->0x10 | 0x80000000` **or** `conv == s->0x10 & 0x7fffffff`
+  (mask literal `0x7fffffff` at `0x5da04`), so **both bit forms of the same
+  word are accepted** — send both.
+* receiving `WASK` (83) sets `kcp->probe |= 2` (`0x7a24c`) and `ivkcp_flush`
+  then emits `WINS` (84) at `0x7ae7c` — a **zero-payload round trip** that needs
+  no guessed fields, i.e. the ideal liveness probe.
+* `ivkcp_flush` early-returns unless `kcp+0x74 (updated) != 0`; `ivkcp_update`
+  (`0x7bc64`) sets it to 1 and calls flush. `ivkcp_update` is driven by
+  `iv_mtp_session_send_rcv_proc` (`0x64668`, `0x6468c`) from
+  `iv_on_timer_10ms_v2` (`0x3bb80`).
+
+### Session lifecycle
+
+```
+iv_on_rcv_calling @ 0x4d0f0  ──┐
+iv_process_calling @ 0x545f8 ──┴──> iv_mtp_session_new @ 0x5da08
+                                      calloc, memclr, rand x3, iv_getRandomValue,
+                                      rc5_ctx_new + rc5_ctx_setkey (session key),
+                                      8x iv_ringbuf_new, ivudp_listen_new,
+                                      iv_create_kcb x2   (0x5df84, 0x5dfa0),
+                                      iv_mtp_session_meter_proc, ivtimer_create
+iv_on_rcv_calling  ──> iv_mtp_session_add_lan_or_nat  (0x4d478, 0x4d548)
+gat_on_rcvpkt_MTP_RES_RESPONSE ──> the same (x6)      [relay path]
+```
+
+`iv_create_kcb(a, b)` @ `0x5c06c` → **`ivkcp_create(a, 0)` unconditionally**; on
+success it installs the output/log callbacks at `+0xfc`/`+0x104`, stores
+`+0xe8 = b`, and calls `ivkcp_nodelay`. Its tail loops over the channel array at
+`session+0x378` looking for channel type 135/136 and, when found, re-sends a
+frame through `iv_mtp_chnnel_send_mtp_frm(ch, frm, len, 0)` — i.e. **flag 0, a
+`C0 10` KCP packet**.
+
+### The session word `session+0x10`
+
+* It is the u32 at `CALLING[28:32]` **and** at `hello payload[4:8]` — verified
+  equal in every capture pair.
+* **It is random per session**, not derived from the TID: the same TID
+  (`429728658691722`) appears with `0xef34cbd9` in some captures and
+  `0x7be6cb9a` in others. Replays therefore only work within one session's
+  frame set — pick `hello` and `CALLING` for the **same** word.
+* The camera echoes it back: its replies carry `payload[4] == 0xef34cbd9` for the
+  session built from our `CALLING` — proof our `conv` is right.
+
+### The three frames we replay, and the answers we get
+
+```
+74 B   C0 90 02 09  <chval>  00 01 44 00 | word | 0 | sender u64 | receiver u64
+                                     | counter | tick | ...      session hello
+128 B  7e a4 80 00 ...        GUTES, RC5 key = f[0:4]||f[0x14:0x17]||00   CALLING
+ 76 B  7e b9 4c 00 ...        GUTES, same key rule                        AvStreamCtl
+```
+
+Replies, all 32 bytes unless noted:
+
+| frame | meaning |
+|---|---|
+| `7e a4 20 00` | CALLING ack — `[12:16]` echoes request seq |
+| `7e b9 20 00` | AvStreamCtl ack — `[12:16]` echoes request seq |
+| both | `[20:24] = 00 00 11 02`, `[24:28] = 4` |
+| `C0 90 02 09` (74 B) | camera's own hello, `payload[1] = 1`, sent ~1 Hz |
+| `C0 90 02 09` (74 B) | camera's reply to our hello, `payload[1] = 2` |
+
+Retransmit rule: identical `CALLING` retransmits differ **only at byte [23]**
+(the retransmit counter, stamped after the checksum), so `g(header)` is constant
+and edits stay fold-neutral:
+
+```
+chk_new = chk_tmpl ^ fold_tmpl[24:] ^ fold_new[24:]      (BE u32 words)
+```
+
+### [!] Still open on this layer
+
+* **KCP never starts.** `C0 90` control frames are answered, the session is
+  created, `session+0x10` matches — but no `C0 10` packet has ever come back,
+  so `WASK → WINS` fails. Remaining suspects, in order: `session+0x330/0x334`
+  still NULL because the channel-array type-135 lookup in `iv_create_kcb` finds
+  nothing; or `ivkcp_update` not yet running for this session.
+* `iv_send_av_stream_ctl_frm` has not been shown to emit over GUTES vs KCP;
+  `iv_rcvpkt_AVSTREAMCTL_ACCEPT` is definitely reached from
+  `iv_on_rcv_kcp_cmdfrm` (`0x58008`, called by `iv_rcv_tlvfrm` `0x628e8`), so
+  **the ACCEPT arrives over KCP**, while the `7e b9 20` we get is a separate
+  GUTES-level ack.
+* Unknown: the four words `session+0x1c/+0x20/+0x24/+0x28` written into the
+  `0x25` payload. The receiver never reads them, so they are probably ignorable.
+* Discovery-reply checksum rule still unknown (sidestepped with identical
+  clones).
+
 ## 6. Transport [CONFIRMED]
 
 - **KCP over UDP.** Steady state emits `iv_cal_kcp_rate sta_cur->real_snd=… resend_frm=0

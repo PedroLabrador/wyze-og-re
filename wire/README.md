@@ -20,6 +20,17 @@ Captured **2026-10-12**. This is the ground truth that unblocked the wire protoc
 | `list_resp_raw.hex` | the genuine server's reply from `18.118.90.161:51701`, 176 bytes |
 | `list_resp_decrypted.hex` | same after RC5-32/6/8 LE decrypt (header + full payload) |
 | `list_resp_decrypted.txt` | annotated dump of the decrypted response |
+| **`p2p_frames.json`** | **the camera-side handshake frames** — per TID, one internally-consistent group of `hello` (74 B) / `calling` (128 B) / `avstreamctl` (76 B), hex-encoded. Frozen by `../dump_frames.py` so `../p2p_call.py` works from a clean checkout. |
+
+### `p2p_frames.json` — read this before editing it
+
+Captured **2026-10-13** by `../forge_call.py` (a discovery-reply impersonator that makes the
+app dial the Mac instead of the camera). The field `word` is `session+0x10`
+(`P2P_PROTOCOL.md` §5e) and it is **random per session**: the same TID appears with
+`0xef34cbd9` in some captures and `0x7be6cb9a` in others. The camera looks the session up by
+that word, so **`hello` and `calling` must be re-grouped together if you ever regenerate this
+file** — `dump_frames.py` does that grouping for you. Do not hand-merge frames from different
+captures.
 
 ## Verification
 
