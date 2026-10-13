@@ -668,13 +668,21 @@ port:<p>`. Two observations, two different cameras:
 | `192.168.77.17` | `port:63011` |
 | `192.168.77.12` | `port:59239` |
 
-[!] **The port is NOT in `ProReadonly.netInfo`** (it carries ip + mac + ssid only), it is **not**
-stable across the two observations, and it did **not** come from `:8900` — sniffing `0.0.0.0:8900`
-+ `[::]:8900` while the app started captured **0 packets**, even though the app runs
-`broadcast_init` / `send_loop addr_len=28 multicast=ff02::1`. Its origin is the **current
-unknown**: either `lst_devinfo_proc` (the broadcast receiver), an `MTP`/GDM field we have not
-isolated, or a NAT-mapped port handed back by the relay. **Next RE target:
-`iv_mtp_session_add_lan_or_nat` and `iv_process_calling`.**
+**The port's origin is now SOLVED — see §5d.** It is advertised by the camera itself over the
+LAN discovery protocol on UDP/8899, and the two values above match the reply field at offset 44
+byte-for-byte (`.169 → 63011`, `.217 → 59239`).
+
+**Beliefs that were WRONG, now corrected** (kept here so nobody re-walks them):
+
+- [X] "The port comes from `ProReadonly.netInfo`." — it does not; that JSON carries ip/mac/ssid
+  only (`content_len=880`, dumped in full).
+- [X] "The port comes from the GDM / relay / a NAT mapping." — no `ip`/`port` key exists anywhere
+  in the GDM blob, and no camera IP bytes appear in the relay frames.
+- [X] "Sniff `:8900` to see discovery." — the app **binds** :8900 to *receive*, but it **sends**
+  the probe **to :8899**. Sniffing 8900 saw 0 packets; sniffing 8899 saw everything in the first
+  second. (`send_loop` passes `movw r2, #0x22c3` = 8899 as the destination port.)
+- [X] "8900 is where the cameras listen." — 8900/32300/4456 answer with **ICMP port-unreachable**
+  on all four cameras; **8899 and the advertised P2P port do not** (open).
 
 Other AV-leg facts already pinned from these logs:
 
@@ -684,6 +692,96 @@ Other AV-leg facts already pinned from these logs:
 - GDM data objects are queried over the AV link too:
   `giot_get_gdm_data_object_resp tid=CAM-1_D03F27747BB0 … error_code=0 … renew json tree`.
 - Channel types seen: `start_av_enc_dec AudioType=5 VideoType=0`, `conn_type=1`.
+
+---
+
+## 5d. LAN discovery — **how the client learns each camera's P2P port** [WIRE + standalone]
+
+> This closes the last unknown blocking our own client: *where does `port:<p>` come from?*
+
+### The exchange
+
+```
+us  --UDP 28 B-->  192.168.77.18:8899        (also ff02::1 port 8899 from the phone)
+cam --UDP 138 B->  <whatever port we put in the probe>   from <cam>:8899
+```
+
+The camera's IPv4 is simply the **source address of the reply** — nothing in the payload.
+
+### Request — 28 bytes, NOT encrypted, no checksum
+
+| offset | size | value |
+|---|---|---|
+| `0` | 1 | `0x70` magic |
+| `1` | 1 | `0x02` = discovery request |
+| `2` | u16 LE | `28` — total length |
+| `4` | 8 | terminal-id slot, all zero on the wire |
+| `12` | u32 LE | probe counter, +1 every send (`6d44b3de → 6e44b3de → …`) |
+| `16` | 4 | checksum slot — **left zero**, never computed |
+| `20` | u32 LE | flags `0x02010000` (`(flags>>16)&3 == 1`, i.e. "RC5") |
+| `24` | u16 | 0 |
+| `26` | u16 LE | **the port the camera must answer on** (app uses its bound `8900`) |
+
+Although the flags word advertises RC5, the counter at `[12:16]` is plainly visible in the
+clear, so **no encryption and no checksum are applied to this frame type.**
+
+### Reply — 138 bytes, cleartext
+
+| offset | size | value |
+|---|---|---|
+| `0` | 1 | `0x70` |
+| `1` | 1 | `0x03` = discovery reply |
+| `2` | u16 LE | `138` total length |
+| `4` | 8 | zero |
+| `12` | 8 | random |
+| `20` | 4 | zero |
+| `24` | u32 | `1` |
+| `28` | u32 | `0x000e11b2` — **constant across all four cameras** |
+| `32` | u32 | `0x000186d6` — **constant across all four cameras** |
+| `36` | 4 | zero |
+| `40` | u32 | `0x02000054` (`u16@40 = 84`) |
+| **`44`** | **u32 LE** | **the camera's P2P port** |
+| `48` | 10 | zero |
+| **`58`** | **6** | **MAC address** |
+| `64` | u16 | `8` |
+| `66` | 36 | zero |
+| **`102`** | 24 | **ASCII `wyze_id`, NUL padded** (`CAM-1_D03F27747BB0`) |
+
+The payload is **identical on every reply from the same camera** — it is a static advertisement,
+not a session state. So there is no handshake and no cookie: *send 28 bytes, read the answer.*
+
+### Proof — reproducible, no phone, no app
+
+`discover.py` builds the probe from scratch (it does not replay anything) and finds all four
+cameras in 3 s:
+
+```
+$ python3 discover.py
+  192.168.77.11    p2p_port=49706  mac=00:00:00:00:00:02  CAM-1_D03F277576D8
+  192.168.77.10    p2p_port=49802  mac=00:00:00:00:00:03  CAM-1_D03F27EBFB10
+  192.168.77.12    p2p_port=59239  mac=00:00:00:00:00:01  CAM-1_D03F27747BB0
+  192.168.77.17    p2p_port=63011  mac=00:00:00:00:00:04  CAM-1_D03F2776110C
+[done] 4 camera(s)
+```
+
+Both **broadcast** (`192.168.77.18:8899`) and **unicast** to a known camera IP work.
+All four advertised ports then pass the ICMP-open test (silent, no port-unreachable), while
+`8900` / `32300` / `4456` are provably closed on all four.
+
+[!] IPv6 multicast `ff02::1%en0` fails from the Mac with `OSError(65, No route to host)` —
+**IPv4 broadcast is the reliable path**; the IPv6 leg is optional.
+
+### How it was found (audit trail)
+
+1. `GDM` payload dumped in full → **no port key anywhere** (disproved that route).
+2. `nm -D libiotp2pav.so` → `send_loop @ 0x7d778`, `recv_loop @ 0x7d08c`,
+   `get_lan_device_info @ 0x190cc`, `find_dst_id_inlan @ 0x18a74`.
+3. `disfn.py 0x545f8 0x54e24` on `iv_process_calling` → it reads `ctx+0x22c` (IPv4) and
+   `ctx+0x230` (u16, `strh`) and hands both to `iv_mtp_session_add_lan_or_nat`.
+4. `disfn.py 0x7d778 0x7dc00` on `send_loop` → `movw r2, #0x22c3` (8899) passed as the
+   destination port; `send_msg @ 0x7d340` is a plain `sendto()` with `htons(port)`.
+5. Empirical ICMP test → 8899 open on all four cameras, 8900 closed → **sniff the right port**.
+6. `python3 lansniff.py 95 replay` → full request + reply captured in 0.57 s.
 
 ---
 
@@ -730,13 +828,33 @@ AV / channels
   iv_init_frm_mtp_quality           0x582e4
   ivkcp_interval/nodelay/wndsize    0x7c03c / 0x7c094 / 0x7c17c
 
-LAN discovery
-  broadcast_fd_init  0x7c200   binds UDP 8900 (movw r1,#0x22c4 then rev/lsr #16 = htons)
-  broadcast_init     0x7cad8
-  recv_loop          0x7d08c
-  send_msg           0x7d340   generic UDP send(fd, buf, len, port, addr)
-  send_loop          0x7d778   emits to multicast ff02::1
-  start_recv_thread  0x7d5f4   send_loop ipv6 variant uses send_msg_ipv6 0x7d45c
+LAN discovery — see §5d (the whole thing now reversed)
+  broadcast_fd_init  0x7c200   binds the RECEIVE socket on UDP 8900
+                               (movw r1,#0x22c4 = 8900, then rev/lsr #16 = htons)
+  broadcast_init     0x7cad8   ctx+8 = 8900, echoed into every probe's [26:28]
+  recv_loop          0x7d08c   parses the 138-B reply -> lan_device_info list
+  send_msg           0x7d340   sendto(fd, buf, len, ip, htons(port))   [IPv4 only]
+  send_msg_ipv6      0x7d45c   the ff02::1 variant (optional leg)
+  send_loop          0x7d778   emits the 28-B probe to **port 8899**
+                               (movw r2,#0x22c3 = 8899) via IPv4 broadcast + IPv6 mcast
+  start_recv_thread  0x7d5f4
+  find_dst_id_inlan  0x18a74   <-- iv_start_av_link's LAN lookup (called at 0x1c970/0x1c9cc)
+  get_lan_device_info 0x190cc  copies the discovered list (52-B stride, max 256)
+  lst_devinfo_proc   0x18e0c   discovery result handler
+  start_devinfo_proc_thread 0x19a14
+
+LAN call chain (what our client must reproduce next)
+  iv_start_av_link            0x1c860   decides lanCall via find_dst_id_inlan
+  iv_start_process_calling    0x539a8
+  iv_init_frm_CALLING         0x542c0   frame carries the *client's* lan_ipv4
+  iv_process_calling          0x545f8   reads ctx+0x22c (cam IPv4), ctx+0x230 (cam port, strh)
+  iv_mtp_session_add_lan_or_nat 0x5ffcc  logs "lan dstAddr:<ip> port:<p>"
+  gutes_on_ackfrm_Lan_Calling 0x5456c
+  iv_on_ackfrm_Calling        0x54e24
+  iv_mtp_session_new          0x5da08
+  iv_mtp_kcp_create           0x61798   <-- KCP session
+  iv_create_kcb               0x5c06c   <-- KCP control block
+  iv_init_frm_AvStreamCtl     0x53274
 ```
 
 > [!] **Address caveat:** these are **armeabi-v7a** addresses. The arm64-v8a copies of the same
@@ -775,11 +893,14 @@ LAN discovery
 
 | # | Earlier belief | Reality |
 |---|---|---|
-| D16 | Live view is LAN-direct **TCP** to `192.168.77.12:59239` | **False.** Full TCP sweep of all cameras is empty; transport is KCP/**UDP**. The old `port:59239` log line was misread. |
-| D17 | LAN discovery is **IPv4 broadcast to :8900** | **False / unproven.** App binds :8900 to *receive*, but discovery sends to **IPv6 multicast ff02::1**. IPv4 listeners see nothing. |
+| D16 | Live view is LAN-direct **TCP** to `192.168.77.12:59239` | **Half-right.** TCP was correctly ruled out (full TCP sweep empty; transport is KCP/**UDP**), but `59239` is *not* misread — it is a genuine camera port, advertised at reply offset 44 (§5d). |
+| D17 | LAN discovery is **IPv4 broadcast to :8900** → "unproven, IPv4 listeners see nothing" | **The conclusion was wrong, the sniff was on the wrong port.** The app **binds** :8900 to receive and **sends to :8899**. Sniffing 8899 captures everything in <1 s (§5d). |
 | D18 | `tid_key_map` is populated locally or via HTTP | **False.** Delivered by the relay: `gat_rcv_init_info_msg_resp did=… <--> wyze_id:…`. |
-| D19 | Camera LAN IPs come from LAN discovery | **False.** They arrive through the relay in `GDM_JDAT_RPT_REQ` `netInfo.stVal.ip`. |
+| D19 | Camera LAN IPs come from LAN discovery | **False** for the app's path — they arrive via the relay in `GDM_JDAT_RPT_REQ` `netInfo.stVal.ip`. But LAN discovery *does* also return the IP as the reply's source address, and that is what our client should use (§5d). |
 | D20 | Frames are in the clear | **False.** RC5-encrypted — but with a header-derived key (§5), so not a hard barrier. |
+| D21 | Camera P2P port might live in `ProReadonly.netInfo`, the GDM blob, the relay frames, or be NAT-mapped back by the relay | **All false.** It is advertised by the camera over **UDP/8899 discovery, reply offset 44** (§5d). |
+| D22 | Sniffing `0.0.0.0:8900` proves discovery is not IPv4 | **False methodology.** The bind port and the destination port differ. Always ICMP-probe first (8900 closed, 8899 open) before concluding a protocol is absent. |
+| D23 | The advertised P2P port changes between runs | **False so far.** `.217→59239` and `.169→63011` reproduced byte-identically across an app restart and independent probes (cameras not rebooted). |
 
 ## 10. Confirmed today
 
@@ -809,6 +930,9 @@ LAN discovery
 | C36 | **[DISASSEMBLED]** `certify_req` = type `0x0c`, 64 B header+body: flags word `0x01410000` @+20, `hash(nonce)` @+28, **32-B RC5 nonce @+32** |
 | C37 | **[DISASSEMBLED]** `certify_resp` reports `u16 errcode` at `+26` and an **8-byte token** at `+28..+36`, echoed in later requests by `frame+24 bit2` |
 | C38 | **[DISASSEMBLED]** **The GUTES session RC5 key = the client's own 32-byte nonce** — `rc5_ctx_setkey(ctx+0xd8, ctx+156, 32)` right after a successful `certify` |
+| C39 | **[WIRE]** **LAN discovery solved**: 28-B request → `192.168.77.18:8899`, 138-B cleartext reply; **P2P port at offset 44, MAC at 58, `wyze_id` at 102**; camera IP = reply source address |
+| C40 | **[STANDALONE]** `discover.py` finds **all 4 cameras in 3 s** from the Mac with no app and no phone involved; broadcast and unicast both work |
+| C41 | **[EMPIRICAL]** On all four cameras UDP **8899 and the advertised P2P port are open**; **8900 / 32300 / 4456 are closed** (ICMP port-unreachable) |
 
 ---
 

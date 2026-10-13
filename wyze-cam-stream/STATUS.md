@@ -27,8 +27,30 @@
    `cap_relay.py`.
 6. **The relay dials over TCP as well as UDP** — `ivtcp_start_connect` must be satisfied or the
    session stalls; all four genuine relays accept TCP.
-7. **Remaining gate**: where the camera's P2P port comes from (not in `netInfo`, not `:8900`,
-   not stable). See `P2P_PROTOCOL.md` §5c.
+7. **[OK] Remaining gate SOLVED (2026-10-13 later): the camera's P2P port comes from the camera
+   itself**, via LAN discovery on **UDP/8899** — 28-byte request, 138-byte cleartext reply with
+   the port at **offset 44**, MAC at 58, `wyze_id` at 102, camera IP = reply source address.
+   `discover.py` finds **all 4 cameras in 3 s from the Mac with no app at all**.
+   Full spec + audit trail: `P2P_PROTOCOL.md` **§5d**.
+
+### LAN discovery — solved (2026-10-13, this session)
+
+The last unknown blocking our own client is gone, and it was hiding in plain sight:
+
+- `send_loop` (`0x7d778`) passes `movw r2, #0x22c3` = **8899** as the destination port — we had
+  been sniffing **8900**, which is only the app's *receive* socket. 0 packets was the wrong
+  experiment, not a negative result.
+- Empirical ICMP triage settled it: **8900 / 32300 / 4456 are closed on all four cameras,
+  8899 and the advertised P2P port are open.**
+- `python3 lansniff.py 95 replay` captured the whole exchange in 0.57 s.
+- `python3 discover.py` then reproduced it **standalone**, without replaying any app traffic.
+- The advertised ports match the logcat exactly: `.217→59239`, `.169→63011` — so
+  `iv_mtp_session_add_lan_or_nat` was reading this reply all along.
+
+**Next gate: the LAN calling handshake + KCP** — `iv_process_calling` reads `ctx+0x22c`
+(camera IPv4) and `ctx+0x230` (camera port, `strh`), then `iv_mtp_session_add_lan_or_nat`
+→ `iv_mtp_kcp_create`. Our client now knows *where* to dial; it still needs to learn
+*what to send*.
 
 > [!] **The smali patch made our Mac the only list server.** Experiments now *require*
 > `cap_relay.py`; with it off the app gets no list at all (GDM = 0).
@@ -118,7 +140,8 @@ wyze-re/
 ├── listreq.py                         # byte-exact LIST_REQUEST builder (checksum + RC5-32/6/8)
 ├── cap_relay.py                       # list-server impersonator + relay MITM (UDP+TCP, fold-neutral)
 ├── chk_probe.py                       # app-as-checksum-oracle (proved §4a)
-├── lansniff.py                        # UDP/8900 + [::]:8900 discovery sniffer (negative result, §5c)
+├── lansniff.py                        # UDP/8899 + :8900 discovery sniffer (found §5d; `55 replay`)
+├── discover.py                        # STANDALONE camera discovery → P2P port (§5d), 3 s, no app
 ├── netdump.sh                         # decode /proc/net/* for sockets to the camera LAN IPs
 ├── decode_lr.py                       # LIST_RESP payload decoder (prints the 4 relays)
 ├── probe_real.py                      # sends our packets to the real server, prints responses
@@ -141,7 +164,9 @@ wyze-re/
 3. `Signature2` GET rule cracked, **verified 30/30**.
 4. Device list via `home_page/get_object_list` → 4 cameras → `wyze_devices.json`.
 5. Streaming identified: **TUTK Kalay + Gwell IoTVideo P2P**, KVS ruled out.
-6. **LAN-direct TCP** discovered (`dstAddr:192.168.77.12 port:59239`), camera LAN IPs from the API.
+6. **LAN-direct call** identified (`dstAddr:192.168.77.12 port:59239`), camera LAN IPs from the API.
+   *(Corrected: it is **UDP**, not TCP — full TCP sweep empty. The port itself was real and is
+   now explained: discovery reply offset 44, §5d.)*
 7. `accessId` + per-device `accessToken` harvested from logcat (7-day TTL).
 8. Toolchain ready: NDK r30, apktool, uber-apk-signer, keystore; device runs native bins; `run-as` works.
 9. Docs written with [OK]/[X] verdict board; files consolidated into `wyze-re/`.
@@ -152,14 +177,14 @@ wyze-re/
 > between A/B/C" list is retired. Route C is the only live path, and its first two stages are
 > done, so the list starts where the work now actually is.
 
-1. **The camera's P2P port** — `iv_mtp_session_add_lan_or_nat lan dstAddr:<cam> port:<p>` gives
-   `192.168.77.17:63011` and `192.168.77.12:59239`, but the port is **not** in
-   `ProReadonly.netInfo`, is not stable, and did not come from `:8900` (sniffed — 0 packets).
-   Reverse `iv_mtp_session_add_lan_or_nat` / `iv_process_calling`, or find the
-   `lst_devinfo_proc` broadcast response. **This is the current gate.**
-2. **KCP + AV framing** — `iv_create_kcb`, `iv_start_process_transfer`,
+1. **KCP + AV framing** — `iv_create_kcb`, `iv_start_process_transfer`,
    `iv_rcvpkt_AVSTREAMCTL_ACCEPT`, `gute_recv_fragment` (MTU 1032), zlib, then
    `start_av_enc_dec AudioType=5 VideoType=0`. Get from there to actual H.264/H.265 NAL units.
+   **This is the current gate.**
+2. **The LAN calling handshake** — we now know the endpoint (discovery, §5d) but not the bytes:
+   `iv_init_frm_CALLING` (28 B? type?) → `iv_process_calling` → `iv_mtp_session_add_lan_or_nat`
+   → `gutes_on_ackfrm_Lan_Calling` → `iv_mtp_kcp_create`. Reverse
+   `iv_init_frm_CALLING @ 0x542c0` and `iv_process_calling @ 0x545f8` (both exported).
 3. **Byte-exact `certify_req` (type `0x0c`) finalizer** — the format is known from §5a and the
    handshake completes live through our MITM, but no capture has been decrypted to verify the
    bytes (session RC5 key = client nonce, so it is now decryptable — just do it).
@@ -175,10 +200,10 @@ wyze-re/
 ### Retired / superseded (kept so nobody re-opens them)
 - [X] *APK frame-tap (Route A)* — needs the phone app running. User vetoed.
 - [X] *Native harness on the phone (Route B)* — phone must not be involved. User vetoed.
-- [X] *UDP broadcast discovery as a gateway step* — superseded. The cameras are reached via the
-  relay → KCP path, and their LAN IPs are handed to us by the relay (`GDM_JDAT_RPT`), not
-  discovered locally. The app *binds* `:8900` to receive but sends discovery to **IPv6
-  multicast ff02::1**, which our IPv4 listener never saw (verdict D17).
+- [OK] **UN-retired:** *"UDP broadcast discovery is a dead end"* was **wrong** (old D17). Discovery
+  is real and now fully reversed — it is **IPv4 broadcast to :8899**, not IPv6-only, and it is
+  exactly how our client gets the P2P port. See `P2P_PROTOCOL.md` §5d. What the relay (`GDM`)
+  hands the app and what discovery hands us are two views of the same data; **use discovery**.
 
 ## DECISION (locked, from user)
 > **"I do not want an app running. I want to run a webserver, log in, and see all
@@ -200,7 +225,8 @@ wyze-re/
 | 2 | GUTES `certify` → session key | [OK] **DONE** — frame format + `rc5_ctx_setkey(nonce, 32)` (§5a) |
 | 3 | `init_info` → `GDM_JDAT_RPT` (did↔TID, camera LAN IPs) | [OK] **DONE live** — `online_cnt=4`, `did↔wyze_id`, per-cam LAN IP/MAC/ssid, through our own MITM (§5b, §5c) |
 | 4 | Relay dial: transport + byte-exact type `0x0c` finalizer | [OK] **DONE live** — UDP **and TCP** both relayed; `certify`/`init_info`/`GDM` complete against our Mac. `Detect` 0x01/0x02 formats captured (§5b). Type `0x0c` bytes still not byte-verified. |
-| 5 | KCP config + AV channel framing → H.264/H.265 | [~] **AV LINK UP** — LAN-direct call + KCP + `video_decode_proc` reached (§5c). Left: how the camera port is obtained, `iv_mtp_session_add_lan_or_nat`, framing/codec extraction |
+| 4b | **LAN discovery → camera P2P port** | [OK] **DONE standalone** — `discover.py`, all 4 cameras in 3 s, no app, no phone (§5d) |
+| 5 | LAN calling handshake + KCP config + AV channel framing → H.264/H.265 | [~] **AV LINK UP** — LAN-direct call + KCP + `video_decode_proc` reached (§5c). Endpoint now known (4b). Left: `iv_init_frm_CALLING` bytes, `iv_mtp_session_add_lan_or_nat`, KCP config, framing/codec extraction |
 | 6 | Auth to camera (`accessToken` vs LAN password) | [ ] not started |
 | 7 | Python client → `ffmpeg` → HLS/WebRTC → browser grid of 4 → `server.py` | [ ] not started |
 
