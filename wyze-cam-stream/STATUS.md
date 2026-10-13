@@ -87,11 +87,22 @@ and then **discards every outgoing segment** because it has no relay channel. Th
 why not a single `C0 10` packet has ever come back, and it is *not* a bug in
 `p2p_call.py`.
 
-**So the remaining work is the relay route, and we already hold every card for it:**
-the `accessId` + per-device `accessToken` from `regist_gw_user` (§1), the relay
-endpoints from `LIST_RESP` (§3), and `cap_relay.py`, which already MITMs the app's
-entire relay dialogue end-to-end. Replay the `gat`/`MTP_RES` dialogue from the Mac the
-same way `p2p_call.py` replayed the LAN frames. Then `AVSTREAMCTL` → H.264/H.265.
+**So the remaining work is the relay rendezvous — and it may not even need AWS (§5g).**
+`init_frm_mtp_res_request` builds a GUTES **`7f a2` MTP_RES** frame (122 B) and it is called
+from **`iv_on_rcv_calling`**, i.e. from the *LAN* calling path. Meanwhile the receive router's
+`C0`-`bit4=0` branch feeds `iv_on_rcv_pkt_as_relay` → `giot_on_rcvpkt` →
+`gat_on_rcvpkt_MTP_RES_RESPONSE` **on the same LAN socket**. And the wire agrees we never did
+it: across 294 captured camera replies there are only `c0 90` / `7e b9` / `7e a4` — **no `7f`
+frame at all, and no KCP** — while the relay leg of the `cap_relay.py` session carried **zero
+`C0` frames** even when the control plane ran end-to-end.
+
+**Immediate next experiment (cheap):** send our own `7f a2` `MTP_RES` at a camera from
+`p2p_call.py`. It is an ordinary GUTES frame, so the §4 request checksum + §5 RC5 rule
+(both already byte-exact for outgoing frames) cover it. If the rendezvous is peer-to-peer,
+that is the *one* missing frame and the relay is unnecessary. Fallback, if it is refused:
+the full relay route — we already hold the `accessId` + per-device `accessToken` from
+`regist_gw_user` (§1), the relay endpoints from `LIST_RESP` (§3), and `cap_relay.py`, which
+already MITMs the app's entire relay dialogue. Then `AVSTREAMCTL` → H.264/H.265.
 
 > [!] **The smali patch made our Mac the only list server.** Experiments now *require*
 > `cap_relay.py`; with it off the app gets no list at all (GDM = 0).

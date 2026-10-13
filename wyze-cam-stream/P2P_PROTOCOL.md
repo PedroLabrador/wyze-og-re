@@ -1117,6 +1117,69 @@ same (no type-135 channel ⇒ no KCP), but the mechanism is in the output path, 
 because it means the camera **accepts and buffers** our KCP segments regardless — it just can
 never emit.
 
+---
+
+## 5g. The missing handshake step: `MTP_RES` (`7f a2`)  [REVERSED — NOT YET SENT]
+
+Follow-on from §5f. Three independent checks all point at the same missing frame.
+
+**1. The LAN calling path *builds* an MTP_RES request.** `init_frm_mtp_res_request @ 0x4cc04`
+is called from **`iv_on_rcv_calling @ 0x4d6c4`** — i.e. the peer that receives a `CALLING`
+turns around and emits an `MTP_RES`. Layout (all little-endian):
+
+| offset | field |
+|---|---|
+| `[0]` | `0x7f` |
+| `[1]` | `0xa2` |
+| `[2:4]` | `u16` total length = **122** |
+| `[4:12]` | `u64` = `ctx+0x240` (low) / `ctx+0x244` (high) — an ID |
+| `[24:26]` | `u16` = 0 (or'd with 4 when `ctx+1012 != 0`) |
+| `[26:30]` | `u32` = `arg2+0x1c` |
+| `[30:38]` | `u64` = `arg2+0x20` / `arg2+0x24` |
+| `[38:46]` | `u64` = `arg2+0x28` / `arg2+0x2c` |
+| `[46:82]` | 36 B copied from `arg2+48` |
+| `[82:122]` | tail (40 B, not yet fully decoded) |
+
+**2. The relay-class path exists on the *LAN* socket.** The receive router at `0x340c4` splits
+`C0` frames by `wire[1]` bit 4, and its **`bit4 == 0` branch (`C0 80`/`C0 00`) calls
+`iv_on_rcv_pkt_as_relay @ 0x63330`** — reachable from the same UDP port the camera advertises.
+Non-`C0` GUTES frames continue on to `giot_on_rcvpkt @ 0x520c8`, which is the very function
+that dispatches `gat_on_rcvpkt_MTP_RES_RESPONSE @ 0x4bafc`.
+
+So the rendezvous protocol is **not** confined to the AWS relay connection: it is routable on
+the P2P socket itself.
+
+**3. Wire evidence that we simply never did it.** Across **294** captured camera replies there
+are exactly three frame types and nothing else:
+
+```
+len=74  c0 90   x215     the camera's own MTP hello
+len=32  7e b9   x56      AvStreamCtl ack
+len=32  7e a4   x23      CALLING ack
+zero 7f frames.  zero C0 10 (KCP) frames.
+```
+
+And on the relay leg of the `cap_relay.py` session there are **zero `C0` frames** too — which
+is the important negative: even when the control plane ran end-to-end through the relay, KCP
+never went over it. The type-135 channel is *created by* the rendezvous but *carries the
+traffic itself* (its sockaddr is whatever the peer reported — LAN on one subnet).
+
+### What to do next
+
+Send a `7f a2` `MTP_RES` ourselves. It is a plain GUTES frame, so the §4 request checksum and
+the §5 RC5 rule apply and are both already byte-exact for outgoing frames. Two sub-questions
+remain and both are cheap to settle by experiment:
+
+* **Is `MTP_RES` peer-to-peer or peer-to-relay?** §5g(2) says the machinery is present on the
+  P2P socket, and `init_frm_mtp_res_request` is built in the *LAN* calling handler — both argue
+  peer-to-peer. If so, the relay is unnecessary and `p2p_call.py` only needs one more frame.
+* **Who answers, and with which GUTES type?** Only `MTP_RES_RESPONSE` is exported, so the
+  reply type is whatever `giot_on_rcvpkt` maps to it. Capturing one from a real app session
+  (re-run `cap_relay.py`) would settle it without more disassembly.
+
+The relay route (§5f) is the fallback if peer-to-peer rendezvous turns out to be refused.
+
+
 
 ## 6. Transport [CONFIRMED]
 
@@ -1190,6 +1253,13 @@ LAN call chain (what our client must reproduce next)
   iv_mtp_session_add_tcp_relay  0x5f500  *** creates channel type 135/136 ***
   gat_on_rcvpkt_MTP_RES_RESPONSE 0x4bafc *** ONLY caller of both add_*_relay ***
                                           -> the relay rendezvous (see 5f)
+  init_frm_mtp_res_request     0x4cc04   builds the 122-B GUTES 7f a2 MTP_RES;
+                                          CALLED FROM iv_on_rcv_calling 0x4d6c4
+                                          -> the LAN calling path! (see 5g)
+  iv_on_rcv_pkt_as_relay       0x63330   relay-class C0 frames, reachable from
+                                          the LAN socket (router 0x340c4 bit4=0)
+  giot_on_rcvpkt               0x520c8   top-level GUTES dispatcher; routes
+                                          gat_on_rcvpkt_* (incl. MTP_RES_RESPONSE)
   gutes_on_ackfrm_Lan_Calling 0x5456c
   iv_on_ackfrm_Calling        0x54e24
   iv_mtp_session_new          0x5da08
