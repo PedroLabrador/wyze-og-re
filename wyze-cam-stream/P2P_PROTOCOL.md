@@ -3,7 +3,12 @@
 > **This file is ground truth recovered on 2026-10-12** from static disassembly of
 > `lib/armeabi-v7a/libiotp2pav.so` **corroborated by live `logcat`** from the running app.
 > Confidence is marked per item: **[CONFIRMED]** = seen in disassembly *and/or* log output,
-> **[INFERRED]** = read out of code but not yet observed on the wire.
+> **[WIRE]** = captured on the wire (highest confidence — byte-exact), **[INFERRED]** = read out
+> of code but not yet observed on the wire.
+>
+> **The `LIST_REQUEST`/`LIST_RESP` exchange is now [WIRE]-confirmed end to end.** Our Python
+> builder reproduces the app's own packet **byte for byte**, and the genuine list server answers
+> it. See §3a.
 >
 > Companion docs: [`STATUS.md`](./STATUS.md), [`REVERSE_ENGINEERING.md`](./REVERSE_ENGINEERING.md),
 > [`SECRETS.md`](./SECRETS.md).
@@ -128,6 +133,125 @@ off  size  field
 **[CONFIRMED]** flags bits 16–17 control the crypto mode: `iv_gute_frm_rc5_encrypt` branches on
 `(*(u32*)(buf+0x14) >> 16) & 3`; only the `== 1` branch (header-derived key) is taken here.
 
+**Correction on offset 4 and on the sequence number** (learned from the wire, §3a):
+the value written at `buf[4:12]` at *build* time is **not** the value that goes on the wire, and
+`seq` is **always 0** for this frame type.
+
+---
+
+## 3a. Ground truth — the real packet, captured [WIRE]
+
+### How it was captured
+
+Rather than guessing crypto parameters against a silent server, the app's **own** list-server
+host was redirected at this Mac:
+
+1. `smali_classes6/com/gwell/common/data/GWApi.smali` line 727, inside
+   `getBaseServerUrl()` (the `:cond_5` official branch):
+   `const-string v0, "|192.168.77.13"` (was `"|wyze-mars-asrv.wyzecam.com"`).
+   `MarsUrl` deliberately left untouched so OAuth still works.
+2. `apktool b` → `uber-apk-signer --ks wyze_debug.keystore --ksAlias wyze --ksPass android
+   --ksKeyPass android` → `adb install -r` (same signature ⇒ login preserved).
+3. `cap_listsrv2.py` listens on **UDP+TCP 51701** (both — see the HTTP fallback below).
+
+> `GWApi.GWellP2PUrl` is a pipe-delimited list: `"" , host [, fallback_ip]`, and it is written
+> only by `getBaseServerUrl()`. `setGWellP2PUrl` is never called.
+> Install needs free space (`pm trim-caches 4G`) — a 244 MB APK alongside the old one overflowed
+> `/data` the first time.
+
+### The request the app actually sent
+
+```
+7f152800 4b64b35d7f2dddab 94d93411 e3835696 00000100
+000102030405060708090a0b0c0d0e0f
+```
+identical on every retransmission and **identical across a full app restart** (only the UDP
+source port changes).
+
+### The response, decrypted
+
+```
+magic 0x7F  type 0x16 (22) = LIST_RESP  total 176  flags 0x000185f4
+key  = 7f16b000f4850100            # same header-derived rule as the request
+[12:20] -> seq=1596074741  chk=0xaa0ab28a
+payload = 176 - 24 = 152 bytes, 19 RC5 blocks, decrypted clean (no residual garbage)
+```
+
+Decrypted payload (offsets are from the frame start):
+
+```
+ 24: 02 00 00 00 81 00 04 00 03 0d d4 18 00 00 00 00
+ 40: 00 00 00 00 00 00 00 00 00 00 00 00 01 00 31 00
+ 56: 70 80 70 80 a0 29 67 e8 00 00 00 00 2c ee 68 fc
+ 72: 26 00 1f 13 0a c8 36 0b ff c0 38 53 a1 f3 e9 92
+ 88: 09 00 12 00 01 bb 01 bb 1f 41 67 e8 00 00 00 00
+104: 36 d0 10 f5 00 00 00 00 00 00 00 00 00 00 00 00
+120: 00 00 00 00 01 00 3a 00 01 bb 01 bb b1 bd 67 e8
+136: 00 00 00 00 34 28 dd fd 26 00 1f 13 0a c8 36 0c
+152: f5 86 1a db 61 e6 88 f9 09 00 1c 00 c9 f9 c9 f9
+168: 52 09 67 e8 00 00 00 00
+```
+
+**[INFERRED]** `LIST_RESP` layout is **not yet decoded**. What is solid so far:
+- there is a **36-byte stride** — the marker `?? ?? 67 e8` recurs at +62/+98/+134/+170.
+- four network-order IPv4s sit at a fixed +12 offset inside each stride:
+  `44.238.104.252` (+68), `54.208.16.245` (+104), `52.40.221.253` (+140) — all AWS — plus
+  `3.13.212.24` at +32 (also seen in logcat as `iv_addRmtP2pSrv … srv_id=49`).
+- `192.168.77.15` / `192.168.77.16` at +76/+148 (private; likely an alternate path).
+- the 4 bytes before each marker are a repeated u16: `70 80 70 80`, `01 bb 01 bb`, `01 bb 01 bb`,
+  `c9 f9 c9 f9` — `01 bb` = **443** and `c9 f9` = **51705** read big-endian ⇒ *probably* a
+  `tcp_port || udp_port` pair, one pair per record. Ports `443`/`51705` at `+92/+93` and
+  `+128/+129`.
+
+### What the server actually accepts (probed against `18.118.90.161:51701`)
+
+| packet | `[4:12]` | checksum over | result |
+|---|---|---|---|
+| app verbatim | `d_real` | `d_log` | [OK] **176-byte `LIST_RESP`** |
+| self-consistent | `d_log` | `d_log` | [X] timeout |
+| self-consistent | `d_real` | `d_real` | [X] timeout |
+| `seq=1` | `d_real` | `d_log` (seq 1) | [X] timeout |
+
+where
+```
+d_log = 9512032141665525923   = 0x840186d6001260a3   # = logcat devID/srcID (terminal ID)
+d_real= 12384104575394866251  = 0xabdd2d7f5db3644b   # value that goes on the wire at [4:12]
+```
+
+So the wire format is: **`buf[4:12] = d_real`, but the checksum is computed over `d_log`.**
+Both are **stable constants** for this install (verified across a restart), and `seq` **must be
+0** — consistent with the builder, which only increments when `(*(ctx+0x1548))->field_0x68 != 0`;
+for `LIST_REQUEST` that field is `0`, so it writes `0` and skips the increment.
+
+- `d_log` is the phone's P2P terminal ID (see §1) and is what the server evidently looks the
+  client up by. **[OPEN]** where `d_real` comes from — it is *not* RC5 of `d_log` (tried the
+  header key), and it does not XOR to any obvious constant. Practical answer: **hardcode both.**
+- `iv_init_frm_listsrv` writes `ctx+0x240 / ctx+0x244` into `buf[4:12]` **once**, *before*
+  `chkval` @ `0x36654`, and nothing in the function touches it afterwards ⇒ the swap to
+  `d_real` happens between the build and the send. **[OPEN]** where.
+
+### HTTP fallback [WIRE]
+
+The client alternates transports, both on port 51701:
+
+```
+iv_send_list_request mode=0 -> UDP ListFrmRequest
+iv_send_list_request mode=1 -> evhttp_connection   (HTTP fallback)
+iv_on_timeout_query_listsrv_resend: send HTTP ListFrmRequest to ipv4=…:51701, ms_timeout = 1000
+iv_http_list_request_done: pkt->data_len=0
+```
+
+The HTTP request body is the same 40 raw bytes.
+
+### Our builder reproduces the app exactly
+
+```python
+build() == app_packet   # True
+```
+
+i.e. frame layout + checksum + RC5-32/6/8 little-endian are all **byte-exact**. See
+`listreq.py` and `probe_real.py`.
+
 ---
 
 ## 4. Checksum — plain XOR over 32-bit words [CONFIRMED]
@@ -151,6 +275,10 @@ def chkval(buf, payload_len):          # payload_len = gute_get_encrypt_data_len
 - Result is stored at **offset 16** (`str r0, [r2, #0x10]` in `iv_init_frm_listsrv`).
 - `gute_get_encrypt_data_len` @ `0x2a9b4` returns the *payload* length; for a 40-byte frame the
   checksum loop indexes offsets 24/28/32/36 ⇒ payload = 16 ⇒ **`payload_len = total_len − 24`**.
+- **[WIRE]** the algorithm above is byte-exact: feeding it the plaintext terminal ID reproduces
+  the app's encrypted `chk` field exactly, and the same function validates against the decrypted
+  `LIST_RESP`. [!] but note the `d_log`/`d_real` split in §3a — the words at offsets 4/8 that go
+  into the checksum are **not** the ones that end up on the wire.
 
 ---
 
@@ -174,15 +302,38 @@ So the on-wire layout is:
 - **offsets 20–23**: plaintext flags (part of the key)
 - **offsets 24+**: RC5-encrypted payload
 
-### Open on RC5
-- `rc5_ctx_setkey` @ `0x64b08` dispatches on `ctx->wordsize` (byte at `ctx+2`): **16 / 32 / 64**.
-  The 32-bit path is `0x64e7c`, 64-bit `0x650f8`. P = `0xB7E15163` is present in `.rodata`;
-  **the round count and the exact wordsize used for this context are not yet pinned down.**
-  `rc5_ctx_enc` operates on 8-byte blocks, consistent with RC5-64, but this is **[INFERRED]**.
-- Related symbols: `rc5_ctx_new 0x64994`, `rc5_ctx_free 0x64ae8`, `rc5_enc32 0x65dbc`,
-  `rc5_enc64 0x65ee4`, `rc5_encrypt 0x66044`, `rc5_ctx_dec 0x658d0`.
-- `iv_gute_frm_encrypt_id 0x2ac40` / `iv_gute_frm_decrypt_id 0x2acec` also exist (separate from
-  the frame crypto).
+### RC5 parameters — PINNED [WIRE]
+
+**RC5-32, 6 rounds, 8-byte key, 8-byte blocks, little-endian block words.**
+
+Evidence chain:
+- call site does `movw r1,#0x8; movw r2,#0x6` → `rc5_ctx_new(8,6)`, stored at `struct+0xd4`
+  (the context `iv_gute_frm_rc5_encrypt` reads).
+- `ctx[0]=6` (rounds), `ctx[1]=8`, `ctx[2]=ctx[1]<<2 = 32`.
+- `rc5_enc64` requires `ctx[1]==8` (ours), `rc5_enc32` requires `==4` ⇒ we take the 64-bit-block
+  routine. Function names mean **block size in bits**; `ctx[2]` is the **word** size.
+- S-table = `(6+1)*8 = 56 B = 14 × 4-byte words` = `2(r+1)` ⇒ word = 32 bits ⇒ **RC5-32**.
+- inner routine `movw r0,#0x20` → rotate mask `32`.
+- `rc5_ctx_setkey` switches on `ctx[2] ∈ {16,32,64}` = word bits.
+
+**Byte order = little-endian** — proven on the wire: decrypting `LIST_RESP[24:40]` yields
+`0100000000000000`, exactly the planned `u16(1)` at offset 24 with zero padding.
+
+Decryption (the inverse of §5):
+```python
+def rc5_dec(S, blk):                       # RC5-32/6, blk = 8 bytes
+    A = int.from_bytes(blk[0:4], "little"); B = int.from_bytes(blk[4:8], "little")
+    for i in range(6, 0, -1):
+        B = rotr32((B - S[2*i+1]) & MASK, A) ^ A
+        A = rotr32((A - S[2*i])   & MASK, B) ^ B
+    B = (B - S[1]) & MASK; A = (A - S[0]) & MASK
+    return A.to_bytes(4, "little") + B.to_bytes(4, "little")
+```
+
+Still **[OPEN]**: `iv_gute_frm_encrypt_id 0x2ac40` / `iv_gute_frm_decrypt_id 0x2acec` — a
+separate ID transform, possibly the source of `d_real` (§3a).
+Related symbols: `rc5_ctx_new 0x64994`, `rc5_ctx_free 0x64ae8`, `rc5_ctx_setkey 0x64b08`,
+`rc5_enc32 0x65dbc`, `rc5_enc64 0x65ee4`, `rc5_encrypt 0x66044`, `rc5_ctx_dec 0x658d0`.
 
 ---
 
@@ -253,11 +404,20 @@ LAN discovery
   order: `PLT_stub[n] = 0x12588 + n*12`. (Stubs are 12 bytes: 3 ARM words.)
 - `nm -D` for dynamic symbols; `nm` alone misses statics.
 - Scripts written today: `watch_lan.py` (UDP + `/proc/net/tcp` poller), `capture_mcast.py`
-  (IPv6 multicast listener), `capture_setup.py` (cold-start + navigate + pid-filtered logcat).
+  (IPv6 multicast listener), `capture_setup.py` (cold-start + navigate + pid-filtered logcat),
+  **`listreq.py`** (frame builder + checksum + RC5, byte-exact), **`cap_listsrv2.py`**
+  (UDP+TCP list-server impersonator), **`probe_real.py`** (send to the genuine server).
   Helper `run()` wraps `tools.rea.capture_process_scenario`.
+- **Ground truth without a root phone:** patch the app's list-server host to the Mac, rebuild
+  with `apktool`, re-sign with `wyze_debug.keystore`, `adb install -r`, and listen. This is
+  how §3a was obtained and it unblocks any "the server never answers" investigation.
+  *Flag:* the app takes ~45 s to reach the home screen, so the listener must outlive it.
+- `uber-apk-signer` flag is `--ksKeyPass` (not `--keyPass`); `adb install` of a 244 MB APK
+  needs ~1 GB free — run `adb shell pm trim-caches 4G` first.
 - **The `execute` harness kills a PTY that goes silent** — long-running listeners need a
   heartbeat print or a large `idle_timeout_ms`. Also `normalization.ports` masks port numbers
   in output unless disabled, and `terminal.columns × (rows+scrollback) ≤ 1,000,000`.
+  A stale owned PID wedges cleanup (`cleanup_incomplete`) — kill -9 the stale PID first.
 
 ---
 
@@ -286,24 +446,42 @@ LAN discovery
 | C23 | `devID`(signed) == `srcID`(unsigned) == `9512032141665525923` |
 | C24 | Transport is **KCP/UDP**; zero TCP sockets to cameras while streaming |
 | C25 | `gute_get_encrypt_data_len` = `total_len − 24` for the list frame |
+| C26 | **[WIRE]** Real `LIST_REQUEST` captured: `7f1528004b64b35d7f2dddab94d93411e383569600000100b403bcb04c02f4141b543c610e1bce3b` |
+| C27 | **[WIRE]** Genuine `LIST_RESP` = 176 B, magic `0x7F`, **type `0x16` (22)**, `flags 0x000185f4`, payload 152 B |
+| C28 | **[WIRE]** RC5 decrypt verified: `LIST_RESP[24:40]` → `0100000000000000`; **block byte order = little-endian** |
+| C29 | **[WIRE]** Our Python builder reproduces the app's packet **byte for byte** (`build() == app`) |
+| C30 | **[WIRE]** Server accepts *only* `[4:12]=d_real` + `checksum(d_log)` + `seq=0`; both IDs stable across restart |
+| C31 | **[WIRE]** There is an **HTTP fallback** for the list request on the same port 51701 (`mode=1`, `evhttp_connection`) |
+| C32 | Redirecting `GWApi.GWellP2PUrl` to the Mac works end-to-end and preserves login (same-signature reinstall) |
 
 ---
 
 ## 11. Honest risk assessment for Route C
 
-**What is now easy:** the list-server request is fully specified (§3–§5) except the RC5
-round-count/wordsize, and the server's response is a *validation oracle* — we can send a
-crafted packet and see whether we get a `LIST_RESP`.
+**Updated 2026-10-12 late — the two biggest handicaps were removed today.**
 
-**What is still hard, and blind:**
-- RC5 params not pinned (small search space: wordsize ∈ {32,64} × rounds ∈ {8,12,16}).
-- `LIST_RESP` parsing, then the whole GUTES certify + `init_info` + `GDM` layer.
+**Now easy / solved:**
+- Frame layout, checksum and **RC5-32/6/8 little-endian** are byte-exact — our builder
+  reproduces the app's own packet (§3a, C29).
+- **There is now a ground-truth byte oracle.** Redirect `GWApi.GWellP2PUrl` to the Mac and the
+  app hands us its real packets; send them to the real server to get a real `LIST_RESP`.
+  This is the same trick that de-blocked the list exchange and applies to anything else the
+  app builds and sends. It also means we are no longer limited to "did the server answer".
+
+**Still hard:**
+- `LIST_RESP` payload decode (§3a — stride/ports/IPs spotted, record layout not pinned),
+  then the whole GUTES `certify` → `session_id` → `init_info` → `GDM` layer.
 - KCP configuration and the AV channel/frame protocol, then H.264/H.265 extraction.
+- `d_real` provenance (§3a) — worked around by hardcoding, not understood.
+- **[OPEN]** whether the server will accept a *different* terminal ID than this install's
+  `d_log`. If it keys the client by it, a Python client may need to register its own ID
+  (probably via `regist_gw_user`, §1).
 
-**The fundamental handicap:** the phone↔relay and phone↔camera traffic is *unicast*, so it
-cannot be sniffed from the Mac (no root on the phone; `tcpdump` lacks permission; adb is over
-USB so the Mac isn't in the path). Every layer must be rebuilt from disassembly and validated
-only by "did the server answer". That is workable but slow, and there is no ground-truth byte
-log to diff against when something subtly fails.
+**Remaining handicap (reduced):** phone↔relay and phone↔camera traffic is unicast and still
+cannot be sniffed from the Mac (no root, `tcpdump` unprivileged, adb over USB). But the
+redirect technique turns the *app itself* into the sniffer for anything it originates, which
+covers the control plane. The AV plane still has to come from disassembly unless we can
+redirect the relay endpoints too (possible in principle: rewrite the `LIST_RESP` IP fields and
+relay everything back).
 
 **This is the crux of the strategic decision** — see `STATUS.md`.

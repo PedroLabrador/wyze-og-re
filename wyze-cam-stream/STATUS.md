@@ -19,18 +19,35 @@ UDP/8900" is superseded by [`P2P_PROTOCOL.md`](./P2P_PROTOCOL.md).** The ground 
 4. Full `LIST_REQUEST` frame format, XOR checksum and RC5 key schedule are now recovered —
    see [`P2P_PROTOCOL.md`](./P2P_PROTOCOL.md) §3–§5.
 
-### The strategic fork (still undecided)
+### Ground truth achieved (2026-10-12, end of session)
 
-Reimplementing the rest from disassembly alone is possible but **blind**: the phone↔relay and
-phone↔camera traffic is unicast, so we cannot capture a single real byte to diff against. We'd
-validate only by "did the server answer". The two options are laid out in `P2P_PROTOCOL.md` §11:
+The "no way to capture real bytes" handicap is **gone**. The app's list-server host was
+redirected to the Mac (smali patch → rebuild → resign → reinstall), and the app then handed us
+its own packets. Result:
 
-- **(A) Keep going pure-Python** — RC5 params → LIST_RESP → GUTES certify → GDM → KCP → AV.
-  Long, risky, no ground truth.
+- **Our Python builder reproduces the app's request byte for byte.**
+- **The genuine Wyze list server answers it** — a real 176-byte `LIST_RESP`, decrypted clean.
+- **RC5 is fully pinned**: RC5-32, 6 rounds, 8-byte key, 8-byte blocks, little-endian — every
+  parameter confirmed by decryption, not inference.
+- Captures live in [`../wire/`](../wire/) with a README; the recipe is in
+  [`P2P_PROTOCOL.md`](./P2P_PROTOCOL.md) §3a and §8.
+
+Everything the app *originates* can now be captured this way (control plane). The AV plane is
+still un-captured, but the redirect trick can be extended to it by rewriting the relay IPs in
+the `LIST_RESP` and relaying traffic back.
+
+### The strategic fork (revisited)
+
+Option **(A)** just got substantially cheaper — it is no longer blind. See `P2P_PROTOCOL.md`
+§11 for the updated risk assessment:
+
+- **(A) Keep going pure-Python** — [OK] `LIST_REQUEST`/`LIST_RESP` **done**. Next: decode the
+  `LIST_RESP` payload → GUTES `certify` → `init_info` → `GDM` → KCP → AV.
+  Now has a byte-level oracle for anything the app sends.
 - **(B) Drive Gwell's own SDK** — obtain a Linux/x86 build of `libiotvideo` and call it from
   Python via ctypes with the `accessId`/`accessToken` we already have. Turns it into a glue job.
   Gray area vs. "no third-party", but it *is* the vendor's own protocol implementation, not a
-  third-party client like wyze-bridge.
+  third-party client like wyze-bridge. **Remains the fallback.**
 
 ## Layout after reorganisation
 Everything lives under **`~/Downloads/wyze-re/`**:
@@ -45,6 +62,10 @@ wyze-re/
 ├── wyze_debuggable.apk (+ .idsig, _aligned, _signed)  # installed on device, debuggable
 ├── wyze_debug.keystore               # signs the rebuild; install -r keeps login
 ├── uber-apk-signer.jar
+├── wire/                              # captured LIST_REQUEST/LIST_RESP + README (ground truth)
+├── listreq.py                         # byte-exact LIST_REQUEST builder (checksum + RC5-32/6/8)
+├── probe_real.py                      # sends our packets to the real server, prints responses
+├── cap_listsrv2.py                    # UDP+TCP list-server impersonator (app redirect target)
 ├── wyze_token.json  wyze_devices.json
 ├── cdp_*.py  grab_*.py  watch_*.py  nav*.py  live_capture.py  clear_session.py  # capture scripts
 ├── auth_login.html  auth_url.txt  oauth_code.txt  pkce*.txt  pkce*.json  sp_secure.xml
