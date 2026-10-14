@@ -562,14 +562,29 @@ function tile(c) {
       '<div class="head"><div class="dot"></div><div class="name"></div>' +
       '<div class="ip"></div><div class="badge"></div>' +
       '<button class="fsbtn" title="Fullscreen (or double-click the video)"' +
-      '>&#9974;</button></div>' +
+      '>&#9974;</button>' +
+      '<button class="fsbtn" title="Save a still JPEG (snapshot)"' +
+      '>&#128247;</button></div>' +
       '<div class="shot"><div class="ph">connecting&hellip;</div>' +
       '<img id="img' + c.tid + '" class="hidden" alt=""></div>' +
       '<div class="foot"><span class="f1"></span>' +
       '<span class="f2 err"></span></div>';
     $('#grid').appendChild(el);
-    el.querySelector('.fsbtn').addEventListener('click', e => {
+    const [fsb, snapb] = el.querySelectorAll('.head .fsbtn');
+    fsb.addEventListener('click', e => {
       e.stopPropagation(); openFs(c.tid);
+    });
+    // An <a download> click makes the browser save the JPEG under the
+    // filename the server sets in Content-Disposition, without leaving the
+    // page or disturbing the MJPEG socket.
+    snapb.addEventListener('click', e => {
+      e.stopPropagation();
+      const a = document.createElement('a');
+      a.href = '/snapshot/' + c.tid + '.jpg';
+      a.download = '';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
     });
     el.addEventListener('dblclick', () => openFs(c.tid));
   }
@@ -754,6 +769,42 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return {}
 
+    # -- stills ------------------------------------------------------------
+    def _snapshot(self, tid):
+        """Serve the newest decoded JPEG as a downloadable still.
+
+        Deliberately NOT a frame consumed off the stream: CameraStreamThread
+        keeps `self.frame` as the newest decoded JPEG alongside the bounded
+        deque that feeds the MJPEG viewers, so grabbing a still can never
+        steal a frame from a live viewer.
+        """
+        try:
+            tid = int(tid)
+        except ValueError:
+            self._json(404, error="bad camera id")
+            return
+        w, err = HUB.ensure(tid)
+        if err:
+            self._json(503, error=err)
+            return
+        # The worker starts on demand and needs a handshake before the first
+        # frame decodes, so wait briefly instead of 503-ing on first click.
+        deadline = time.time() + 8.0
+        while time.time() < deadline and not w.frame and w.is_alive():
+            time.sleep(0.25)
+        if not w.frame:
+            self._json(503, error=w.error or "no frame decoded yet")
+            return
+        body = w.frame
+        name = "wyze-%s-%s.jpg" % (tid, time.strftime("%Y%m%d-%H%M%S"))
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Disposition",
+                         'attachment; filename="%s"' % name)
+        self.end_headers()
+        self.wfile.write(body)
+
     # -- routes ------------------------------------------------------------
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
@@ -769,6 +820,8 @@ class Handler(BaseHTTPRequestHandler):
                        "generic.")
         elif path.startswith("/stream/") and path.endswith(".mjpg"):
             self._stream(path.split("/")[2].split(".")[0])
+        elif path.startswith("/snapshot/") and path.endswith(".jpg"):
+            self._snapshot(path.split("/")[2].split(".")[0])
         else:
             self._json(404, error="not found")
 
