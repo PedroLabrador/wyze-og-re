@@ -19,6 +19,74 @@
 > Use this README only for the historical static-analysis trail and the server's
 > HTTP API surface (§"Run it").
 
+---
+
+## Quick start — the server that actually works now (2026-10-13)
+
+**No login, no cloud credentials, no internet.**  `server.py` was rewritten from
+scratch around the direct P2P path; the KVS/OAuth code described below is kept
+only as documentation of what the app does.
+
+```bash
+python3 server.py                 # http://127.0.0.1:8080
+python3 server.py --port 9000     # pick a port
+python3 server.py --discover      # scan the LAN once and exit
+```
+
+Requirements: Python 3.8+ standard library and `ffmpeg` on `PATH`. Nothing else.
+
+Open the URL and you get a dark grid — one tile per camera, each an MJPEG
+stream. Cameras that are powered off show *"camera offline"* and the rest keep
+working; discovery retries every 2 s from the UI, or on demand with
+**Re-discover**.
+
+| Route | What it does |
+|---|---|
+| `GET /` | the grid UI |
+| `GET /api/state` | cameras + per-camera status/fps/error |
+| `POST /api/discover` | rescan the LAN |
+| `GET /stream/<tid>.mjpg` | multipart MJPEG for one camera |
+
+**Why no auth is needed** (each verified — see `../JOURNAL.md` Phase 9):
+discovery is a LAN broadcast the cameras answer unconditionally; the CALLING
+frame is a bare UDP packet with no camera-bound field — *any* captured CALLING
+streams *any* camera; and KCP/RC5 are negotiated inside that session with a key
+we supply.  The `accessToken` / IOTC credentials the app fetches from
+`regist_gw_user` are never used here.  Camera **nicknames** come from the
+locally cached `../wyze_devices.json`.
+
+Per camera the pipeline is:
+
+```
+discover -> CALLING -> meter_ack -> KCP -> AvStreamCtl (inside KCP)
+        -> RC5-ECB decrypt (key = CALLING[120:128]) -> H.264 -> ffmpeg -> MJPEG
+```
+
+Four things that each independently block progress if you get them wrong:
+
+1. **Answer the meter, don't echo it.** The camera sends `C0 90` meter
+   *requests* (inner `[1] == 1`). Echoing them loops forever. Reply with inner
+   `[1] == 2`; only then does KCP start.
+2. **Deduplicate KCP.** The camera retransmits ~9× (576 PUSH for 64 unique
+   segments). Concatenating them splices duplicates into the H.264 stream and
+   the decoder desyncs permanently — ffmpeg yields *zero* frames.
+3. **Drain bursts, don't keep "the latest frame".** ffmpeg hands JPEGs over in
+   bursts; a single-slot frame buffer collapsed bursts of ~7 into one delivery
+   (19 of 132 frames reached the browser). `CameraStreamThread.take()` returns
+   everything past a per-viewer cursor instead — now 100 %.
+4. **Never read a pipe only after writing to the other one.** Writing
+   `ff.stdin` before draining `ff.stdout` deadlocks as soon as ffmpeg's output
+   backs up: ffmpeg blocks on stdout, stops reading stdin, our write blocks
+   forever — with `h264` frozen, no exception, and status stuck on
+   `streaming` (the stall check lives inside the loop that is wedged). Two
+   cameras sometimes won the race; four froze within ~8 s. Drain stdout on its
+   own thread.
+
+Measured with all four cameras live for 25 s: **1992 frames, 70 MB, zero
+dropped** (`pub == served` on every camera).
+
+---
+
 Stream **your own** Wyze OG camera through a local web server, using the same
 cloud auth + live-view flow as the Hualai/Wyze app — recovered by reverse
 engineering the `com.hualai_2.50.7.487` APK (a white-label Wyze app).

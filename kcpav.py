@@ -73,6 +73,7 @@ ACT_ALT = 2            # fills [0x14] from obj->0x1e4, [24:56] from obj->0x20c
 ACT_STOP = 6           # wrapper routes this to kcp_b (the lo-conv object)
 
 MTU = 1032             # gute_recv_fragment_init mtu=1032, from the live log
+KCP_OVERHEAD = 24      # IKCP_OVERHEAD: conv+cmd+frg+wnd+ts+sn+una+len
 
 
 def _tick_ms():
@@ -166,6 +167,8 @@ class KCP(object):
         self.dead_link = 20
         self.packets = []       # raw ikcp segments to transmit
         self.received = []      # reassembled PUSH payloads (data, sn)
+        self.pending = {}       # out-of-order sn -> data, awaiting a gap fill
+        self._rcv_started = False
 
     # -- sending -----------------------------------------------------------
     def push(self, data):
@@ -174,11 +177,15 @@ class KCP(object):
         if not data:
             return []
         segs = []
-        # fragment exactly as ikcp does: count full chunks, +1 if a remainder
-        n = (len(data) + self.mtu - 1) // self.mtu
+        # ikcp fragments on mss = mtu - IKCP_OVERHEAD (24), NOT on mtu itself:
+        # kcp->mss = kcp->mtu - IKCP_OVERHEAD in ikcp_setmtu.  With the
+        # camera's mtu=1032 that gives 1008 bytes of payload per segment,
+        # which is exactly the largest segment length we observe from it.
+        mss = max(1, self.mtu - KCP_OVERHEAD)
+        n = (len(data) + mss - 1) // mss
         off = 0
         for i in range(n):
-            chunk = data[off:off + self.mtu]
+            chunk = data[off:off + mss]
             off += len(chunk)
             # frg counts DOWN from (n-1) to 0 on the last fragment
             frg = (n - 1) - i
@@ -203,31 +210,75 @@ class KCP(object):
 
     # -- receiving ---------------------------------------------------------
     def input(self, buf):
-        """Feed raw ikcp bytes from the wire.  Returns parsed segments."""
+        """Feed raw ikcp bytes from the wire.  Returns parsed segments.
+
+        The returned list is for *inspection only* (cmd/conv/diagnostics).
+        Delivery data is NOT in it -- call take_received() for that.
+
+        This matters more than it looks.  The camera retransmits aggressively
+        (we measured 620 PUSH segments carrying only 62 unique frames -- a 10x
+        amplification), so naively concatenating every PUSH splices duplicates
+        into the byte stream and the H.264 parser desyncs permanently.  ikcp
+        itself avoids this with an sn window + rcv_nxt ordering; we reproduce
+        the same contract here:
+
+          * every PUSH is ACKed (una = rcv_nxt, per ikcp_flush) whether or not
+            its data is new, otherwise the camera never stops resending
+          * sn is compared modulo 0x8000 (IKCP_SN_MOD); a sn "before" rcv_nxt
+            is a retransmission and is ACKed but NOT delivered
+          * delivery happens only in sn order -- out-of-order segments are
+            held in self.pending until the gap fills
+        """
         got = []
         for s in parse_all(buf):
-            got.append(s)
+            if s["conv"] != self.conv:
+                continue          # two KCP objects exist per session, split
+            got.append(s)         # by conv bit31 -- ignore the other one
             cmd = s["cmd"]
             if cmd == CMD_PUSH:
-                # ack it (the camera expects an ACK for its sn)
+                sn = s["sn"]
+                if not self._rcv_started:
+                    # snap to whatever sn the camera starts at; otherwise a
+                    # first sn != 0 would stall the window forever
+                    self.rcv_nxt = sn
+                    self._rcv_started = True
+                if self._in_rcv_window(sn):
+                    self.pending[sn] = s["data"]
+                    self._drain()
+                # ACK unconditionally, with una = rcv_nxt (ikcp convention)
                 self.packets.append(
                     seg(self.conv, CMD_ACK, b"", wnd=self.wnd,
-                        sn=0, una=s["sn"]))
-                self.received.append((s["data"], s["sn"]))
-                self._advance(s["sn"])
+                        sn=0, una=self.rcv_nxt))
             elif cmd == CMD_ACK:
-                self.snd_una = max(self.snd_una, s["una"])
+                self.snd_una = (self.snd_una, s["una"])[
+                    self._itimediff(s["una"], self.snd_una) > 0]
             # WASK/WINS need no action for our purposes
         return got
 
-    def _advance(self, sn):
-        if self.rcv_nxt == 0 and sn == 0:
-            self.rcv_nxt = 1
-            return
-        if sn == self.rcv_nxt:
+    @staticmethod
+    def _itimediff(later, earlier):
+        """Signed 32-bit modular difference (ikcp's _itimediff)."""
+        return ((later - earlier) & 0xFFFFFFFF) - 0x100000000 \
+            if (later - earlier) & 0x80000000 else (later - earlier) & 0xFFFFFFFF
+
+    def _in_rcv_window(self, sn):
+        """True if sn is at or ahead of rcv_nxt within half the sn space."""
+        return self._itimediff(sn, self.rcv_nxt) >= 0
+
+    def _drain(self):
+        """Move the in-order run of pending segments into received."""
+        while self.rcv_nxt in self.pending:
+            data = self.pending.pop(self.rcv_nxt)
+            self.received.append((data, self.rcv_nxt))
             self.rcv_nxt = (self.rcv_nxt + 1) & 0xFFFFFFFF
+        # forget anything absurdly far behind (paranoia, bounded memory)
+        if len(self.pending) > 4096:
+            for k in [k for k in self.pending
+                      if self._itimediff(self.rcv_nxt, k) > 4096]:
+                del self.pending[k]
 
     def take_received(self):
+        """Drain the reassembled, in-order, de-duplicated PUSH payloads."""
         out, self.received = self.received, []
         return out
 

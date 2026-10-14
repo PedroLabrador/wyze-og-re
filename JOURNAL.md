@@ -206,16 +206,153 @@ AvStreamCtl over KCP → RC5 AV decrypt (`CALLING[120:128]`) → **H.264 → ffm
 
 ---
 
+## Phase 9 — From a script to "open a browser and see every camera"
+
+**E1 — a single captured CALLING works for EVERY camera.  WORKED.**
+Sent cam2's CALLING *verbatim* to cam4 (.117): 19 replies including a
+`7ea42000` GUTES response and meter requests carrying *our* conv.
+⇒ **the TID field is not checked**, so there is no per-camera capture gap and
+cam4 (which never had one) is not a special case.  This killed the "solve the
+CALLING checksum so we can forge per-camera frames" line of work.
+
+**E2 — a camera streams off a borrowed CALLING.  WORKED.**
+cam4 → 377,504 B H.264 → **187 JPEG frames**; cam2 → 230,057 B → 192 frames.
+
+**E3 — two cameras at once.  WORKED.**
+Two threads on ephemeral ports **62008** and **55939**: `.117` 307,190 B /
+176 JPEG, `.224` 211,995 B / 177 JPEG.  The camera replies to the UDP *source*
+port, not the advertised 48171 — so no shared-socket demux is needed and each
+worker just binds its own port.
+
+**CALLING field layout — DECODED** (from a decrypted CALLING):
+
+| offset | field |
+|---|---|
+| `[0:4]` | `7ea48000` |
+| `[4:12]` | id8 |
+| `[16:20]` | checksum (formula still unknown) |
+| `[20:24]` | flags `1e2805a2` — mode1 / bit25 / ack all set |
+| `[28:32]` | `conv` |
+| `[32:40]` | `d_log 0x840186d6001260a3` (shared across all cameras) |
+| `[40:48]` | TID as u64 LE |
+| `[54:56]` | local port `2bbc` = 48171 |
+| `[64:68]` | local IP (the phone's) |
+| **`[120:128]`** | **AV RC5 key** |
+
+**KCP retransmission — FAILED FIRST, then FIXED.**
+`kcpav.KCP.input()` appended every PUSH with no dedup, and `p2p_client` read
+raw segments, so duplicates were spliced into the H.264 stream and the decoder
+desynced permanently — **ffmpeg produced 0 frames.** Measured on conv
+`0x77e202cb`: 576 PUSH but only **64 unique sn** (0–63).
+Fix: ACK every PUSH with `una=rcv_nxt`, dedupe by `sn mod 0x8000`, deliver in
+order via a `pending` dict, filter foreign convs, snap `rcv_nxt` to the first
+sn.  Also fragment on `mtu - KCP_OVERHEAD(24)` = 1008 (matches observed max).
+⇒ **0 frames → 222 JPEG frames.**
+
+**ffmpeg → JPEG.  WORKED.** 265,444 B H.264 → 222 JPEGs, `ffprobe -f mjpeg`
+reports `mjpeg 640x360, 222 frames`.
+
+**The web server needs NO LOGIN.  RULED OUT (the whole login requirement).**
+Everything above used **zero** cloud credentials: discovery is a LAN broadcast,
+the CALLING is a bare UDP frame the camera accepts unconditionally, and
+KCP/RC5 are session-local with a key we chose.  The `accessToken` / IOTC
+credentials the *app* fetches from `regist_gw_user` are never used on this
+path.  The only thing a cloud login ever bought was *nicknames*, and those are
+cached in `wyze_devices.json` and read locally.  ⇒ `server.py` was written
+without any auth gate.
+
+**MJPEG delivery — FAILED, then FIXED (three separate bugs).**
+
+1. *`KeyError: 'p2p_port'`* — `discover()` returns `{ip: {...}}` but the code
+   read it as a single camera record.  FAILED, fixed by taking
+   `next(iter(got.values()))`.
+2. *`EADDRINUSE`* — every worker bound the app's advertised port 48171, so the
+   second camera could not bind.  Fixed with `local_port=0`; proven safe by E3.
+3. *Only 19 of 132 frames reached the browser* — **the interesting one.**
+   Socket writes cost 0.00 s, and the poll loop ran at exactly 32 ms, yet
+   `served` stayed far below `published`.  Traced it by recording
+   `(cur, seq, served)` per sample: `seq = cur` **jumps over skipped frames**,
+   and `_publish` overwrote a single `self.frame` slot.  ffmpeg hands JPEGs over
+   in **bursts** (the producer is busy decrypting, so the pipe accumulates), so
+   a burst of ~7 collapsed into exactly one delivery.
+   Fix: buffer in a `collections.deque` and **drain** (`take()`) each poll.
+   ⇒ **19/132 → 199/199.**
+   Two red herrings cost time here: condition-variable wakeups really were slow
+   (~1.7 Hz under GIL contention), and a stats reset I added to isolate the bug
+   raced with the producer's `self.stats["h264"] += n`, raising `KeyError` and
+   killing the stream outright.
+
+**Server verified end to end** (`server.py`, stdlib only):
+
+```
+page            : 6096 bytes, JS syntax OK (node --check)
+discovery       : 192.168.77.11 "CAM-1"  +  192.168.77.10 "CAM-1"
+                  (nicknames from the local cache -- no login)
+concurrent 20 s : Camera 4  3,110,522 B  237 JPEG   pub=243 served=243
+                  Camera 2  1,503,112 B  245 JPEG   pub=252 served=252
+```
+
+**Three more bugs found while scaling from 2 cameras to 4.**
+
+4. *The UI could never start a stream.*  The JS attached `<img>` only when
+   `status === 'streaming'`, but the status only becomes `'streaming'` when
+   something requests `/stream/` — a deadlock that no amount of polling breaks.
+   Fixed twice over: the server now starts a worker for every camera the moment
+   `refresh()` finds it, and the JS attaches for any status except `offline`.
+
+5. *Multiple viewers split the stream.*  `take()` **drained** the frame deque,
+   so each frame went to exactly one viewer.  Proved with two simultaneous
+   clients on camera 2: a draining take would halve each.  Now `take(cursor)`
+   is non-destructive and every viewer keeps its own cursor (frames age out
+   after 120, so a stalled viewer skips rather than grows).  Verified: two
+   viewers got byte-identical files.
+
+6. *`ffmpeg` pipe deadlock — the one that froze all four cameras.*  The loop
+   wrote to `ff.stdin` and only read `ff.stdout` **afterwards**.  Once
+   ffmpeg's output backed up it blocked writing stdout, stopped reading stdin,
+   and our `ff.stdin.write()` blocked forever.  The symptom is perfectly
+   disguised: `h264` freezes, nothing raises, status stays `streaming`, because
+   the stall check lives *inside* the `for chunk` body — which never runs when
+   the loop is wedged.  Two cameras occasionally won the race (which is why the
+   earlier tests passed); four froze within ~8 s every time.  Fixed by draining
+   stdout on its own thread.  `timeout` also dropped 30 s → 12 s so a genuine
+   stall re-handshakes instead of showing a frozen frame.
+
+**Four cameras, simultaneously — the actual goal:**
+
+```
+Camara 1   21,353,949 B   500 JPEG   pub=500 served=500   19.9 fps
+Camara 4   19,500,937 B   500 JPEG   pub=500 served=500   19.9 fps
+CAM-1   16,005,596 B   491 JPEG   pub=502 served=502   18.8 fps
+Camara 2   13,739,612 B   501 JPEG   pub=501 served=501   18.9 fps
+TOTAL      70,600,094 B  1992 JPEG   in 25 s -- zero dropped
+```
+
+All four cameras auto-start at boot with no login, no click, and no phone.
+
+---
+
 ## Open questions still unanswered
 
-- The type-`0x04` AV payload cipher and key derivation (the current blocker).
-- Fragment reassembly (MTU 1032) and the zlib layer the logcat mentions.
-- H.264/H.265 codec framing and extraction.
-- Discovery-reply checksum rule (sidestepped by using identical clones).
-- Auth to the camera (per-device `accessToken` vs LAN password).
-- POST `Signature2` rule.
-- RC5 mode 3 (unread, @0x2b500).
-- cam4 (.117) has no captured frames, so it is always skipped.
+- **CALLING checksum formula** — `iv_gute_frm_init_chkval` is byte-exact for
+  LIST frames but matches none of the 3 captured CALLINGs.  Not needed any
+  more (E1: any CALLING works for any camera), and `calling_forge.py`'s
+  round-trip fails on region A `[12:20]` anyway.  Only revisit if per-camera
+  CALLING *editing* becomes necessary.
+- Discovery-reply checksum rule (edited clones rejected 102–108/0; sidestepped
+  by using identical clones).
+- POST `Signature2` rule (needs runtime-injected `cg01_f3c397620f853b12`).
+- RC5 mode 3 (unread, @0x2b500); `iv_gute_frm_decrypt_id`'s use of `ctx->0xd0`.
+- `AVSTREAMCTL` field values (`obj->0x164`/`0xac`/`0xb0`/`0x160`/`0x1ec`) —
+  parameterised in `kcpav.py`, currently zeroed, and it works anyway.
+- `init_frm_mtp_res_request`'s `[82:122]` tail; `gat_rcv_init_info_msg_resp`
+  @ 0x46960; `certify_req` finalizer for type `0x0c`.
+- The zlib layer the logcat mentions (MTU 1032 fragment reassembly).
+
+**Resolved since the last update:** the type-`0x04` AV cipher (RC5, key =
+`CALLING[120:128]`), H.264 framing (ffmpeg decodes it), authentication to the
+camera (**none required** — see Phase 9), and cam4 having no capture of its own
+(a borrowed CALLING streams it fine).
 
 ## Rotation reminder
 
