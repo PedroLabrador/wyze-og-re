@@ -711,7 +711,120 @@ byte offsets to aim at.
 - `adb`'s daemon can die silently between calls (logcat exits 255); `adb devices`
   restarts it.  Never name a shell variable `UID` -- zsh treats it as read-only.
 
-## Rotation reminder
+## Phase 12 -- capturing the 3.23.1 app's real session *(patched app, live capture)*
+
+### The patch itself
+
+Only **one file** in the whole APK changes: the Gwell SDK's config holder
+`com/gwell/common/data/GwApiService` (in `classes34.dex`).  It holds the
+list-server host the SDK asks for camera addresses:
+
+```
+- URL_GWELL_P2P_BETA/OFFICIAL/TEST = "|beta-mars-asrv.wyzecam.com"  (x3 fields)
+- const-string copies of the same host                              (x3 sites)
++ "|192.168.77.13"                                                  (all 6)
+```
+
+That is the entire patch: the app still runs its genuine, unmodified protocol
+against the genuine camera -- we only become the directory it asks first, so
+its traffic passes through `cap_relay.py` where we log raw bytes.  Re-signing
+with a debug key forced uninstall + re-login (accepted).  Restore from
+`wyze_3.23/extracted/`.
+
+### What the capture actually contained
+
+`frameparse.py` reassembles the relay's TCP reads (they are NOT frame-aligned)
+and walks both `7e` and `7f` frames -- both use
+`<magic> <type> <u16LE total-incl-header> <payload>`.
+
+- app -> camera: 54 frames; camera -> app: 53 frames; **~12 KB total**
+- GUTES types the 3.23.1 app exchanges: `a0 a1 a4 a6 a7 aa b0 b1 b7 b8 b9 bc
+  c3 d8 d9` -- a dozen types **our client never emits**
+- **zero `c010` / `c090`** -- no KCP ever crossed the tunnel
+- the app's CALLING is **66 B** (16 B nonce, 4 B flags, 16 B session id, conn id
+  twice, 10 B tail) vs our replayed 2.50.7 CALLING's 128 B.  The payload is
+  RC5 with the frame-derived key `frame[0:4]+frame[20:23]+0x00`
+  (`calling_decode.py`).
+
+### Three structural findings
+
+1. **The app's AV plane never touches the relay.**  `phone_socks.py` reads
+   `/proc/net/{tcp,udp}` over adb: the app's only non-loopback socket is the
+   tunnel `192.168.77.14:48650 <-> 192.168.77.13:28803` at **13.9 KB** for the
+   whole session (`nettop`), while `dumpsys netstats` shows it pulling
+   **1.79 MB / 10 s**.  Its live view kept rendering after the relay's window
+   expired.  So the app streams **direct to the camera over LAN**; the tunnel
+   carried only the control handshake.
+2. **Quality is decided per-session, by the camera.**  While the app was
+   live-viewing camera 2 at ~1.4 Mbps, our client opened its *own* session to
+   the same camera and got the usual 400 kbps / 640x360.  The camera happily
+   serves both at once, so this is not a slot or bandwidth effect -- the two
+   dialogues genuinely select different encoder settings.
+3. **Our session has no GUTES dialogue at all.**  `gutesprobe` on a free camera
+   shows the camera answering our CALLING with exactly one `7ea4` ack, then
+   MTP meter requests and straight into KCP/AV.  The app negotiates first.
+
+### Experiments *(both null, both well-grounded)*
+
+**A. The new CALLING dialect is not the switch -- and the camera refuses it.**
+`dialectprobe.py` replays the 3.23.1 app's CALLING verbatim, and again with the
+per-session fields (nonce, session id, conn id) randomised.  The camera replies
+with **nothing at all**, while the same camera answers our 2.50.7 CALLING
+instantly with a full stream.  Either the new dialect needs a step we have not
+replicated, or that CALLING is bound to the relay path it arrived on.
+
+**B. The SDK's own definition frame does not change the resolution.**
+`IoTVideoPlayerImpl::sendUserData` (`libiotvideo 0xfa348`, re-verified this
+round) builds an AV-link user-data frame:
+
+```
+ff ff ff 88 00 02 <u16LE len> <payload>          -> 8 B header
+ff ff ff 88 00 03 <u16LE len> <20 B seq/time>    -> 28 B header
+```
+
+and hands it to `iv_send_data_link_chn`.  The changeDefinition path builds the
+9-byte payload `00 05 00 00 <seq:u32LE> <definition>`, and `GwDefinitionLogEnum`
+gives the values `2=DEF_SD 3=DEF_HD 4=DEF_2K`.  `defsend.py` swept 16
+combinations (definition 1-4 x linktype 3/4, plaintext vs RC5 with the AV key x
+AV type 2/3), mid-stream and again immediately before re-pushing AvStreamCtl:
+the header stayed `640x360 @ 20 fps` every time.
+
+### Tooling / gotchas from this round
+
+- `frameparse.py <log>` -- GUTES frame timeline from a relay capture, both
+  magic bytes, with per-type byte totals.
+- `phone_socks.py <uid>` -- the app's live sockets decoded from `/proc/net`
+  (readable without root on this device).  The app's uid changed 10312 ->
+  **10317** after the reinstall.
+- `cap_relay.py` writes BOTH stdout and `/tmp/cap_relay.log` (fixed path), so a
+  rerun silently overwrites the older capture.  Args are
+  `[list_port] [relay_port] [seconds]` -- passing just a number sets the PORT.
+- **RC5 is 8-byte-blocked**: decrypting `body[:28]` leaves the height u32 at
+  `[24:28]` as raw ciphertext.  Decrypt 32 B to read the AV header.  The header
+  is `ffffff88 | 00 | type | ... | sample-rate u32@[12:16] | fps@[19] |
+  width u32@[20:24] | height u32@[24:28]`, and the media type byte is **1**.
+- `adb shell ip -s link` is permission-denied; use `dumpsys netstats` or
+  `nettop -x -l 1 -p <pid>` on the Mac.
+
+### Where this leaves the resolution question
+
+The remaining ways to see what the app sends on its **AV plane** (where the
+definition clearly lives, since nothing on the GUTES/AvStreamCtl path works):
+
+1. **Force the app's AV plane through the relay** -- the list response carries
+   only relay records (`nrec = (total-32)//36`, all four rewritten), so the app
+   must be finding the camera by its own LAN search.  Suppressing that would
+   route its AV through us.
+2. **LAN MITM** -- answer the app's LAN search with the camera's TUID but our
+   IP, then forward app<->camera.  Captures everything, but the payloads stay
+   end-to-end encrypted with the app's session key, which we cannot derive for
+   the new dialect; we would have to brute-force candidates against the
+   recognisable `ffffff88` AV header.
+3. **Find the definition's real carrier in the disassembly** -- the meter
+   measurement section (Phase 11) and `iv_send_av_ringbuf`'s contents are both
+   still unread, and both sit on the path we cannot observe.
+
+
 
 `SECRETS.md` holds the OAuth `client_id` / `client_secret` and the checklist.
 Delete the plaintext token files (`/tmp/wyze_token.json`, `/tmp/wyze_live.txt`,
