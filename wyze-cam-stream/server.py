@@ -498,19 +498,53 @@ PAGE = """<!doctype html>
  .err { color:#f85149; }
  #banner { background:#9e6a03; color:#fff; padding:8px 20px; font-size:13px; }
  .hidden { display:none; }
+
+ /* fullscreen: a tile's <img> is MOVED into this overlay, not duplicated, so
+    it keeps the MJPEG connection it already has (a second <img> would open a
+    second socket and double the bandwidth for the same camera). */
+ .fsbtn { background:none; border:0; color:#8b949e; cursor:pointer;
+          font-size:15px; line-height:1; padding:2px 6px; border-radius:4px; }
+ .fsbtn:hover { background:#30363d; color:#e6edf3; }
+ #overlay { position:fixed; inset:0; background:#000; z-index:100;
+            display:none; }
+ #overlay.open { display:block; }
+ #ovslot { position:absolute; inset:0; display:flex; align-items:center;
+           justify-content:center; }
+ #ovslot img { width:100%; height:100%; object-fit:contain; }
+ .obar { position:absolute; top:0; left:0; right:0; z-index:2;
+         display:flex; align-items:center; gap:14px; padding:13px 18px;
+         background:linear-gradient(rgba(0,0,0,.82), rgba(0,0,0,0));
+         color:#fff; font-size:14px; opacity:0; transition:opacity .25s; }
+ #overlay:hover .obar { opacity:1; }
+ .obar .ostat { color:#8b949e; font-size:12px; }
+ .obar .x { background:rgba(255,255,255,.14); border:0; color:#fff;
+            padding:7px 13px; border-radius:6px; cursor:pointer; }
+ .obar .x:hover { background:rgba(255,255,255,.28); }
 </style>
 
 <header>
   <h1><span>Wyze</span> cameras</h1>
   <span class="sub" id="cnt"></span>
   <div class="spacer"></div>
+  <button id="fsall" title="Browser fullscreen">&#9974; Fullscreen</button>
   <button id="refresh">&#8635; Re-discover</button>
 </header>
 <div id="banner" class="hidden"></div>
 <div id="grid"></div>
 
+<div id="overlay">
+  <div id="ovslot"></div>
+  <div class="obar">
+    <strong class="oname"></strong>
+    <span class="ostat"></span>
+    <div class="spacer"></div>
+    <button class="x">&#10005; Close</button>
+  </div>
+</div>
+
 <script>
 const $ = s => document.querySelector(s);
+let LAST = [];            // latest /api/state snapshot, for fullscreen helpers
 
 async function j(u, o) {
   const r = await fetch(u, o);
@@ -526,19 +560,29 @@ function tile(c) {
     el.className = 'tile'; el.id = 'c' + c.tid;
     el.innerHTML =
       '<div class="head"><div class="dot"></div><div class="name"></div>' +
-      '<div class="ip"></div><div class="badge"></div></div>' +
+      '<div class="ip"></div><div class="badge"></div>' +
+      '<button class="fsbtn" title="Fullscreen (or double-click the video)"' +
+      '>&#9974;</button></div>' +
       '<div class="shot"><div class="ph">connecting&hellip;</div>' +
-      '<img class="hidden" alt=""></div>' +
+      '<img id="img' + c.tid + '" class="hidden" alt=""></div>' +
       '<div class="foot"><span class="f1"></span>' +
       '<span class="f2 err"></span></div>';
     $('#grid').appendChild(el);
+    el.querySelector('.fsbtn').addEventListener('click', e => {
+      e.stopPropagation(); openFs(c.tid);
+    });
+    el.addEventListener('dblclick', () => openFs(c.tid));
   }
   el.querySelector('.name').textContent = c.name || ('Camera ' + c.tid);
   el.querySelector('.ip').textContent = c.ip || '\\u2014';
   el.querySelector('.dot').className = 'dot ' + (c.status || '');
   el.querySelector('.badge').textContent = c.status || '';
 
-  const img = el.querySelector('img'), ph = el.querySelector('.ph');
+  // Look the <img> up by id, NOT with el.querySelector('img'): while a camera
+  // is fullscreen its <img> lives inside the overlay, so it is no longer a
+  // descendant of the tile.
+  const img = document.getElementById('img' + c.tid),
+        ph = el.querySelector('.ph');
   // Attach the MJPEG socket as soon as the camera is listed -- requesting it
   // is what makes the server create the worker (HUB.ensure).  Waiting for
   // status === 'streaming' deadlocks: the status can never become 'streaming'
@@ -572,17 +616,83 @@ function tile(c) {
   }
 
   const s = c.stats || {};
+  // s.jpg counts frames this SERVER WORKER has decoded since the camera
+  // started streaming -- it deliberately survives page reloads (the worker
+  // keeps running so you do not pay an 8-10s discovery+handshake on refresh).
+  // Label it as a worker total so it does not look like a viewer counter.
   el.querySelector('.f1').textContent =
-    s.jpg ? ((s.fps || 0).toFixed(1) + ' fps \\u00b7 ' + s.jpg + ' frames')
+    s.jpg ? ((s.fps || 0).toFixed(1) + ' fps \\u00b7 ' + s.jpg + ' total')
           : (c.status === 'streaming' ? 'starting\\u2026' : '');
+  el.querySelector('.f1').title =
+    'frames decoded since this camera\\'s stream started on the server';
   el.querySelector('.f2').textContent = c.error || '';
   if (c.log && c.log.length) el.querySelector('.foot').title = c.log.join('\\n');
+
+  // Keep the overlay bar in sync if this camera is the one fullscreened.
+  if (FS.tid === c.tid) {
+    $('.oname').textContent = c.name || ('Camera ' + c.tid);
+    $('.ostat').textContent = c.status || '';
+  }
 }
+
+/* ---- fullscreen ------------------------------------------------------
+   The tile's existing <img> is MOVED into the overlay and moved back on
+   close.  Moving keeps the element, so the MJPEG socket it already opened
+   stays open: pointing a *second* <img> at /stream/ would open a second
+   socket and double this camera's bandwidth for an identical picture. */
+const FS = {tid: null, home: null};
+
+function openFs(tid) {
+  if (FS.tid === tid) return;
+  if (FS.tid !== null) closeFs();
+  const img = document.getElementById('img' + tid),
+        tileEl = document.getElementById('c' + tid);
+  if (!img || !tileEl) return;
+  FS.tid = tid;
+  FS.home = img.parentNode;                 // the tile's .shot, before moving
+  $('.oname').textContent = tileEl.querySelector('.name').textContent;
+  $('.ostat').textContent = tileEl.querySelector('.badge').textContent;
+  $('#ovslot').appendChild(img);            // MOVE, not clone
+  img.classList.remove('hidden');
+  tileEl.querySelector('.ph').classList.remove('hidden');
+  $('#overlay').classList.add('open');
+}
+
+function closeFs() {
+  if (FS.tid === null) return;
+  const img = document.getElementById('img' + FS.tid),
+        home = FS.home;
+  $('#overlay').classList.remove('open');
+  if (img && home) {
+    home.appendChild(img);                  // move it back into the tile
+    // Re-run tile() so the img's hidden/visible state is recalculated for
+    // its home slot instead of inheriting whatever fullscreen left behind.
+    const d = LAST && LAST.find(c => c.tid === FS.tid);
+    if (d) tile(d);
+  }
+  FS.tid = null;
+  FS.home = null;
+}
+
+$('#overlay .x').addEventListener('click', closeFs);
+// Click the black surround (but not the picture, not the bar) to dismiss.
+$('#ovslot').addEventListener('click', e => { if (e.target.id === 'ovslot') closeFs(); });
+$('#overlay').addEventListener('dblclick', closeFs);
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') { closeFs(); if (document.fullscreenElement) document.exitFullscreen(); }
+});
+// Header button: browser fullscreen on whichever camera is showing, else
+// fullscreen the first one so the button is never a dead end.
+$('#fsall').addEventListener('click', () => {
+  const tid = FS.tid !== null ? FS.tid : (LAST[0] && LAST[0].tid);
+  if (tid != null) openFs(tid);
+});
 
 async function tick() {
   try {
     const d = await j('/api/state');
     const cams = d.cameras || [];
+    LAST = cams;
     cams.forEach(tile);
     $('#cnt').textContent = cams.length + (cams.length === 1 ? ' camera' : ' cameras');
     const warn = d.cameras.length === 0
