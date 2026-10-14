@@ -103,6 +103,20 @@ def load_calling(tid):
     return bytes.fromhex(c if isinstance(c, str) else "".join("%02x" % b for b in c))
 
 
+def any_calling(tid):
+    """Any captured CALLING works for any camera (the old 7ea4 dialect)."""
+    import json
+    try:
+        return load_calling(tid)
+    except KeyError:
+        doc = json.load(open("~/Downloads/wyze-re/wire/p2p_frames.json"))
+        for rec in doc["devices"].values():
+            c = rec["frames"]["calling"]
+            return bytes.fromhex(c if isinstance(c, str)
+                                 else "".join("%02x" % b for b in c))
+    return load_calling(tid)
+
+
 def main():
     tid = sys.argv[1] if len(sys.argv) > 1 else "429728658691722"
     secs = float(sys.argv[2]) if len(sys.argv) > 2 else 45.0

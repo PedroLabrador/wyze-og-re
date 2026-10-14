@@ -194,6 +194,7 @@ class CameraStream(object):
         self.conv = struct.unpack_from("<I", pt, 28)[0]
         self.kcp = None
         self._buf = bytearray()
+        self._abuf = bytearray()          # audio (mu-law)
         self._started = False
 
     # -- the handshake -----------------------------------------------------
@@ -243,12 +244,11 @@ class CameraStream(object):
     def _on_tlv(self, payload):
         """A TLV frame arrived over KCP: [0]=type [2:4]=u16LE len [4:]=body.
 
-        Only linktype 4 (media) is RC5 with the AV key.  Linktype 3 is the
-        AvStreamCtl exchange and its body is PLAINTEXT -- the camera's own
-        replies decode straight to `00000000 02000000 00...` (id164, cmd).
-        Running those through RC5 turned every control frame into 72 B of
-        garbage that then landed in the H.264 buffer, so only type 4 is
-        decrypted and fed to the decoder now.
+        Linktype 4 (media) is RC5 with the AV key.  Its body is either:
+          - a video frame (starts with 0xff 0xff 0xff 0x88 0x00 ...)
+          - an audio frame (mu-law, 8 kHz, mono) -- no AV header, but the
+            plaintext bytes cluster in [0x60, 0xff] with low consecutive diff.
+        Linktype 3 is AvStreamCtl (plaintext) -- we ignore it after handshake.
         """
         if len(payload) < 5:
             return
@@ -258,10 +258,41 @@ class CameraStream(object):
         body = payload[4:ln]
         if not body:
             return
-        if payload[0] != 4:
+
+        lt = payload[0]
+        if lt == 3:
+            return                                 # AvStreamCtl reply, ignore
+        if lt != 4:
             self.tlv_other = getattr(self, "tlv_other", 0) + 1
             return
-        self._buf += rc5_decrypt_stream(self.key, body)
+
+        # linktype 4: decrypt with AV key
+        pt = rc5_decrypt_stream(self.key, body)
+        if not pt:
+            return
+
+        if pt[:4] == b"\xff\xff\xff\x88":
+            # video frame (Annex-B H.264)
+            self._buf += pt
+        elif self._looks_like_mulaw(pt):
+            # audio frame: mu-law 8 kHz mono
+            self._abuf += pt
+        else:
+            # unknown/garbage -- count it but don't corrupt either buffer
+            self.tlv_other = getattr(self, "tlv_other", 0) + 1
+
+    @staticmethod
+    def _looks_like_mulaw(data):
+        """Heuristic: mu-law audio has >50% bytes in [0x60, 0xff] and low
+        consecutive difference (it's low-pass ~3.4 kHz)."""
+        if len(data) < 16:
+            return False
+        hi = sum(1 for b in data if b >= 0x60)
+        if hi / len(data) < 0.5:
+            return False
+        # low-pass check: mean |diff| between consecutive samples
+        diff = sum(abs(data[i] - data[i - 1]) for i in range(1, min(len(data), 200)))
+        return diff / min(len(data) - 1, 199) < 60
 
     def start(self):
         """Run the handshake once.  Idempotent-ish; safe to call again."""
@@ -325,6 +356,19 @@ class CameraStream(object):
                 yield bytes(self._buf[3:j])
                 del self._buf[:j]
                 deadline = time.time() + self.timeout
+
+    def raw_audio(self):
+        """Generator of raw mu-law audio bytes (8 kHz, mono, no header)."""
+        self.start()
+        deadline = time.time() + self.timeout
+        while time.time() < deadline:
+            self._pump(0.5, [(self.kcp_lo.conv, self.kcp_lo),
+                             (self.kcp_hi.conv, self.kcp_hi)])
+            if self._abuf:
+                out = bytes(self._abuf)
+                del self._abuf[:]
+                deadline = time.time() + self.timeout
+                yield out
 
     def close(self):
         try:

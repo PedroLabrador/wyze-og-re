@@ -129,6 +129,9 @@ class CameraStreamThread(threading.Thread):
         # published, because `seq = cur` jumped over the skipped ones.
         self.frames = collections.deque(maxlen=120)
         self.stats = {"h264": 0, "jpg": 0, "fps": 0.0, "last": 0.0}
+        self.audio_stats = {"bytes": 0, "chunks": 0}
+        self.audio_chunks = collections.deque(maxlen=200)
+        self._audio_cond = threading.Condition()
         self._cond = threading.Condition()
         self._stop = threading.Event()
         self._on_status = on_status
@@ -159,6 +162,12 @@ class CameraStreamThread(threading.Thread):
         with self._cond:
             got = [(s, j) for s, j in self.frames if s > since_seq]
             return [j for _, j in got], (got[-1][0] if got else since_seq)
+
+    def take_audio(self, since_seq=0):
+        """Return `(chunks, cursor)` for every audio chunk newer than `since_seq`."""
+        with self._audio_cond:
+            got = [(s, c) for s, c in self.audio_chunks if s > since_seq]
+            return [c for _, c in got], (got[-1][0] if got else since_seq)
 
     def _publish(self, jpeg):
         with self._cond:
@@ -270,25 +279,44 @@ class CameraStreamThread(threading.Thread):
                                  name="drain-%s" % self.camera["tid"])
         drain.start()
 
+        st.start()  # handshake + KCP up + AvStreamCtl
+
+        # Single pump loop: feed video AND audio from one CameraStream
         last_h264 = time.time()
+        audio_cursor = 0
         try:
-            for chunk in st.raw_h264():
+            for _ in range(1000000):  # effectively infinite
                 if self._stop.is_set():
                     break
-                self.stats["h264"] += len(chunk)
-                last_h264 = time.time()
-                try:
-                    ff.stdin.write(chunk)
-                    ff.stdin.flush()
-                except (BrokenPipeError, ValueError, OSError):
-                    break
+                st._pump(0.05, [(st.kcp_lo.conv, st.kcp_lo),
+                                 (st.kcp_hi.conv, st.kcp_hi)])
 
-                # a camera that stops talking must be re-handshaked
+                # Video: feed ffmpeg
+                if st._buf:
+                    chunk = bytes(st._buf)
+                    del st._buf[:]
+                    self.stats["h264"] += len(chunk)
+                    last_h264 = time.time()
+                    try:
+                        ff.stdin.write(chunk)
+                        ff.stdin.flush()
+                    except (BrokenPipeError, ValueError, OSError):
+                        break
+
+                # Audio: queue chunks for the audio endpoint
+                if st._abuf:
+                    with self._audio_cond:
+                        audio_cursor += 1
+                        self.audio_chunks.append((audio_cursor, bytes(st._abuf)))
+                        self.audio_stats["bytes"] += len(st._abuf)
+                        self.audio_stats["chunks"] += 1
+                        self._audio_cond.notify_all()
+                    del st._abuf[:]
+
+                # stall check
                 if time.time() - last_h264 > 8.0:
                     raise RuntimeError("stream stalled")
 
-            if time.time() - last_h264 > 8.0:
-                raise RuntimeError("stream ended")
         finally:
             stop_drain.set()
             for closer in (lambda: ff.stdin.close(), ff.kill, st.close):
@@ -520,6 +548,10 @@ PAGE = """<!doctype html>
  .obar .x { background:rgba(255,255,255,.14); border:0; color:#fff;
             padding:7px 13px; border-radius:6px; cursor:pointer; }
  .obar .x:hover { background:rgba(255,255,255,.28); }
+  .sndbtn { background:none; border:0; color:#8b949e; cursor:pointer;
+            font-size:16px; line-height:1; padding:2px 6px; border-radius:4px; }
+  .sndbtn:hover { background:#30363d; color:#e6edf3; }
+  .sndbtn.on { color:#3fb950; }
 </style>
 
 <header>
@@ -563,10 +595,13 @@ function tile(c) {
       '<div class="ip"></div><div class="badge"></div>' +
       '<button class="fsbtn" title="Fullscreen (or double-click the video)"' +
       '>&#9974;</button>' +
+      '<button class="sndbtn" title="Toggle sound" aria-label="Toggle sound"' +
+      '>&#128266;</button>' +
       '<button class="fsbtn" title="Save a still JPEG (snapshot)"' +
       '>&#128247;</button></div>' +
       '<div class="shot"><div class="ph">connecting&hellip;</div>' +
       '<img id="img' + c.tid + '" class="hidden" alt=""></div>' +
+      '<audio id="aud' + c.tid + '" class="hidden" preload="none" crossorigin="anonymous"></audio>' +
       '<div class="foot"><span class="f1"></span>' +
       '<span class="f2 err"></span></div>';
     $('#grid').appendChild(el);
@@ -587,6 +622,30 @@ function tile(c) {
       a.remove();
     });
     el.addEventListener('dblclick', () => openFs(c.tid));
+  }
+  // Sound button
+  const sndb = el.querySelector('.head .sndbtn'),
+        aud = document.getElementById('aud' + c.tid);
+  if (sndb && aud) {
+    let audioOn = false;
+    sndb.addEventListener('click', e => {
+      e.stopPropagation();
+      if (!audioOn) {
+        aud.src = '/audio/' + c.tid + '.wav?r=' + Date.now();
+        aud.play().catch(() => {});  // autoplay policy may block
+        sndb.classList.add('on');
+        sndb.textContent = '&#128266;';
+        sndb.title = 'Sound on (click to mute)';
+        audioOn = true;
+      } else {
+        aud.pause();
+        aud.removeAttribute('src');
+        sndb.classList.remove('on');
+        sndb.textContent = '&#128263;';
+        sndb.title = 'Sound off (click to unmute)';
+        audioOn = false;
+      }
+    });
   }
   el.querySelector('.name').textContent = c.name || ('Camera ' + c.tid);
   el.querySelector('.ip').textContent = c.ip || '\\u2014';
@@ -661,13 +720,16 @@ function openFs(tid) {
   if (FS.tid === tid) return;
   if (FS.tid !== null) closeFs();
   const img = document.getElementById('img' + tid),
+        aud = document.getElementById('aud' + tid),
         tileEl = document.getElementById('c' + tid);
   if (!img || !tileEl) return;
   FS.tid = tid;
   FS.home = img.parentNode;                 // the tile's .shot, before moving
+  FS.audHome = aud.parentNode;
   $('.oname').textContent = tileEl.querySelector('.name').textContent;
   $('.ostat').textContent = tileEl.querySelector('.badge').textContent;
   $('#ovslot').appendChild(img);            // MOVE, not clone
+  $('#ovslot').appendChild(aud);            // move audio too
   img.classList.remove('hidden');
   tileEl.querySelector('.ph').classList.remove('hidden');
   $('#overlay').classList.add('open');
@@ -676,7 +738,9 @@ function openFs(tid) {
 function closeFs() {
   if (FS.tid === null) return;
   const img = document.getElementById('img' + FS.tid),
-        home = FS.home;
+        aud = document.getElementById('aud' + FS.tid),
+        home = FS.home,
+        audHome = FS.audHome;
   $('#overlay').classList.remove('open');
   if (img && home) {
     home.appendChild(img);                  // move it back into the tile
@@ -820,6 +884,8 @@ class Handler(BaseHTTPRequestHandler):
                        "generic.")
         elif path.startswith("/stream/") and path.endswith(".mjpg"):
             self._stream(path.split("/")[2].split(".")[0])
+        elif path.startswith("/audio/") and path.endswith(".wav"):
+            self._audio(path.split("/")[2].split(".")[0])
         elif path.startswith("/snapshot/") and path.endswith(".jpg"):
             self._snapshot(path.split("/")[2].split(".")[0])
         else:
@@ -922,6 +988,61 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             w.log("mjpeg served %d frames (write %.1fs)"
                   % (served, t_write))
+
+    # -- audio -------------------------------------------------------------
+    def _audio(self, tid):
+        """Stream raw mu-law audio (8 kHz, mono) from the camera.
+
+        The camera emits audio interleaved with video on the same linktype/conv,
+        and CameraStream.raw_audio() yields complete chunks.  CameraStreamThread
+        collects them in a bounded deque and this endpoint serves them as a
+        streaming WAV (RIFF header with 0xFFFFFFFF sizes, then raw mu-law).
+        """
+        try:
+            tid = int(tid)
+        except ValueError:
+            self._json(404, error="bad camera id")
+            return
+        w, err = HUB.ensure(tid)
+        if err:
+            self._json(503, error=err)
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        # Streaming WAV header: RIFF with 0xFFFFFFFF size (unknown length)
+        riff = struct.pack(
+            "<4sI4s4sIHHIIHH4sI",
+            b"RIFF", 0xFFFFFFFF, b"WAVE", b"fmt ", 16,
+            7, 1, 8000, 8000, 1, 8,
+            b"data", 0xFFFFFFFF)
+        try:
+            self.wfile.write(riff)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+        cursor = 0
+        dead = 0
+        while True:
+            chunks, cursor = w.take_audio(cursor)
+            if chunks:
+                try:
+                    self.wfile.write(b"".join(chunks))
+                    self.wfile.flush()
+                    dead = 0
+                except (BrokenPipeError, ConnectionResetError):
+                    break
+            else:
+                time.sleep(0.02)
+                if not w.is_alive():
+                    dead += 1
+                    if dead > 100:
+                        break
 
 
 def main():
