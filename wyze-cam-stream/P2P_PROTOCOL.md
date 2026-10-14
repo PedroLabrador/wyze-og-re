@@ -1321,6 +1321,175 @@ What we are adding is a postman, not a stream.
 
 
 
+## 5i. The data plane is KCP — AvStreamCtl is NOT a GUTES frame  [SOLVED]
+
+This section **supersedes** the earlier working assumption that the client's
+`7e b9` AvStreamCtl was a raw GUTES UDP frame to replay. It is not.
+
+### Ground truth: a fully working phone session
+
+`adb logcat` while opening a live view of CAM-1 (`.224`), tag `IoTVideo-P2P`.
+This is the *real* client sequence, LAN path, end to end:
+
+```
+iv_start_av_link lanCall
+CH3: iv_start_process_calling   session_id=1752459303 dev_id=429728659223864
+iv_mtp_session_new              link_id=2112963560
+iv_create_kcb                             <-- KCP control block
+iv_create_kcb                             <-- (twice: +0x330 and +0x334)
+iv_init_frm_CALLING  reqfrm->mtp_link.link_id=2112963560 lan_ipv4=...
+iv_process_calling  lanCallIp=...
+iv_mtp_session_add_lan_or_nat  lan dstAddr:192.168.77.10 port:49802
+gutes_on_ackfrm_Lan_Calling
+CH3: iv_on_time_out_check_into_transfer     <-- TIMEOUT drives this, not a frame
+CH3: ========iv_start_process_transfer========
+iv_rcvpkt_AVSTREAMCTL_ACCEPT
+CH3: iv_notify_p2pconnReady normal_sqn=2
+start_av_enc_dec  chnnelid=3 conn_type=1
+start_av_enc_dec  AudioType=5 VideoType=0
+```
+
+Two things fall straight out:
+
+1. **`iv_create_kcb` runs inside `iv_mtp_session_new`** — the KCP control block
+   is created *at session creation*, on both sides. There is **no separate
+   "create KCP" handshake step**, and no type-`0x25` exchange on the LAN path.
+   The earlier hunt for an inbound KCP trigger (type-185 cmd 1) was chasing a
+   step that does not exist here.
+2. **The transfer phase is driven by a timer** (`iv_on_time_out_check_into_transfer`
+   → `iv_start_process_transfer`), ~150 ms after the CALLING ack — not by any
+   frame we could send.
+
+### The finding that reframes everything
+
+`iv_send_av_stream_ctl_frm` (**0x541a8**) — resolved `bl` targets, authoritative:
+
+```
+0x541e4 bl -> 0x13a40  iv_init_frm_AvStreamCtl
+0x54264 bl -> 0x13a4c  ivkcp_send
+0x54288 bl -> 0x13a4c  ivkcp_send
+```
+
+**It calls `ivkcp_send` twice and never calls `iv_mtp_chnnel_send_mtp_frm`.** So
+the AvStreamCtl frame is a plain payload **inside KCP** — no GUTES header, no
+RC5, no checksum. Both KCP objects are tried (`obj->0x94->0x334` and `->0x330`,
+selected by the action argument), and the function silently returns if either
+is NULL.
+
+`iv_init_frm_AvStreamCtl` (**0x53274**) builds that inner frame, and its shape
+proves the point — it writes raw data into what would be GUTES header bytes:
+
+```
+memset(buf, 0, 0x4c)          # 76 bytes
+buf[0]   = 3                  # <-- not 0x7e! this is the KCP-ctrl msg type
+buf[2:4] = 0x4c               # length field, 76
+buf[4:8] = obj->0x164
+buf[8:12] = arg2              # action
+# wrapper then does buf[0xc] = arg2
+# arg2==1: buf[1] |= 2 ; buf[0x10:0x14]=obj->0xac ; buf[0x14:0x18]=obj->0xb0
+#          buf[62:64]=(u16)obj->0x160 ; memcpy(buf+24, obj+0x1ec, 32)
+# arg2==2: buf[0x14:0x18]=obj->0x1e4 ; memcpy(buf+24, obj+0x20c, 32)
+```
+
+A GUTES frame has `buf[0]=0x7e/0x7f`, checksum at `[16:20]`, flags at `[20:24]`.
+Here `[0x10]`/`[0x14]` are *data*, and `[0]=3`. **This is not a GUTES frame.**
+
+> The `7e b9` frames in `wire/p2p_frames.json` are `PASSTHROUGH_MSG` (type 185,
+> cmd 0) — a *different* message class that happens to be 76 bytes too. They
+> were mislabelled "avstreamctl". Replaying them was never going to start a stream.
+
+### The receive router — first byte-level routing ground truth
+
+**0x340c4**, fully decoded:
+
+```c
+if (buf[0] == 0xC0) {
+    if (buf[1] & 0x80)  -> iv_on_rcv_mtpCtrl_pkt      // `C0 90`
+    else if (buf[1] & 0x10) -> iv_on_rcv_kcpdata_pkt  // `C0 10`
+    else                 -> iv_on_rcv_pkt_as_relay
+} else {
+    if (*(u16*)(buf+58) > 1536) { log; return; }      // sanity cap
+    if (buf[0] == 0x70) -> iv_gute_fragment_decode
+    else                -> the 0x7e/0x7f GUTES path (0x343f4)
+}
+```
+
+| `buf[1]` | class |
+|---|---|
+| bit7 = 1 | MTP control |
+| bit7 = 0, bit4 = 1 | **KCP data** |
+| bit7 = 0, bit4 = 0 | relay |
+
+`C0 10` = `0b00010000` → bit7=0, bit4=1 → **correctly routed to the KCP
+handler**. Our framing was never the problem.
+
+### `iv_on_rcv_kcpdata_pkt` (0x630c0) — fully decoded
+
+```c
+p = buf + 56;                          // the MTP header (buf+0..56 is recv metadata)
+n = (p[1] >> 5) & 3;                   // ubfx r0,r0,#5,#2
+if (n == 0) { kcp = buf+62; len = *(u32*)(buf+8) - 6;   }
+else         { kcp = buf+70; len = *(u32*)(buf+8) - 14; }
+
+session = iv_find_mtp_session(ctx->8, *(u32*)kcp);   // conv = kcp[0:4]
+if (session == NULL) return;                          // SILENT - no ack, no log
+
+if (conv & 0x80000000) kcpobj = session->0x334;       // hi form
+else                   kcpobj = session->0x330;       // lo form
+if (kcpobj) { ret = ivkcp_input(kcpobj, kcp, len); if (ret < 0) log(); }
+```
+
+For our packets, `(0x10>>5)&3 == 0`, so `kcp = buf+62` and `len = total-6` —
+**exactly the bytes we already send** (verified: our 30-byte `c010…` yields a
+24-byte ikcp segment, the correct WASK size).
+
+### `iv_find_mtp_session` (0x5d96c) — the session key
+
+Singly-linked walk, `next` at **offset 0**, head at `ctx->0`. Match on
+`session->0x10` (= `conv` = `link_id`), and it accepts **either bit form**:
+
+```c
+if (key == (conv | 0x80000000)) return session;
+if (key == (conv & MASK))       return session;   // mask from literal @0x5da04
+```
+
+**So the conv bit-form is not a failure mode** — we have been sending both, and
+both would match. The lookup only fails if no session exists at all.
+
+### What this rules out, and what is left
+
+The camera **answers our CALLING with a hello on every run** (`c0 90`, inner
+`[4:8] = cb 02 e2 f7` = `0xf7e202cb`, echoing our CALLING's `link_id`). So:
+
+- The CALLING **is** being processed → a session **does** exist on the camera
+  with `conv = 0xf7e202cb`. *(Rules out the duplicate-cache theory: if
+  `iv_gutes_pkt_isDuplicate` were dropping the replayed CALLING, no hello.)*
+- The MTP framing is right (router decodes it to the KCP handler).
+- The conv is right (it is the camera's own hello word, and either bit form matches).
+
+**Therefore the remaining blocker is one of:**
+1. the camera's KCP object (`session->0x330`/`+0x334`) is NULL at the time we
+   probe, or
+2. `ivkcp_input` accepts our segment but our **WASK does not elicit a reply** —
+   note a WASK only asks for a window probe; the frame that actually matters is
+   the AvStreamCtl.
+
+### The concrete next experiment
+
+Stop sending WASK. **Implement ikcp in Python and send the real AvStreamCtl
+over KCP** — this is what the actual client does, and it is the only thing that
+provokes `iv_rcvpkt_AVSTREAMCTL_ACCEPT`:
+
+1. ikcp segment: `conv(4) cmd=81(PUSH) frg wnd ts sn una len` + 76-byte payload
+2. payload = the `iv_init_frm_AvStreamCtl` frame above, `buf[0]=3`
+3. wrap in MTP: `C0 10 <len:2> <chval:2>` (chval rule, § "MTP wire")
+4. expect back `C0 10` carrying an AVSTREAMCTL_ACCEPT, then H.264 fragments
+   (MTU 1032, `gute_recv_fragment_init mtu=1032`)
+
+The camera's KCP will only emit once it has data to send — which it gets only
+after we request the stream. That is why six runs of WASK produced zero `C0 10`.
+
+
 ## 6. Transport [CONFIRMED]
 
 - **KCP over UDP.** Steady state emits `iv_cal_kcp_rate sta_cur->real_snd=… resend_frm=0
