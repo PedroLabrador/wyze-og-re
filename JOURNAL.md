@@ -618,15 +618,83 @@ counters at `[0x1c..0x34]` (order swapped on `ctx->0x154==1`), timing deltas at
 Candidates still standing:
 
 - **The 164-byte `7f 0c a4 00 ...` frame** the app sends at 8.33 s, immediately
-  after `TOPEN` and *before* the 0xa6 exchange.  It is a `0x7f` frame (so its
-  second byte is not a type the way `0x7e` frames are), and our client has
-  never sent anything like it.  Not yet tried.
+  after `TOPEN` and *before* the 0xa6 exchange.  **RULED OUT** (see below).
 - `iv_create_kcb` (0x5c06c) -- iotv2.log shows it firing twice right after
   `iv_start_process_calling`.
 - Whether the camera grants HD only after completing the 0xa6/0xa7/0xaa
   exchange *properly* (the replayed bytes embed the relay session's connection
   id `00001200660b40155cf08858`, so a verbatim replay may simply have been
   malformed rather than meaningless).
+
+### Addendum: the `7f` frames are relay plumbing, and the meter frame is the map
+
+Two more eliminations, both free.
+
+**The 0x7f frames never reach the camera.** `wrapperchk.py` walks
+`cap_relay.log` properly (using `[2:4]` as the total length, which the earlier
+walker in `replay_app.py` got wrong -- that is why it reported an `0xa7` of
+1132 B when the real one is 209 B).  The full ordered sequence is:
+
+```
+  0  app->relay  7f 01  len=36    1  relay->app  7f 02  len=40
+  2  app->relay  7f 0c  len=164   3  relay->app  7f 0c  len=48
+  4  relay->app  7f 0d  len=72    5  app->relay  7f 0d  len=32
+  6..  7e a6 / 7e a7 / 7e aa / 7e a0 ... then 7e a4 CALLING (128 B)
+```
+
+The `0x7f` prefix appears **only in the first six frames**, bracketing the
+TCP connect, and the app's 128-byte CALLING is *not* a substring of the 164-B
+frame.  `0x7f` is the relay's own protocol (its own type namespace: 1/2/3/12),
+`0x7e` is tunneled camera protocol.  Our LAN-direct client has no relay, so
+there is nothing to send.  **The last "untried candidate" on the old list is
+gone.**
+
+**Our handshake already matches the app's.** With an instrumented probe
+(`gutesprobe.py` now records from the first byte instead of letting `_pump()`
+silently discard non-MTP traffic) the camera answers our CALLING with exactly
+
+```
+   7e a4  [1]=0xa4  len=32   000102030405060708090a0b0c0d0e0f1011121314151617
+```
+
+-- the same `7e a4 20 00` ack it sends the app (relay indices 22, 27, 28, 33,
+50, 51).  Then `C0 90` meter_req x3 and KCP.  **The camera treats our session
+identically to the app's at the control plane.**
+
+**It is not a session-slot effect.** `adb shell am force-stop com.hualai`,
+then a fresh session: still `header=(640, 360, 20)`.  The camera hands us the
+sub-stream even when we are the only client, so "HD goes to the first
+connection" is disproved.
+
+**The meter frame, fully dumped** (74 bytes, from `/tmp/gutes_full.log`):
+
+```
+c0 90 02 09 4b 33                 MTP hdr, total = 74
+00 01 44 00                       inner type 1 = meter REQUEST, len 68
+d9 cb 34 ef                       <- connection id = our hi conv (0xef34cbd9)
+00 00 8a 16 0d 00
+d6 86 01 00 a3 60 12 00 d6 86 01 84    <- the device id (d_log split)
+01 00 00 00
+7b 1d 79 02                       <- getTickCount64 (increases each frame)
+00 00 00 00 00 00 00 00 00 00 00 00     <- measurement section: ALL ZERO
+04 00 00 00  44 00 00 00         <- item count 4, item length 68
+00 00 00 00 00 00 00 00 00 00 00 00
+```
+
+`iv_rcv_meter_ack` @ 0x61338 -- *the function the camera runs on our reply* --
+is now decoded: it takes `pkt+56` as the payload, reads `body[1]` bits 5..6 as
+a sub-type to pick a 6- or 8-byte offset, checks `body[4:8] == ctx->0x10`
+(that is the connection id above, which we echo, which is why the check
+passes), then reads `body[+8, +0x1c, +0x20, +0x2c, +0x34, +42]`, calls
+`iv_get_meter_item`, stores `getTickCount64()`, and runs
+`iv_mtpSession_optimize_proc`.
+
+So the meter record is a **path-measurement** structure, and its measurement
+section is zero-filled in the camera's own request.  `make_meter_ack` echoes
+those zeros back verbatim.  If the app fills that section with its measured
+downlink rate, that is a live, still-untested lever -- and we now have the
+byte offsets to aim at.
+
 
 ### Tooling notes
 

@@ -48,8 +48,40 @@ def main():
 
     st = p2p_client.CameraStream(ip, port, tid, calling, local_port=0,
                                  timeout=8.0)
-    st._send(st.calling)                       # <-- we send GUTES 0xa4
-    st._pump(1.5, [])
+
+    # Record EVERY datagram from the first byte we send.  _pump() only
+    # understands C0 90 / C0 10 and silently discards everything else, which
+    # is exactly where the camera's GUTES replies to our CALLING live -- so
+    # an earlier version of this probe could only ever conclude "the camera
+    # sent us nothing", having thrown the handshake away before it looked.
+    st._send(st.calling)
+    hs = []
+    end = time.time() + 2.0
+    while time.time() < end:
+        r, _, _ = select.select([st.sock], [], [],
+                                max(0.0, end - time.time()))
+        if not r:
+            continue
+        try:
+            data, _ = st.sock.recvfrom(65535)
+        except OSError:
+            continue
+        hs.append(data)
+        if data[:2] == b"\xc0\x90":
+            a = p2p_client.make_meter_ack(data)
+            if a:
+                st._send(a)
+
+    print("\n== every datagram the camera sent after our CALLING ==")
+    for d in hs:
+        if d[0] in (0x7E, 0x7F) and len(d) >= 4:
+            print("   prefix 0x%02x  [1]=0x%02x  len=%-5d %s"
+                  % (d[0], d[1], len(d), d[:24].hex()))
+        else:
+            print("   %-6s len=%-5d %s"
+                  % (d[:2].hex(), len(d), d.hex()))
+    print("   (%d datagrams)" % len(hs), flush=True)
+
     lo, hi = st.conv & 0x7FFFFFFF, st.conv | 0x80000000
     st.kcp_lo = kcpav.KCP(lo, mtu=p2p_client.MTU)
     st.kcp_hi = kcpav.KCP(hi, mtu=p2p_client.MTU)
