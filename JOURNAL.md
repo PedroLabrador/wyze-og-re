@@ -826,6 +826,153 @@ definition clearly lives, since nothing on the GUTES/AvStreamCtl path works):
 
 
 
+## Phase 13 -- reading the AvStreamCtl INITREQ off the other side
+
+Every parameter we had been guessing at could now be read in the SDK's own
+*receive* handler, because ThroughTek runs the same code on both ends.  Five
+more theories were eliminated and one real bug was fixed.
+
+### The complete AvStreamCtl field map
+
+`iv_init_frm_AvStreamCtl @ 0x53274` (was: partially known):
+
+```c
+memset(buf, 0, 0x4c);
+buf[0] = 3;                       /* linktype                       */
+*(u32*)(buf + 4)  = ctx->0x164;   /* id164                          */
+*(u32*)(buf + 8)  = action;       /* cmd                            */
+if (action == 1) {                /* ACT_START                      */
+    buf[1] = (buf[1] & ~2) | 2;
+    *(u32*)(buf + 0x10) = ctx->0xac;
+    *(u32*)(buf + 0x14) = ctx->0xb0;
+    *(u16*)(buf + 62)   = ctx->0x160;   /* w160                     */
+    memcpy(buf + 24, ctx + 0x1a4, 0x20);
+}
+if (action == 2) {                /* ACT_ALT                        */
+    *(u32*)(buf + 0x14) = ctx->0x1e4;
+    memcpy(buf + 24, ctx + 0x1c4, 0x20);
+}
+*(u16*)(buf + 2) = 0x4c;          /* total length, header included  */
+```
+
+and `iv_send_av_stream_ctl_frm @ 0x541a8` writes `buf[0xc]` from its own fourth
+argument *after* the builder returns.  So the message is
+`<cmd @ [8:12]> <subcmd @ [0xc]>`, two independent fields -- not one action
+byte as previously assumed.  Constants: `ACT_START=1, ACT_ALT=2, ACT_STOP=6`.
+
+`iv_send_av_stream_ctl_frm` then calls `ivkcp_send` directly.  **No RC5**: the
+AvStreamCtl goes out in the clear, which is what our client already did.
+
+### id164 is not a parameter -- it is a per-session random
+
+`iv_start_process_calling @ 0x539a8` generates it:
+
+```c
+do {
+    v = (rand() << 20) | (rand() << 10) | (rand() & 0x3ff);
+} while (v == 0);
+ctx->0x164 = v;
+ctx->0x158 = ctx->0xa0;  ctx->0x15c = ctx->0xa4;  ctx->0x160 = ctx->0xa8;
+```
+
+30 random bits, nothing to do with resolution.  The `0xa0/a4/a8 -> 0x158/15c/160`
+mirror means the interesting values are the **`ctx+0xa0..0xb0` block**, which
+`iv_start_av_link @ 0x1c860` fills straight from its arguments:
+
+```c
+ctx->0xa4 = arg(u32);  ctx->0xa0 = arg(u32);  ctx->0xa8 = arg(u16);
+ctx->0xac = *(arg + 8);  ctx->0xb0 = *(arg + 0xc);
+ctx->0x1e4 = 0;  ctx->0x16c = 0;
+```
+
+`iv_start_av_link` is the exported entry point (no internal callers; the JNI
+layer in libiotvideo calls it), so those five values are exactly what the app
+hands the SDK.
+
+### What the camera actually reads back
+
+`iv_rcvpkt_AVSTREAMCTL_INITREQ @ 0x56f4c`, after its state machine, reads
+precisely two fields out of the packet:
+
+```c
+chn->0x160 = *(u16*)(pkt + 62);      /* also pkt_ctx->0x18            */
+chn->0x164 = *(u32*)(pkt + 4);       /* also chn->0x8c                */
+```
+
+It never touches `pkt[0x10]` (ac), `pkt[0x14]` (b0) or the 32-byte blob at
+`[24:56]`.  **Every earlier sweep of ac/b0/blob was sweeping bytes the camera
+discards.**  A repeated INITREQ is answered with an AvStreamCtl of
+`cmd=3, subcmd=7` (or dropped, depending on `chn->0x154` and a bit-8 test on
+`chn->8->0x1c`).
+
+### Five eliminations
+
+* **`w160` is not a resolution knob** -- 15 values (1920/1280/1080/720/640/360/
+  2560/2/3/4/5/20/30/1/0), one fresh random `id164` each, header stayed
+  `640x360` throughout (`w160probe.py`).
+* **the subcmd byte is not a verb for quality** -- `[0xc]` in 2,3,4,5,7.
+* **the cmd byte is not either** -- `[8:12]` in 2,3,4,5.
+* **GUTES `0xb9` is not an AvStreamCtl.**  It is 76 B and was labelled
+  "avstreamctl" in `wire/p2p_frames.json` purely because the length matches.
+  Decrypted with the frame-derived key its blob is
+  `03000000 000d168a 000186d6 001260a3 840186d6 00...` -- the product code and
+  `d_log` -- and its tail is the conv id (`ef34cbd9`, `7ff1a426`, `f7e202cb`
+  for the three cameras).  It is an identity/link frame.
+* **`init_frm_mtp_res_request @ 0x4cc04` is a relay resource, not video.**  Now
+  fully mapped: magic `0x7f`, type `0xa2`, total `0x7a` (122 B);
+  `[4:12] = ctx->0x240/0x244`, `[0x1a..0x2a] = src->0x1c..0x2c`,
+  `memcpy([46:82], src+48, 36)`, `memcpy([82:118], src+84, 36)`,
+  `[0x62] = ctx->0x28`, `[88] = *(u16*)(ctx+0x130)`.  It pairs with
+  `gat_on_rcvpkt_MTP_RES_RESPONSE`, i.e. GAT/relay bookkeeping.
+
+### The frame-derived RC5 rule reads the whole captured dialogue
+
+`frames_clear.py` decrypts every frame of a capture with
+`key = frame[0:4] + frame[20:23] + 0x00` over `[12:20]` and `[24:]` in 8-byte
+blocks.  It holds structurally: retransmitted frames decrypt identically
+(ECB), the plaintext flag word at `[20:24]` survives, and its third byte is a
+per-type class code (0x06 / 0x0a / 0x0e / 0x12).  The app's 3.23.1 dialogue is
+now readable end to end -- 14 frame types, `a6 a7 a0 a4 aa b0 b1 b7 b8 b9 bc
+c3 d8 d9`.  No frame in it carries anything resembling a width, height or
+definition code.
+
+The JSON's `hello` is the meter frame (`c090...`, same shape as the meter_req
+we receive).
+
+### Fixed: linktype 3 is plaintext, and we were shredding it
+
+`_on_tlv` decrypted *every* KCP body with the AV key and appended it to the
+H.264 buffer.  Linktype 3 is plaintext -- the camera's replies decode directly
+to `00000000 02000000 00...` (id164=0, cmd=2) and `00000000 06000000 00...`
+(cmd=6), and `rc5_dec(key, 8 zero bytes) = 49d8aa887750e980` reproduced the
+repeated block we had been seeing.  Only linktype 4 is decrypted now; 659 media
+TLVs / 391 KB / 718 start codes per 8 s, unchanged, with 4 control frames no
+longer injected.
+
+### Where this leaves the resolution question
+
+The camera reads exactly two fields from the only parameterised frame our client
+can send, and neither changes the encoder.  Combined with Phase 12 (the app's
+AV plane is direct-LAN and therefore unobservable from the Mac), the remaining
+candidates are:
+
+1. **A cloud-side device setting.**  The app's definition lives in
+   `SpUtils` (`sp_definition_2`), and Wyze cameras carry a device-level video
+   quality property that may be what the encoder actually follows.  The cached
+   `wyze_devices.json` (`home_page/get_object_list`) has no such key, so it
+   would need `get_device_info`/property read + write.  Testable with the
+   existing OAuth + Signature2 + curl path, but it mutates a camera's live config, so it waits for a spare test camera.
+2. **A stream resource we never request.**  `setDataResource` / "data resource"
+   is the SDK's own vocabulary for the definition path, and `iv_start_av_link`'s
+   `ctx+0xa0..0xb0` block is fed from the app side, not from anything we can
+   synthesise blindly.
+3. **LAN MITM** to finally read the app's AV plane (Phase 12, route 2).
+
+`w160probe.py`, `ctlreply.py`, `frames_clear.py` are kept; `ctlreply.py` is the
+one to rerun after any protocol change, since it dumps both directions of the
+AvStreamCtl exchange field by field.
+
+
 `SECRETS.md` holds the OAuth `client_id` / `client_secret` and the checklist.
 Delete the plaintext token files (`/tmp/wyze_token.json`, `/tmp/wyze_live.txt`,
 `/tmp/wyze_log.txt`) and revoke the token when finished.

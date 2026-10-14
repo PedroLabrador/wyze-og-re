@@ -241,7 +241,15 @@ class CameraStream(object):
                 continue
 
     def _on_tlv(self, payload):
-        """A TLV frame arrived over KCP: [0]=type [2:4]=u16LE len [4:]=RC5."""
+        """A TLV frame arrived over KCP: [0]=type [2:4]=u16LE len [4:]=body.
+
+        Only linktype 4 (media) is RC5 with the AV key.  Linktype 3 is the
+        AvStreamCtl exchange and its body is PLAINTEXT -- the camera's own
+        replies decode straight to `00000000 02000000 00...` (id164, cmd).
+        Running those through RC5 turned every control frame into 72 B of
+        garbage that then landed in the H.264 buffer, so only type 4 is
+        decrypted and fed to the decoder now.
+        """
         if len(payload) < 5:
             return
         ln = struct.unpack_from("<H", payload, 2)[0]
@@ -249,6 +257,9 @@ class CameraStream(object):
             ln = len(payload)
         body = payload[4:ln]
         if not body:
+            return
+        if payload[0] != 4:
+            self.tlv_other = getattr(self, "tlv_other", 0) + 1
             return
         self._buf += rc5_decrypt_stream(self.key, body)
 
