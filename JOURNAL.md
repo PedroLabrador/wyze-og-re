@@ -165,6 +165,45 @@ initialised), and confirming the RC5 parameters (rounds/key length — the GUTES
 path uses a 32-byte nonce key). Then the decrypted stream is plain
 H.264/H.265 for ffmpeg.
 
+### THE AV KEY — SOLVED: `CALLING[120:128]`
+
+`ctx->0x488` has exactly **one** writer in the whole binary, and
+`ctx+0x480` (the 8-byte key buffer passed to `rc5_ctx_setkey`) likewise.
+Both are in `iv_mtp_session_new` (0x5db90..0x5dbe0), which has **two
+branches**:
+
+```c
+// branch A (local / LAN initiator):
+iv_getRandomValue(ctx + 1152);            // 1152 = 0x480 -- random 8-byte key
+ctx->0x488 = rc5_ctx_new(a & 0xff, b & 0xff);
+rc5_ctx_setkey(ctx->0x488, ctx + 0x480, 8);
+
+// branch B (session built FROM a received CALLING):
+ctx->0x10  = arg->0x1c;                   // the conv -- CALLING[28:32]
+ctx->0x484 = arg->0x7c;                   // CALLING[124:128]
+ctx->0x480 = arg->0x78;                   // CALLING[120:124]
+```
+
+Branch B reads the session straight out of the parsed CALLING, and `arg->0x78`
+is a frame-buffer offset ⇒ **the 8-byte AV RC5 key is the last 8 bytes of the
+128-byte CALLING frame.**
+
+**Verified live.** Key = `889fcf8a9318d6b3` (cam2's captured CALLING), RC5-ECB
+in 8-byte blocks, little-endian word order, via `listreq.rc5_setup` /
+`rc5_decrypt_block`:
+
+```
+unique frames      : 62
+decrypted stream   : 30068 bytes
+start codes 000001 : 64
+NAL types          : SPS 1, PPS 1, IDR 1, non-IDR 14
+ffprobe            : codec_name=h264  width=640  height=360  frames=15
+```
+
+**So the complete pipeline works end to end:**
+login → device list → LAN discovery → CALLING → **meter_ack** → KCP up →
+AvStreamCtl over KCP → RC5 AV decrypt (`CALLING[120:128]`) → **H.264 → ffmpeg**.
+
 ---
 
 ## Open questions still unanswered
