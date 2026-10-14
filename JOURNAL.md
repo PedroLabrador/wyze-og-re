@@ -973,6 +973,135 @@ one to rerun after any protocol change, since it dumps both directions of the
 AvStreamCtl exchange field by field.
 
 
+## Phase 14 -- the client side is exhausted; 640x360 is the camera's decision
+
+Phase 13 left one live candidate: `w160`, the only field the camera's INITREQ
+handler actually parses.  This phase tested it properly and closed it, then
+mapped the last unread frame and checked the cloud.  Nothing reachable from a
+client changes the resolution.
+
+### The earlier w160 sweep was invalid, and this is why it matters
+
+`w160probe.py` pushed 15 values into one session and saw no change.  That
+result should be DISREGARDED as a test of w160: `gutesprobe.py` shows the
+camera emits only four linktype-3 replies in an entire session, all of them at
+the very start, so every INITREQ after the first is swallowed by the state
+machine.  The sweep was poking a field the camera had stopped reading.
+
+`w160fresh.py` re-runs it correctly -- one value per **fresh** session
+(discover -> CALLING -> a single AvStreamCtl carrying that w160), 35 s apart
+for the slot:
+
+```
+w160=0     -> header=(640, 360, 1, 20)   media TLVs=1059
+w160=1920  -> header=(640, 360, 1, 20)   media TLVs=1048
+w160=1080  -> header=(640, 360, 1, 20)   media TLVs=1072
+w160=3     -> header=(640, 360, 1, 20)   media TLVs=1085
+w160=4     -> header=(640, 360, 1, 20)   media TLVs=1050
+```
+
+All five sessions streamed normally, so this is not a silent failure.  `w160`
+is dead as a definition lever.  Its only other appearance in the library,
+`0x1a544`, is a struct clone (`dst[0x60] = src->0x160`), not an encoder read.
+
+### The CALLING is now completely mapped, and it has no resolution
+
+`iv_init_frm_CALLING @ 0x542c0` builds a **128-byte** frame, magic `0x7e` on
+the wire, type `0xa4` (`7ea48000`).  This also settles the dialect confusion:
+the 66-byte `7ea6` CALLING in the 3.23.1 capture is the *newer* form, which
+this camera firmware ignores (`dialectprobe.py`); the 128-byte form is the one
+that works, and what `wire/p2p_frames.json` calls "calling" is that 128-byte
+frame, not a 66-byte one.
+
+Full layout, confirmed by decrypting all three stored CALLINGs:
+
+| offset | source | meaning |
+|---|---|---|
+| `[0:2]` | `0x7e a4` | magic, type |
+| `[2:4]` | `0x0080` | total length, 128 |
+| `[4:8]`   | `ctx->8->0x240` | `d_log` low |
+| `[8:12]`  | `ctx->8->0x244` | `d_log` high |
+| `[0x18:0x1a]` | 0 | zero |
+| `[0x1c:0x20]` | `ctx->0x94->0x10` | **conv id** (per camera) |
+| `[0x20:0x24]` | `ctx->8->0x240` | `d_log` low again |
+| `[0x24:0x28]` | `ctx->8->0x244` | `d_log` high again |
+| `[0x28:0x2c]` | `ctx->0x158` | per-camera constant (0x0d168a / 0x0e7d09 / 0x153538) |
+| `[0x2c:0x30]` | `ctx->0x15c` | 0x186d6 on all three |
+| `[0x32]` | `\|= 1` | flag |
+| `[0x34:0x36]`, `[88:90]` | 0 | zero |
+| `[0x3c:0x40]`, `[0x60:0x64]` | 0 | zero |
+| `[0x40:0x44]` | `get_local_ip()` | our LAN IP |
+| `[54:56]` | `*(u16*)(ctx->8 + 0x130)` | our port |
+
+The two "0x158/0x15c" constants are the same pair that appears in the meter
+frame and in the `b9` identity blob, so they are device identity, not stream
+parameters.  There is no width, height, fps or definition code anywhere in the
+frame -- the last place one could have been hiding.
+
+### The camera never asks us for anything
+
+`gutesprobe.py` over a full 25 s session accounts for **every** datagram the
+camera sent: one `7ea4` ack (32 B), two `c090` meter requests, four linktype-3
+AvStreamCtl replies, then 2047 media TLVs.  **Zero GUTES frames.**
+
+So the five `0xbc` (**`iv_init_frm_mtp_quality`, type 188**, 56 B) frames in
+the app's captured dialogue are telemetry the app *volunteers*; the camera
+does not solicit them.  The "we never answer the quality prompt" theory is
+dead.  Layout, for the record: `[4:12]` = `d_log`, and session statistics at
+`[0x1c] [0x20] [0x24] [0x28] [0x30] [0x34]` copied from `ctx->0x94` at
+`0x1c/0x20/0x24/0x28/0x50/0x70`, with the two pairs **swapped** depending on
+`ctx->0x154 == 1`; `[44:46]` and `[46:48]` are elapsed-time counters and
+`[0x19] |= 1` a flag.  It is link telemetry, not a stream request.
+
+**Caveat on `frames_clear.py`:** its frame-derived RC5 rule does not apply to
+type `0xbc`.  Those frames' `[4:12]` does not decrypt to `d_log`, and their
+flags word implies a mix of modes (0 and 2) rather than the uniform mode 2 the
+other types use.  `iv_gute_frm_rc5_decrypt`'s **mode 3 branch at `0x2b500` is
+still unread** and is the likely home of the difference.  Treat `bc` output
+from that script as unreliable.
+
+### The cloud has no video-quality property
+
+`propread.py` (strictly read-only) calls `v2/device/get_property_list`
+(`SV_GET_PROPERTY_LIST="<REDACTED>"`, body needs
+`did`, `device_mac` **and** `device_model`, else 1001 "cannot be empty") and
+returns 9 properties per camera:
+
+```
+P1=1  P3=1  P5=1  P20=1  P1018=1  P1020=1  P22=<public ip>  P30=0  P3000=0
+```
+
+Status flags and the public IP; no quality, definition, resolution or bitrate
+pid, and only `pid`/`value`/`ts` per record -- no names.  This is consistent
+with the app reading its own definition from `SpUtils` (`sp_definition_2`),
+i.e. locally.  **Nothing was written to any camera.**
+
+### Conclusion
+
+Every lever reachable from a client has now been eliminated:
+
+| lever | result |
+|---|---|
+| `changeDefinition` user-data frame (`defsend.py`) | negative |
+| AvStreamCtl `ac` / `b0` / blob (`sweepprobe.py`) | negative |
+| AvStreamCtl `w160`, 15 values in-session | negative |
+| `w160` as the FIRST INITREQ of a fresh session (`w160fresh.py`) | negative, definitive |
+| AvStreamCtl cmd / subcmd bytes | negative |
+| 3.23.1 CALLING dialect (`dialectprobe.py`) | negative, camera silent |
+| GUTES `0xb9` as a definition carrier | it is an identity frame |
+| CALLING fields | fully mapped, no resolution present |
+| MtpQuality `0xbc` handshake | the camera never solicits one |
+| cloud device property | no quality pid exists |
+
+The camera serves 640x360 to our session and ~1.4 Mbps to the app's, at the
+same time, on the same device (Phase 12).  Whatever selects it is decided by
+the camera using something we cannot synthesise, and the only untried route is
+a **LAN MITM** to finally read the app's AV plane -- heavy, needs the phone
+awake, and the payloads stay end-to-end encrypted with a key we cannot derive
+for the new dialect.  640x360 stands as the documented outcome.
+
+
+
 `SECRETS.md` holds the OAuth `client_id` / `client_secret` and the checklist.
 Delete the plaintext token files (`/tmp/wyze_token.json`, `/tmp/wyze_live.txt`,
 `/tmp/wyze_log.txt`) and revoke the token when finished.
