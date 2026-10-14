@@ -137,7 +137,33 @@ split across `buf[2]`/`buf[3]`.
 | 44 | Classify frame types | **WORKED** | `0x03` len 76 ×40 = AvStreamCtl control; `0x04` ×620 = AV data |
 | 45 | Look for Annex-B H.264 start codes | **FAILED** | no `00000001` / `000001` anywhere |
 | 46 | Try zlib decompression | **FAILED** | not raw deflate |
-| 47 | Byte statistics of the type-`0x04` bodies | **IN PROGRESS** | entropy **7.96/8.0** ⇒ encrypted. Only **62 unique frames out of 620** (10× duplicates — likely KCP retransmission because our ACKs are not landing). Frames sharing a header also share their first 16 body bytes, then diverge ⇒ a common prefix / IV, then a stream cipher. |
+| 47 | Byte statistics of the type-`0x04` bodies | **WORKED** | entropy 7.96/8.0 ⇒ encrypted; only **62 unique frames out of 620** (10× KCP retransmission — our ACKs are not landing). Frames sharing a header also share their first 12 body bytes, then diverge ⇒ constant plaintext + constant key. |
+| 48 | Scan the `.so` for cipher constants | **WORKED** | **only RC5 present** (`P32=0xB7E15163` @0x650f0). No AES S-box, no SHA/MD5/ChaCha/TEA/Blowfish. |
+| 49 | Find the AV decrypt via the KCP recv path | **WORKED** | `ivkcp_recv` → `iv_mtp_session_rcv_proc` → **`iv_rcv_tlvfrm` (0x628e8)** → `rc5_ctx_dec` @0x62c54 → `iv_ringbuf_write` |
+
+### The AV decrypt, fully decoded (`iv_rcv_tlvfrm`, 0x628e8)
+
+```c
+if (*(u16*)(frame + 2) <= 4) skip;                   // [2:4] = u16LE total length
+nblocks = (*(u16*)(frame + 2) - 4) / 8;
+for (i = 0; i < nblocks; i++)
+    rc5_ctx_dec(ctx->0x488, frame + 4 + i*8, 8);     // RC5, 8-byte blocks, IN PLACE
+iv_ringbuf_write(ctx->0x4b0, frame + 4, len - 4, 0);
+```
+
+So: the TLV frame is `[0]=type, [1]=?, [2:4]=u16LE total length, [4:]=payload`.
+The payload is RC5-encrypted **in place in 8-byte blocks** with the key context
+at `ctx->0x488`, then handed to the decoder ring buffer.
+
+This confirms the observed data exactly — our type-`0x04` frames have
+`[2:4]` = their walked length, and `732 - 4 = 728 = 91 × 8` blocks. It also
+explains the constant `ef3b6e719e4cc5544bed381a` invariant: constant plaintext
+at `[4:20]` under a constant key.
+
+**Remaining:** the value of the RC5 key context `ctx->0x488` (where it is
+initialised), and confirming the RC5 parameters (rounds/key length — the GUTES
+path uses a 32-byte nonce key). Then the decrypted stream is plain
+H.264/H.265 for ffmpeg.
 
 ---
 
