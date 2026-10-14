@@ -1735,6 +1735,34 @@ type-4 body, so this header is *inside* the RC5 ciphertext — the KCP payload
 header (`[0]=linktype, [1]=flags, [2:4]=u16 total length`) is a separate,
 outer wrapper.
 
+### 12a-2. What the camera actually sends  [OBSERVED, LIVE]
+
+The `2`/`3`/`4` type values above come from the **app's** `sendUserData`
+builder, i.e. the app→camera direction.  The camera→us direction uses a
+different numbering.  Classifying every decrypted type-4 body of a live
+session by the pair `(byte[4], byte[5])`:
+
+| `[4]`,`[5]` | per session | what it is |
+|---|---|---|
+| `00`,`01` | 1 | the **AV descriptor**: sample-rate 16000 as u32 @`[12:16]`, `[16:18]`=320, fps 20 @`[19]`, width 640 as u32 @`[20:24]`, height 360 as u32 @`[24:28]`, then a second `ff ff ff 88` @`[28]` |
+| `00`,`00` | ~420 / 10 s | **video media** frames |
+| other | 1–3 | KCP retransmit / partial-block artefacts — not real frames |
+
+So on the wire, **media frames carry `[5] = 0` and the descriptor `[5] = 1`**.
+Note the media frame's `[6:8]` does **not** behave as the payload length the
+8-byte header in §12a specifies; treat §12a as the app→camera user-data format
+only, and this table as authoritative for the camera→us direction.
+
+**The camera sends no audio.**  Every one of 462 media frames contained an
+Annex-B start code, i.e. all H.264, and no third `[4]`,`[5]` class exists.
+Audio is *described* — the descriptor carries a 16 kHz sample rate and
+`start_av_enc_dec(AudioType=5, …, AudioSampleRate=16000)` configures both
+directions — but none is transmitted to a plain viewer session.  It is not the
+AvStreamCtl INITREQ that withholds it: `iv_rcvpkt_AVSTREAMCTL_INITREQ` reads
+only `pkt[4:8]` (id164) and `pkt[62:64]` (w160), and the camera never sends us
+a GUTES frame asking for anything (`gutesprobe.py`: one `7ea4` ack, two `c090`
+meter requests, four AvStreamCtl replies, then media — zero GUTES).
+
 ### 12b. The user-data command: how the app selects 1920x1080
 
 `changeDefinition(byte def)` (def is 0, 1 or 2) becomes a **command-5 user-data
