@@ -1709,3 +1709,88 @@ will dial the Mac instead of AWS. Field positions are known exactly (§3a), so t
 5-line change to `cap_listsrv2.py`.
 
 **This is the crux of the strategic decision** — see `STATUS.md`.
+
+## 12. The AV-link frame format and the definition (resolution) command  [SOLVED]
+
+Reversed in Phase 11 from 2.50.7's `libiotvideo.so` (Thumb) plus
+`libiotp2pav.so` (ARM).  This is the format of everything that rides the **data**
+side of the session, as opposed to the GUTES control plane.
+
+### 12a. The AV-link header
+
+Every AV-link frame carries an 8-byte header, built by
+`IoTVideoPlayerImpl::sendUserData(uint8_t*, int, bool)` @ `0xfa349`:
+
+```
+[0:5]  ff ff ff 88 00      sync
+[5]    type                 2 = user data          (hdr = 8)
+                            3 = user data+sequence (hdr = 0x1c)
+                            4 = AV media           (what the camera sends)
+[6:8]  u16 LE length        PAYLOAD length, not including the header
+[8:]   payload              (payload starts at [0x1c] when type == 3)
+```
+
+`ff ff ff 88` is exactly what we already find at offset 0 of every decrypted
+type-4 body, so this header is *inside* the RC5 ciphertext — the KCP payload
+header (`[0]=linktype, [1]=flags, [2:4]=u16 total length`) is a separate,
+outer wrapper.
+
+### 12b. The user-data command: how the app selects 1920x1080
+
+`changeDefinition(byte def)` (def is 0, 1 or 2) becomes a **command-5 user-data
+frame**, assembled by `IoTVideoPlayer.addHeader` (`IoTVideoPlayer.smali:1102`):
+
+```
+[0]    0x00        (reserved)
+[1]    0x05        command: changeDefinition
+[2]    0x00
+[3]    0x00
+[4:8]  u32 LE      seq = low 32 bits of currentTimeMillis()
+[8]    def         2 = HD, 1 = SD, 0 = auto
+```
+
+so `changeDefinition(2)` is **9 bytes** `00 05 00 00 <seq:u32LE> 02`, and the
+complete AV-link frame is
+
+```
+ff ff ff 88 00 02 09 00 | 00 05 00 00 <seq:u32LE> 02      (17 bytes)
+```
+
+which is pushed into the AV ring buffer (`giot_eif_send_user_data` →
+`iv_ringbuf_write(ctx->0x4c0, …)`).  Note this is a **post-connect** switch.
+The profile the session *starts* with is declared earlier and separately:
+`SpUtils.getDefinitionToSp(deviceId)` → `PlayerUserData.definition` →
+`IoTVideoPlayer_SetDataResource` → `IoTVideoPlayerImpl->0xc`.
+
+**Sending this frame does not change our cameras' resolution** — verified in
+six KCP framings (see `defprobe.py` and JOURNAL Phase 11).  It is documented
+here because the format is correct, not because the experiment succeeded.
+
+### 12c. AvStreamCtl's real send path and length field
+
+```
+iv_init_frm_AvStreamCtl @ 0x53274     memset(buf, 0, 0x4c);  buf[0] = 3
+                                       buf[4:8]   = ctx->0x164   (id)
+                                       buf[8:12]  = action
+                                       buf[1] |= 2 when action == 1
+                                       buf[0x10]  = ctx->0xac
+                                       buf[0x14]  = ctx->0xb0
+                                       buf[0x18..0x38] = 32 B from ctx+0x1a4
+                                       buf[62:64] = u16 ctx->0x160
+
+iv_send_av_stream_ctl_frm @ 0x541a8   action != 6 → ivkcp_send(chnnel->0x334, buf, *(u16*)(buf+2))
+                                       action == 6 → ivkcp_send(chnnel->0x330, buf, *(u16*)(buf+2))
+```
+
+Two consequences for `kcpav.avstreamctl()`:
+
+* **`[2:4]` is the total frame length and the sender reads it back** to decide
+  how much to push into KCP, so writing `0x4c` there is correct and required.
+* `chnnel->0x334` is the **hi** conv and `chnnel->0x330` the **lo** conv, which
+  independently confirms the conv split we discovered empirically.
+
+The camera's own AvStreamCtl replies are **parameterless** — four arrive per
+session and every byte except `[0]=3`, `[2:4]=0x004c` and `[8:12]=action`
+(2, 6, 2, 6) is zero.  Those fields therefore cannot be how resolution is
+negotiated, and sweeping them changes nothing (`sweepprobe.py`).
+

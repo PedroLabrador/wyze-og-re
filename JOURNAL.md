@@ -484,6 +484,165 @@ patched APK already points `GWApi.GWellP2PUrl` at this Mac).
 camera (**none required** — see Phase 9), and cam4 having no capture of its own
 (a borrowed CALLING streams it fine).
 
+## Phase 11 -- the resolution question (640x360 vs 1920x1080)
+
+Goal after Phase 10: the app streams 1920x1080 and we stream 640x360, both at
+20 fps.  Find the byte that selects the profile.
+
+### The premise, re-measured independently
+
+App 3.23.1.994 was installed on the new device (Moto G52, Android 13, arm64)
+and its account logged in.  The app's own logcat no longer prints
+`iv_recv_avheader` (the 2026 SDK build, `IoTVideo 1.5.20ad`, cut verbosity),
+so the resolution was confirmed a second way -- **throughput**, via
+`adb shell dumpsys netstats` on uid 10312 while the app held a live view:
+
+    app   2 788 481 B / 15 s = 181.5 KB/s = **1487 kbps**
+    ours  ~49 KB/s           =  ~400 kbps   (Phase 9/10)
+
+3.7x the bitrate.  The app really is getting the HD encoder; we really are
+getting the sub-stream.  (Also new: `gidp_WYZE_CAMERA_CONNECTION_INFO` telemetry
+reports `video_definition=2`, `active_connect_count=3`, `transport_protocol=UDP`,
+`connect_mode=2`, `device_firmware_version=CAM-1`.)
+
+### changeDefinition, fully reversed (2.50.7 smali -> libiotvideo)
+
+The app's HD request is *not* in the handshake.  It is a runtime API:
+
+    GmLiveManager.changeDefinition(int d, ...)          # Kotlin `when`: 0/1/2 pass through
+      -> MonitorPlayer.changeDefinition(B d, ...)
+      -> IoTVideoPlayer.changeDefinition(B d, ...)
+           if (!connected)  waitSendDefinition = d; return;
+           sendInnerUserData((byte)5, new byte[]{d}, listener)   # <-- CMD 5
+           if (!force) reviseNativeDefinition(currentDefinition)
+
+    IoTVideoPlayer$28.subscribe()  (the Single that does the work)
+        seq  = ByteUtils.lowBit32(System.currentTimeMillis())
+        data = addHeader((byte)0, (byte)5, seq, new byte[]{d})
+
+    addHeader(BBBJ[B) @ IoTVideoPlayer.smali:1102       <-- WIRE FORMAT
+        buf = new byte[8 + len(data)]
+        buf[0]=arg0(0)  buf[1]=cmd(5)  buf[2]=third&0xff(0)  buf[3]=0
+        buf[4:8] = seq as u32 LITTLE-ENDIAN
+        buf[8:] = data                                   # [0x02] for HD
+    => changeDefinition(2) is exactly 9 bytes:
+       00 05 00 00 <seq:u32LE> 02
+
+    IoTVideoPlayerImpl::sendUserData(uint8_t*,int,bool) @ 0xfa349  (THUMB)
+        hdr = sequence ? 0x1c : 8
+        buf[0..5] = ff ff ff 88 00      buf[5] = sequence ? 0x03 : 0x02
+        *(u16*)(buf+6) = len                       # payload length
+        memcpy(buf + hdr, data, len)
+        sequence ? iv_send_data_link_chn(...) : iv_send_user_data_link_chn(...)
+          -> giot_eif_send_user_data -> iv_ringbuf_write(ctx->0x4c0, buf, len)
+
+    reviseNativeDefinition(int) @ 0xf9978 -- 84 bytes, sends NOTHING:
+        if (state != 6) this->0xc = (uint8)definition;        # just a store
+
+The requested profile is therefore declared **at session start**, by the
+persisted per-device app setting:
+
+    SpUtils.getDefinitionToSp(deviceId)
+      -> MonitorPlayer.setDataResource(did, x)   # x becomes the definition
+      -> new PlayerUserData(x)                   # PlayerUserData.definition:I
+      -> IoTVideoPlayer_SetDataResource          # definition -> IoTVideoPlayerImpl->0xc
+
+**Note `ff ff ff 88` is the AV-link sync, and the byte at offset 5 is the AV
+link type** (2 = user data, 3 = user data with sequence header, 4 = AV media).
+That is the same `ffffff88` we decrypt at the start of every type-4 body.
+
+### AvStreamCtl, fully reversed -- and exonerated
+
+    iv_init_frm_AvStreamCtl @ 0x53274:
+        memset(buf, 0, 0x4c)
+        buf[0]=3                                   # link type
+        buf[4:8]   = ctx->0x164                    # id
+        buf[8:12]  = action                        # 1 start / 2 alt / 6 stop
+        (action==1): buf[1] |= 2
+        buf[0x10:0x14] = ctx->0xac
+        buf[0x14:0x18] = ctx->0xb0
+        buf[0x18:0x38] = 32 B copied from ctx+0x1a4
+        buf[62:64] = u16 ctx->0x160
+
+    iv_send_av_stream_ctl_frm @ 0x541a8:
+        iv_init_frm_AvStreamCtl(...);  buf[0xc] = arg2
+        action != 6 -> ivkcp_send(chnnel->0x334, buf, *(u16*)(buf+2))   # hi conv
+        action == 6 -> ivkcp_send(chnnel->0x330, buf, *(u16*)(buf+2))   # lo conv
+
+Two things fall out.  (a) **`[2:4]` really is the total length**, read back by
+the send path -- `kcpav.avstreamctl()` was right to write `0x4c` there, and
+`iv_init_frm_mtp_quality`-style memsets to zero are for other frame types.
+(b) **The camera's own AvStreamCtl reply is parameterless**: we capture four
+of them per session and every byte except `03 / 4c 00 / action` is zero, with
+`action` alternating 2 and 6.  Echoing them back changes nothing.
+
+### Five experiments, all clean negatives
+
+Each ran a full session against camera 1 (`429728658691722`, 192.168.77.12),
+and each kept the stream alive (hundreds of AV frames after the attempt), so a
+null result really is a null result.  The readout every time was the camera's
+own AV header (decrypted type-4 body: `ffffff88`, type@`[5]`, fps@`[19]`,
+width u32@`[20:24]`, height u32@`[24:28]`).
+
+1. **`defprobe.py`** -- the changeDefinition(2) frame in six plausible KCP
+   framings (linktype 2 raw / wrapped / RC5-wrapped on the lo conv, linktype 4
+   RC5-wrapped, linktype 3 and linktype 2 on the hi conv).  Header unchanged;
+   +350..440 AV frames after every attempt.
+2. **`ctlprobe.py`** -- echoed the camera's own AvStreamCtl reply verbatim, with
+   `action` forced to 1, and re-sent our frame with the camera's blob and with
+   the camera's ac/b0/w160.  All four were no-ops (and the reply's params are
+   zero, so they were no-ops by construction).
+3. **`sweepprobe.py`** -- 8 restarts of the stream with `ac`/`b0`/`w160`/blob
+   set to 1920x1080, 1080x1920, definition 1/2, 4000 kbps, fps 20, and a
+   `1920,1080` blob.  Header pinned at 640x360 through all of them.
+4. **`gutesprobe.py`** -- accounted for every datagram of a live session.  The
+   camera sends us **zero GUTES frames**: only `C0 90` meter_req (inner type 1,
+   x9), KCP linktype 3 AvStreamCtl (x4) and linktype 4 AV (x1472).  So the
+   app's extra frame types are app-initiated, never camera-requested.
+5. **`replay_app.py`** -- parsed `/tmp/cap_relay.log` by direction (`T->R`) and
+   replayed all 30 of the app's captured post-CALLING frames verbatim
+   (`0xa6 x2`, `0xa7`, `0xaa x6`, `0xa0 x7`, `0xa5 x2`, `0xbc x3`, `0xd8 x3`,
+   `0xb9 x2`, `0xb7`).  The camera ignored every one (no GUTES replies) and the
+   header stayed 640x360.
+
+### Where this leaves the search
+
+Ruled out, with evidence: changeDefinition / inner-user-data CMD 5; AvStreamCtl
+as a resolution carrier; every AvStreamCtl field; echoing the camera's reply;
+wholesale replay of the app's control dialogue.  `iv_init_frm_mtp_quality`
+(0x582e4) was also decoded and is **transport** adaptation, not encoder
+selection: `buf[0]=0x7f`, `buf[1]=188`, device ids at `[4]`/`[8]`, channel
+counters at `[0x1c..0x34]` (order swapped on `ctx->0x154==1`), timing deltas at
+`[44]`/`[46]`, bit 0 of `[0x19]` set.
+
+Candidates still standing:
+
+- **The 164-byte `7f 0c a4 00 ...` frame** the app sends at 8.33 s, immediately
+  after `TOPEN` and *before* the 0xa6 exchange.  It is a `0x7f` frame (so its
+  second byte is not a type the way `0x7e` frames are), and our client has
+  never sent anything like it.  Not yet tried.
+- `iv_create_kcb` (0x5c06c) -- iotv2.log shows it firing twice right after
+  `iv_start_process_calling`.
+- Whether the camera grants HD only after completing the 0xa6/0xa7/0xaa
+  exchange *properly* (the replayed bytes embed the relay session's connection
+  id `00001200660b40155cf08858`, so a verbatim replay may simply have been
+  malformed rather than meaningless).
+
+### Tooling notes
+
+- **`llvm-objdump` is at `/opt/homebrew/Cellar/llvm@22/22.1.8/bin/llvm-objdump`**
+  and is the only Thumb-capable disassembler here (Apple's `objdump` rejects
+  both `-M force-thumb` and `--triple`).
+- **`libiotvideo.so` is Thumb; `libiotp2pav.so` is ARM.**  Use
+  `--triple=thumbv7-none-linux-androideabi` for the former and the default for
+  the latter.
+- **A Thumb symbol's `st_value` has bit 0 set as a flag; disassemble from
+  `st_value & ~1`.**  Getting this wrong by one byte yields `<unknown>` followed
+  by plausible-looking garbage -- this wasted a cycle on `sendUserData`
+  (`0xfa349` -> start at `0xfa348`).
+- `adb`'s daemon can die silently between calls (logcat exits 255); `adb devices`
+  restarts it.  Never name a shell variable `UID` -- zsh treats it as read-only.
+
 ## Rotation reminder
 
 `SECRETS.md` holds the OAuth `client_id` / `client_secret` and the checklist.
