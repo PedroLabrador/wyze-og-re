@@ -744,13 +744,19 @@ function closeFs() {
   $('#overlay').classList.remove('open');
   if (img && home) {
     home.appendChild(img);                  // move it back into the tile
-    // Re-run tile() so the img's hidden/visible state is recalculated for
-    // its home slot instead of inheriting whatever fullscreen left behind.
-    const d = LAST && LAST.find(c => c.tid === FS.tid);
-    if (d) tile(d);
   }
+  if (aud && audHome) {
+    audHome.appendChild(aud);               // move audio back too
+    aud.pause();
+    aud.removeAttribute('src');
+  }
+  // Re-run tile() so the img's hidden/visible state is recalculated for
+  // its home slot instead of inheriting whatever fullscreen left behind.
+  const d = LAST && LAST.find(c => c.tid === FS.tid);
+  if (d) tile(d);
   FS.tid = null;
   FS.home = null;
+  FS.audHome = null;
 }
 
 $('#overlay .x').addEventListener('click', closeFs);
