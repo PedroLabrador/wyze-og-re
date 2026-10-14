@@ -79,6 +79,8 @@ from listreq import rc5_decrypt_block, rc5_encrypt_block, rc5_setup
 from mtp_frame import wrap as mtp_wrap, unwrap as mtp_unwrap
 import mtp_res
 import portstat_resp
+import portstat_req
+import passthrough
 
 CALLING_PORT = 48171        # the port embedded at [54:56] of the CALLING
 SIMPLE_HELLO = 74           # the c0900209 frame
@@ -411,17 +413,59 @@ def main():
                                 "mtp_res conv=0x%08x fl=%08x" % (conv, fl),
                                 mtp_res.build(conv, myip, CALLING_PORT, id8,
                                               seq=base + n, flags=fl)))
-                # Phase E2 (KCP unblock): the 7e a3 adds the relay + arms the
-                # send_rcv_map_port watchdog, but that timer re-arms forever
-                # until obj+0x4ec is set, and the ONLY writer of that byte is
-                # PortStatResp (7f cb).  Send it for every conv variant, right
-                # after the 7e a3 that created the session it must key on.
+                # Phase E2 (port mapping / NAT punch).  Two findings redirected
+                # this from the response to the REQUEST:
+                #   - zero 7f ca / 7f cb frames exist in any capture, and the
+                #     MTP control plane cannot create KCP at all
+                #     (iv_rcv_kcp_create_msg @ 0x619f8 is a no-op), so the
+                #     camera is never waiting on us for KCP;
+                #   - the PortStatReq handler (0x51788) is the thing that
+                #     STORES OUR ADDRESS into session+0x4c..0x58 and then both
+                #     replies 7f cb and sends its own 7f ca.  Sending only the
+                #     response records nothing.
+                # So send the Req first for every conv variant, then the Resp.
                 for n, conv in enumerate(dict.fromkeys(
                         [word, word | 0x80000000, word & 0x7FFFFFFF])):
+                    seq.append(("portstatreq",
+                                "portstat_req  conv=0x%08x" % conv,
+                                portstat_req.build(conv, seq=base + n,
+                                                   id8=id8)))
                     seq.append(("portstat",
                                 "portstat_resp conv=0x%08x" % conv,
                                 portstat_resp.build(conv, seq=base + n,
                                                     id8=id8)))
+                # Phase E3 -- THE KCP TRIGGER.  giot_on_rcvpkt's type table
+                # maps type 185 (0xb9) -> gat_on_rcvpkt_PASSTHROUGH_MSG, and
+                # its cmd switch does, at inner = frame+52:
+                #     inner[0]==1 -> iv_mtp_kcp_create(
+                #                      iv_find_mtp_session(ctx->8, inner[4:8]))
+                # That is one of only TWO callers of iv_mtp_kcp_create in the
+                # whole binary, and the only INBOUND one.  The frame we have
+                # been replaying as "avstreamctl" is itself a `7e b9`, i.e. the
+                # same type but cmd 0 (init/state) -- we were one byte short of
+                # the trigger the whole time.  MTP control type 37 is a no-op,
+                # so this is the only way to make the camera build KCP.
+                #
+                # Pre-gates (0x5052c..0x50574) that silently drop the frame:
+                #   frame[24] & 1 must be 1, and
+                #   frame[4:8]^ctx->0x240 | frame[8:12]^ctx->0x244 must be 0.
+                # The second wants the camera's connection id.  Try the CALLING
+                # id8 (known-accepted), the avstreamctl id8, then zeros.
+                id8s = [id8]
+                if TRANSFER_LEN in frames:
+                    id8s.append(frames[TRANSFER_LEN][4:12])
+                id8s.append(b"\x00" * 8)
+                n = 0
+                for conv in dict.fromkeys(
+                        [word, word | 0x80000000, word & 0x7FFFFFFF]):
+                    for cand in dict.fromkeys(id8s):
+                        seq.append(("kcpcreate",
+                                    "passthru cmd=1 conv=0x%08x id8=%s"
+                                    % (conv, cand.hex()[:16]),
+                                    passthrough.build(
+                                        passthrough.CMD_KCP_CREATE, conv,
+                                        cand, seq=base + 40 + n)))
+                        n += 1
         plan.append((ip, dev, seq))
         print("  %-16s -> %s   local_ip=%s"
               % (ip, " ".join(lbl for _, lbl, _ in seq), myip), flush=True)
@@ -535,10 +579,97 @@ def main():
         # send_rcv_map_port watchdog, but that timer re-arms forever until
         # obj+0x4ec is set, and the ONLY writer of that byte is PortStatResp
         # (7f cb).  Without this the camera never starts KCP.
+        #
+        # Order matters: PortStatReq (7f ca) is the frame that stores OUR
+        # ADDRESS into session+0x4c..0x58; only then does the Resp mean
+        # anything.  The Req also provokes the camera into sending its own
+        # 7f ca, which our phase-B hello mirror will see.
+        print("[phase E2] forge 7f ca PortStatReq -> camera records our addr",
+              flush=True)
+        n_sent += send_step("portstatreq")
+        n_sent += drain(2.0)
         print("[phase E2] forge 7f cb PortStatResp -> set obj+0x4ec (KCP gate)",
               flush=True)
         n_sent += send_step("portstat")
         n_sent += drain(3.0)
+    if KCP:
+        # Phase E3 -- THE KCP TRIGGER.  giot_on_rcvpkt's type table maps
+        # type 185 (0xb9) -> gat_on_rcvpkt_PASSTHROUGH_MSG, whose cmd switch
+        # (inner = frame+52) does
+        #     inner[0]==1 -> iv_mtp_kcp_create(
+        #                       iv_find_mtp_session(ctx->8, inner[4:8]))
+        # That is one of only TWO callers of iv_mtp_kcp_create in the whole
+        # binary and the only INBOUND one.  The frame we replay as
+        # "avstreamctl" is itself a `7e b9` but cmd 0 (init/state) -- we were
+        # one byte short of the trigger the entire time.  MTP control type 37
+        # is a no-op, so this is the only way to make the camera build KCP.
+        #
+        # The handler's first pre-gate (0x50550) is
+        #     frame[4:8]^ctx->0x240 | frame[8:12]^ctx->0x244 == 0
+        # i.e. the frame must carry the CAMERA's connection id8.  That is
+        # neither the CALLING's nor the avstreamctl's id8 -- proved: the ack
+        # for cam2's `7e b9` echoes f83cd6f3427ecb78 while its CALLING id8 is
+        # 99af4777b25caaf7 and its avstreamctl id8 57d189fef94fe13d.  The ack
+        # id8 is therefore the camera's own, so harvest it from live acks and
+        # build the trigger with those id8s.
+        seen_id8 = []
+        # The camera echoes a DIFFERENT id8 in the ack to each frame type
+        # (7e a4 -> 2fb8a7.., 7e b9 -> c16cde.., 7e a3 -> 6b39db..,
+        #  7f ca -> efdd57..), because each handler reads a different ctx
+        # field and the pre-gate wants ctx->0x240:0x244 specifically.  Provoke
+        # every type so we can try every candidate rather than guessing which
+        # one is the right ctx.
+        provoke = ["calling", "xfer", "mtpres", "portstatreq", "portstat"]
+        end = time.time() + 3.0
+        step = 0
+        nxt = 0.0
+        while time.time() < end:
+            # The camera is silent until spoken to, so re-provoke it inside the
+            # harvest window; without this the window collects nothing at all.
+            if time.time() >= nxt:
+                n_sent += send_step(provoke[step % len(provoke)], quiet=True)
+                step += 1
+                nxt = time.time() + 0.35
+            r, _, _ = select.select([sock], [], [],
+                                    max(0.0, min(nxt, end) - time.time()))
+            if not r:
+                continue
+            try:
+                data, addr = sock.recvfrom(65535)
+            except OSError:
+                continue
+            show(data, addr, "")
+            if len(data) >= 12 and data[0] in (0x7E, 0x7F) and \
+                    struct.unpack_from("<H", data, 2)[0] == 32 and \
+                    data[4:12] not in seen_id8:
+                seen_id8.append(data[4:12])
+        print("[phase E3] harvested %d ack ctx-ids: %s"
+              % (len(seen_id8), " ".join(i.hex() for i in seen_id8)),
+              flush=True)
+        if seen_id8:
+            tick = int(time.time() * 1000) & 0xFFFFFFFF
+            for ip, dev, s in plan:
+                conv = None
+                for k, lbl, _f in s:
+                    if k == "kcpcreate" and "conv=0x" in lbl:
+                        conv = int(lbl.split("conv=0x")[1].split()[0], 16)
+                        break
+                if conv is None:
+                    continue
+                for n, i8 in enumerate(seen_id8):
+                    for bit in (0, 0x80000000):
+                        sock.sendto(passthrough.build(
+                            passthrough.CMD_KCP_CREATE, conv | bit, i8,
+                            seq=tick + n), (ip, dev["p2p_port"]))
+                        n_sent += 1
+                print("  %-16s sent %d ctx-id cmd=1 frames"
+                      % (ip, 2 * len(seen_id8)), flush=True)
+            n_sent += drain(3.0)
+        for rnd in range(3):
+            print("[phase E3] round %d: type-185 cmd=1 PASSTHROUGH_MSG -> "
+                  "iv_mtp_kcp_create" % rnd, flush=True)
+            n_sent += send_step("kcpcreate")
+            n_sent += drain(2.0)
     if KCP:
         tags = list(dict.fromkeys(lbl for k, lbl, _ in plan[0][2]
                                   if k == "kcp"))
