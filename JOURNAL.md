@@ -332,6 +332,130 @@ All four cameras auto-start at boot with no login, no click, and no phone.
 
 ---
 
+## Phase 10 — "Why only ~20 fps?"  *(answered: the camera; every client-side
+theory DISPROVED)*
+
+The question came up because the stream is LAN-local, so it *should* be fast.  It is fast —
+the network is not the limit.  The **camera's encoder** is.
+
+### The measurement that settles it
+
+`/tmp/bottleneck.py` instruments the raw UDP/KCP layer instead of guessing:
+
+```
+wall 13.5s
+udp packets        1152  (85.3/s)
+retransmits           0  (0.0/s)   <- nonzero means WE are too slow
+cmd83 WASK from cam    0           <- nonzero means its window is full (US)
+our ACKs sent       1152  (85.3/s)
+unique sn/cam      1152  sn gaps 0
+TLV payloads       1152  (85.3/s)
+decoded frames      266  -> 19.70 fps over the capture window
+ffmpeg: frame= 266 ... time=00:00:13.30      (266 / 13.30 = 20.0 fps of content)
+payload KB/s        49.2
+```
+
+Read it as four independent facts:
+
+1. **0 retransmits.** Every segment the camera allocated, we received.  If we
+   were the bottleneck the camera would be resending.
+2. **0 WASK (cmd 83).** The camera never once asked to enlarge its send
+   window, i.e. its window was never full.  Nothing on our side is throttling.
+3. **0 sn gaps.** No loss anywhere in the path.
+4. **ffmpeg decodes 266 frames in 13.30 s of media time = exactly 20.0 fps.**
+   The content itself is 20 fps, not 20 fps *after* we drop some.
+
+And the independent corroboration, straight from the vendor's own library
+running in the official app (`adb logcat`, 2026-10-13 20:15:05):
+
+```
+IoTVideo-IoTVideoPlayerImpl: iv_recv_avheader VideoType : 1, VideoWidth : 1920,
+  VideoHeight : 1080, videoFrameRate : 20, AudioType : 2, ...
+```
+
+The **camera tells the official app `videoFrameRate : 20`.**  The frame rate is
+a camera property, not an app property, so the app being "old" is irrelevant —
+the app is only relaying a number the camera chose.
+
+Four cameras, measured independently, all identical:
+
+```
+camera             variant     res      fps      KB/s
+691722             zeros    640,360     20.0      44.0
+783497             zeros    640,360     20.0      44.3
+223864             zeros    640,360     20.0      40.8
+```
+
+**Being local buys zero loss and low latency; it cannot make the sensor or the
+H.264 encoder run faster.**
+
+### [X] DISPROVED — the AvStreamCtl we send is throttling the camera
+
+Our `build_avstreamctl()` zeroes every field.  `iv_mtp_chnnel_eval_quality`
+(0x5aa40) was then found to *compute* exactly those fields:
+
+```
+obj->0xac  = int_div(0xc4 - 0xd4, dt)   -> AvStreamCtl[0x10:0x14]
+obj->0xb0  = int_div(0xc8 - 0xd8, dt)   -> AvStreamCtl[0x14:0x18]
+obj->0xb4  = (f32)(0xbc - 0xcc) / dt    -> AvStreamCtl[24:56]   x4 floats
+obj->0x160                             -> AvStreamCtl[62:64]
+```
+
+i.e. **the frame is a throughput report**, and we had been telling the camera
+"this link does 0 bytes/s".  Perfect hypothesis for "camera falls back to its
+cheapest profile".  Tested against a live camera (`/tmp/qtest.py`,
+`/tmp/fieldprobe.py`), one field at a time, each run its own control:
+
+| case | result |
+|---|---|
+| `base` (all zeros) | 640x360 @ **20.0** |
+| `blob` = 4x 1e6 floats | 640x360 @ 20.0 — **no change** |
+| `b0` = 50000 | 640x360 @ 20.0 — **no change** |
+| `ac` = 1 | 640x360 @ 20.0 — **no change** |
+| `w160` = 15 / 25 / 30 / 60 | 640x360 @ 20.0 — **no change** |
+| `id164` = 1 | 640x360 @ 20.0 — **no change** |
+| `ac` = 100 / 1k / 8k / 30k / 50k / 1e6 | **stream dies entirely** |
+| `act1` then `act2` reply (alt=1080) | 640x360 @ 20.0 — **no change** |
+| push only on the `lo` conv | **no video** — only `hi` (bit31 set) works |
+| `act2` alone (no prior start) | **no video** — needs prior state |
+
+**No field we control changes resolution or frame rate.**  The throughput
+report is accepted only at tiny magnitudes and merely *breaks* the stream
+beyond them; it never raises the ceiling.
+
+### [X] DISPROVED — the app's `7e b9` PASSTHROUGH_MSG is the profile selector
+
+`wire/p2p_frames.json[..]['avstreamctl']` is a 76-byte `7e b9` (type 185) cmd 0
+frame we had never sent.  Decrypted, all three copies are identical in shape:
+
+```
+[52]      cmd     = 0
+[56:60]   conv    = 0xef34cbd9 / 0x7ff1a426 / 0xf7e202cb   (per camera)
+[64:68]   state   = 0x4e22
+[0x1c:]   d_log   = 0x840186d6 001260a3
+```
+
+Per `passthrough.py`, cmd 0 does `iv_start_process_reset(chan)` — it is a
+**channel reset**, not a quality request.  Sent before the AvStreamCtl it
+yields **0 TLV payloads / no video**; sent never, we stream.  So it is not the
+HD switch, and sending it would be actively harmful.
+
+### The one real gap that remains: resolution, not fps
+
+The app's header says **1920x1080**; our JPEG SOF marker says **640x360**.
+Both at 20 fps.  So the *only* thing that differs between our session and the
+official app's is the **profile**, and we have not found the selector.  Worth
+solving — it is a ~9x pixel-count win for the picture — but it will **not**
+raise the frame rate, because the app's 1080p stream is also 20 fps.
+
+Candidates still untested for that: `iv_send_MtpQuality` (0x588f0) /
+`iv_init_frm_mtp_quality` (0x582e4, GUTES type **188 `0xbc`**, 64 B header +
+8 B per channel), `iv_create_kcb`/`PortStat`, and capturing the app's real
+AvStreamCtl bytes by forcing its P2P through a relay we impersonate (the
+patched APK already points `GWApi.GWellP2PUrl` at this Mac).
+
+---
+
 ## Open questions still unanswered
 
 - **CALLING checksum formula** — `iv_gute_frm_init_chkval` is byte-exact for
@@ -343,8 +467,14 @@ All four cameras auto-start at boot with no login, no click, and no phone.
   by using identical clones).
 - POST `Signature2` rule (needs runtime-injected `cg01_f3c397620f853b12`).
 - RC5 mode 3 (unread, @0x2b500); `iv_gute_frm_decrypt_id`'s use of `ctx->0xd0`.
-- `AVSTREAMCTL` field values (`obj->0x164`/`0xac`/`0xb0`/`0x160`/`0x1ec`) —
-  parameterised in `kcpav.py`, currently zeroed, and it works anyway.
+- `AVSTREAMCTL` field values — **now measured, see Phase 10**: `obj->0xac` /
+  `0xb0` / `0xb4` come from `iv_mtp_chnnel_eval_quality` (0x5aa40) and the
+  frame is a *throughput report*.  Zeroed or plausible, they never change the
+  profile; large values kill the stream.  Still unknown is what selects
+  1920x1080 for the app vs our 640x360.
+- **What selects the stream profile (1080p vs 360p)?**  The only observed
+  difference between our session and the official app's.  Not AvStreamCtl,
+  not the `7e b9` frame, not the CALLING (we replay the app's own bytes).
 - `init_frm_mtp_res_request`'s `[82:122]` tail; `gat_rcv_init_info_msg_resp`
   @ 0x46960; `certify_req` finalizer for type `0x0c`.
 - The zlib layer the logcat mentions (MTU 1032 fragment reassembly).
