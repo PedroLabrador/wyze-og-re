@@ -81,6 +81,7 @@ import mtp_res
 import portstat_resp
 import portstat_req
 import passthrough
+import kcpav
 
 CALLING_PORT = 48171        # the port embedded at [54:56] of the CALLING
 SIMPLE_HELLO = 74           # the c0900209 frame
@@ -94,6 +95,7 @@ _args = [a for a in sys.argv[1:] if not a.startswith("--")]
 REWRITE = "--rewrite" in sys.argv
 KCP = "--kcp" in sys.argv
 MTPRES = "--mtpres" in sys.argv
+AV = "--av" in sys.argv
 DUR = float(_args[0]) if _args else 30.0
 
 
@@ -180,6 +182,34 @@ def rewrite_ip(frame, new_ip_bytes):
             break
         out[off:off + 8] = rc5_encrypt_block(st, bytes(pt[off:off + 8]), "little")
     return bytes(out)
+
+
+def make_meter_ack(hello):
+    """Answer the camera's MTP-control meter REQUEST with a meter ACK.
+
+    The camera sends `C0 90` whose inner frame has [1] = 1.  That is
+    `iv_on_rcv_mtpCtrl_pkt` (0x57e58) indexing the MTP-control jump table at
+    0x57f18 by `inner[1] - 1`; entry 1 -> trampoline 0x57fac ->
+    `iv_rcv_meter_req` (0x603c4).  We had been mirroring that frame VERBATIM,
+    which makes the camera re-run iv_rcv_meter_req and emit yet another
+    request -- the echo loop that produced 19 hellos in a single run.
+
+    Entry 2 -> trampoline 0x57fbc -> `iv_rcv_meter_ack` (0x61338).  So the
+    answer is the same frame with inner[1] flipped to 2.  The MTP header is
+    rebuilt by mtp_wrap with flag=1, i.e. `C0 90` (bit7 = MTP-control class),
+    matching what iv_rcv_meter_req itself builds at 0x60824..0x6089c:
+        buf[1] |= 0x10 (bit4) | 0x80 (bit7); buf[1] &= ~0x60 (clear bits 5-6)
+        buf[0]  = 0xC0; 11-bit length split across buf[2]/buf[3]
+    """
+    r = mtp_unwrap(hello)
+    if not r:
+        return None
+    pl, tot, flag, ok = r
+    if len(pl) < 8:
+        return None
+    inner = bytearray(pl)
+    inner[1] = 2                      # iv_rcv_meter_req -> iv_rcv_meter_ack
+    return mtp_wrap(bytes(inner), 1)  # flag=1 -> C0 90, MTP control
 
 
 # ---------------------------------------------------------------- type 0x25
@@ -354,6 +384,9 @@ def main():
         seq = []
         if SIMPLE_HELLO in frames:
             seq.append(("hello", "hello74", frames[SIMPLE_HELLO]))
+            ack = make_meter_ack(frames[SIMPLE_HELLO])
+            if ack:
+                seq.append(("meterack", "meter_ack(inner type 2)", ack))
         if CALLING_LEN in frames:
             raw = frames[CALLING_LEN]
             if REWRITE:
@@ -526,6 +559,23 @@ def main():
             except OSError:
                 continue
             got += 1
+            # React to the camera's MTP-control meter REQUEST (inner type 1)
+            # with a meter ACK (type 2).  See make_meter_ack: echoing the
+            # request back just makes the camera re-run iv_rcv_meter_req
+            # (0x603c4) and ask again -- the loop behind our 19 hellos/run.
+            if data[:2] == b"\xc0\x90":
+                rr = mtp_unwrap(data)
+                if rr and len(rr[0]) >= 8 and rr[0][1] == 1:
+                    ackf = make_meter_ack(data)
+                    if ackf:
+                        try:
+                            sock.sendto(ackf, addr)
+                            print("  [%6.2fs] meter_req -> meter_ack(type 2) "
+                                  "-> %s:%d"
+                                  % (time.time() - t0, addr[0], addr[1]),
+                                  flush=True)
+                        except OSError:
+                            pass
             sig = (addr[0], data)
             rep = " (dup)" if sig in seen else ""
             seen.add(sig)
@@ -564,6 +614,59 @@ def main():
     n_sent += drain(2.0)
     n_sent += send_step("calling")
     n_sent += drain(2.0)
+
+    # The camera answers our CALLING with `C0 90` meter REQUESTS (inner
+    # type 1).  Answer them with a meter ACK (type 2) instead of mirroring
+    # the request back -- see make_meter_ack.  Must come after the CALLING
+    # because iv_on_rcv_mtpCtrl_pkt (0x57e58) does
+    # iv_find_mtp_session(ctx->8, inner[4:8]) and returns if no session.
+    print("[phase A2] answer the camera's meter_req with a meter_ack",
+          flush=True)
+    n_sent += send_step("meterack")
+    n_sent += drain(2.0)
+
+    # ---- Phase F: the REAL AvStreamCtl, inside KCP -------------------------
+    #
+    # P2P_PROTOCOL.md 5i.  iv_send_av_stream_ctl_frm (0x541a8) calls
+    # ivkcp_send TWICE and never iv_mtp_chnnel_send_mtp_frm, so the frame that
+    # actually starts the stream is a plain 76-byte payload inside a KCP PUSH
+    # -- NOT the `7e b9` GUTES frame we used to replay (that is
+    # PASSTHROUGH_MSG, type 185, a different message class that merely shares
+    # the 76-byte size).
+    #
+    # iv_on_rcv_kcpdata_pkt (0x630c0) indexes the session by the conv in
+    # kcp[0:4] and picks session->0x334 (bit31 set) or ->0x330 (clear), so we
+    # send both bit forms; iv_find_mtp_session (0x5d96c) accepts either, but
+    # only one KCP object exists per form.
+    #
+    # This is the ONE thing that can elicit C0 10: the camera has nothing to
+    # send until we request the stream, which is why six runs of WASK yielded
+    # zero KCP packets.
+    if AV:
+        print("\n[phase F] AvStreamCtl INSIDE KCP (the ivkcp_send path)",
+              flush=True)
+        for ip, dev, seq in plan:
+            frames = tpl.get(dev["tid"])
+            if not frames or CALLING_LEN not in frames:
+                continue
+            word = struct.unpack_from("<I", decrypt(frames[CALLING_LEN]), 28)[0]
+            for conv, tag in ((word & 0x7FFFFFFF, "lo"),
+                              (word | 0x80000000, "hi")):
+                kc = kcpav.KCP(conv)
+                kc.push(kcpav.avstreamctl(kcpav.ACT_START))
+                for s in kc.take_packets():
+                    wire = mtp_wrap(s, 0)      # flag=0 -> C0 10 -> KCP bucket
+                    try:
+                        sock.sendto(wire, (ip, dev["p2p_port"]))
+                        n_sent += 1
+                        print("  [%6.2fs] avstreamctl PUSH conv=%s "
+                              ":%d -> %s:%d (%d B)"
+                              % (time.time() - t0, tag, sock.getsockname()[1],
+                                 ip, dev["p2p_port"], len(wire)), flush=True)
+                    except OSError as e:
+                        print("  [!] av send to %s: %r" % (ip, e), flush=True)
+                time.sleep(0.15)
+        n_sent += drain(6.0)
 
     # The camera only has a session to look up once it has processed our
     # CALLING, so the forged MTP_RES has to go strictly after phase A.  If the
