@@ -153,6 +153,84 @@ def rc5_decrypt_stream(key, data):
     return bytes(out)
 
 
+def rc5_encrypt_stream(key, data):
+    """The inverse of rc5_decrypt_stream: RC5-ECB over 8-byte blocks.
+
+    The trailing partial block is NOT encrypted, which is what the app does on
+    the wire -- a 226-byte talk frame is 224 encrypted bytes plus 2 plaintext
+    ones, and the camera accepts frames built the same way.
+    """
+    st = rc5_setup(key)
+    out = bytearray()
+    n = len(data) - (len(data) % 8)
+    for i in range(0, n, 8):
+        out += rc5_encrypt_block(st, bytes(data[i:i + 8]), "little")
+    out += data[n:]
+    return bytes(out)
+
+
+# ---- the client -> camera audio (talk) -----------------------------------
+#
+# Reversed from a PCAPdroid capture of the app holding the talk button.  The
+# app pushes linktype-4 media on the LOW conv (the AvStreamCtl goes on the high
+# one), and the body is RC5 with the same AV key as the incoming media.
+#
+#   0   ff ff ff 88       AV sync
+#   4   00 00 03 00
+#   8   00 x12
+#   20  u32 counter       increments 60 per frame in the app
+#   24  00 00 00 00
+#   28  40 00 40 00 40 00
+#   34  6 x (0x3c + 31 B) six AMR-NB frames
+#
+# Each sub-frame is RFC 4867 octet-aligned AMR-NB: the ToC octet 0x3c is
+# FT=7, i.e. the 12.2 kbit/s mode, whose 244-bit frames are stored in 31
+# bytes.  Six 20 ms frames is 120 ms, which matches the observed send
+# interval and byte rate.  Verified by decoding the capture to speech and by
+# re-encoding silence with ffmpeg (same ToC, same frame size).
+TALK_AMR_FRAME = 32                   # 1 byte ToC + 31 bytes payload
+TALK_AMR_TOC = 0x3C                   # AMR-NB FT 7 (12.2 kbit/s)
+TALK_FRAMES_PER_PKT = 6               # 6 x 20 ms = 120 ms
+TALK_PKT_BYTES = 34 + TALK_AMR_FRAME * TALK_FRAMES_PER_PKT     # 226
+TALK_COUNTER_STEP = 60                # what the app advances it by
+
+# The two frames the app sends the moment the talk button goes down, before any
+# audio.  The first is 28 B -- 16 kHz (0x3e80) and 320 samples (0x0140) at
+# [12:18], i.e. the audio stream's parameters.  The second is 37 B and carries
+# the byte 0x32 at [29].  Both are replayed verbatim because only their effect
+# is known; they are not user data and carry no session material.
+TALK_OPEN_FRAMES = (
+    bytes.fromhex("000102030405060708090a0b0c0d0e0f10111213141516"
+                  "0040010000"),
+    bytes.fromhex("000102030405060708090a0b0c0d0e0f10111213141516"
+                  "409a504001"),
+)
+
+
+def build_talk_frame(amr_frames, counter=0):
+    """One 226-byte client->camera audio frame from six 31-byte AMR payloads.
+
+    `amr_frames` are payloads WITHOUT the ToC octet, exactly as an AMR-NB
+    encoder emits them; the ToC is added here.
+    """
+    if len(amr_frames) != TALK_FRAMES_PER_PKT:
+        raise ValueError("need %d AMR frames, got %d"
+                         % (TALK_FRAMES_PER_PKT, len(amr_frames)))
+    buf = bytearray(TALK_PKT_BYTES)
+    buf[0:4] = b"\xff\xff\xff\x88"
+    buf[6] = 3
+    struct.pack_into("<I", buf, 20, counter & 0xFFFFFFFF)
+    buf[28:34] = b"\x40\x00\x40\x00\x40\x00"
+    for i, f in enumerate(amr_frames):
+        off = 34 + i * TALK_AMR_FRAME
+        if len(f) != TALK_AMR_FRAME - 1:
+            raise ValueError("AMR frame %d is %d bytes, want %d"
+                             % (i, len(f), TALK_AMR_FRAME - 1))
+        buf[off] = TALK_AMR_TOC
+        buf[off + 1:off + TALK_AMR_FRAME] = f
+    return bytes(buf)
+
+
 def split_nal_units(buf):
     """Yield raw H.264 NAL units (start code stripped) from Annex-B `buf`."""
     starts = []
@@ -213,6 +291,7 @@ class CameraStream(object):
         self._audio_ts = None             # last audio frame timestamp (us)
         self._meter_logged = False
         self._started = False
+        self._talk_counter = 0
 
     # -- the handshake -----------------------------------------------------
     def _send(self, data):
@@ -463,6 +542,42 @@ class CameraStream(object):
                 deadline = time.time() + self.timeout
                 yield out
 
+    # -- client -> camera audio (talk) -------------------------------------
+    def _talk_push(self, body):
+        """Wrap `body` as a linktype-4 media TLV and PUSH it on the lo conv.
+
+        The app pushes its own media on the LOW conv, which is the AV link;
+        the AvStreamCtl is the only thing that goes on the high one.  TLV
+        flag byte 2 means "from the client" (the camera uses 1).
+        """
+        frame = bytearray(4 + len(body))
+        frame[0] = 4
+        frame[1] = 2
+        struct.pack_into("<H", frame, 2, len(frame))
+        frame[4:] = body
+        self.kcp_lo.push(bytes(frame))
+        for pkt in self.kcp_lo.take_packets():
+            self._send(mtp_wrap(pkt, 0))
+
+    def open_talk(self):
+        """Send the two frames the app sends before its first audio frame."""
+        self.start()
+        for blob in (TALK_OPEN_FRAMES):
+            self._talk_push(rc5_encrypt_stream(self.key, blob))
+            self._pump(0.15, [(self.kcp_lo.conv, self.kcp_lo),
+                              (self.kcp_hi.conv, self.kcp_hi)])
+        self._talk_counter = 0
+        self.log("talk: audio stream opened")
+        return True
+
+    def send_talk(self, amr_frames):
+        """Send one 120 ms packet of six AMR frames (31 B each, no ToC)."""
+        pt = build_talk_frame(amr_frames, self._talk_counter)
+        self._talk_counter = (self._talk_counter
+                              + TALK_COUNTER_STEP) & 0xFFFFFFFF
+        self._talk_push(rc5_encrypt_stream(self.key, pt))
+        return len(pt)
+
     def close(self):
         try:
             self.sock.close()
@@ -514,6 +629,25 @@ def selftest():
     assert build_avstreamctl_hd(definition=kcpav.DEF_SD)[24:28] == b"\x00" * 4
     assert set(v2[28:]) == {0}, "v2 tail must be zero"
     print("[ok] v2 AvStreamCtl: 108 B, definition word at [24:28]")
+
+    # the talk frame: layout, and RC5 round-trip through the wire form
+    subs = [bytes([i] * 31) for i in range(TALK_FRAMES_PER_PKT)]
+    tf = build_talk_frame(subs, counter=0x11223344)
+    assert len(tf) == TALK_PKT_BYTES == 226, len(tf)
+    assert tf[:4] == b"\xff\xff\xff\x88" and tf[4:8] == b"\x00\x00\x03\x00"
+    assert tf[8:20] == b"\x00" * 12 and tf[24:28] == b"\x00" * 4
+    assert tf[28:34] == b"\x40\x00" * 3
+    assert struct.unpack_from("<I", tf, 20)[0] == 0x11223344
+    for i in range(TALK_FRAMES_PER_PKT):
+        off = 34 + i * TALK_AMR_FRAME
+        assert tf[off] == TALK_AMR_TOC == 0x3C, "AMR ToC (FT7 = 12.2k)"
+        assert tf[off + 1:off + 32] == subs[i]
+    k2 = b"\x5a" * 8
+    assert rc5_decrypt_stream(k2, rc5_encrypt_stream(k2, tf)) == tf
+    wire = rc5_encrypt_stream(k2, tf)
+    assert len(wire) == 226 and wire[224:226] == tf[224:226], "tail is plaintext"
+    assert wire[:8] != tf[:8], "body really is encrypted"
+    print("[ok] talk frame: 226 B, six AMR-NB FT7 sub-frames, RC5 + 2 B tail")
     print("ALL OK")
     return True
 

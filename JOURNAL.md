@@ -1613,3 +1613,101 @@ python3 ctlsweep.py <tid> 9 45 ours
 
 Delete the plaintext token files (`/tmp/wyze_token.json`, `/tmp/wyze_live.txt`,
 `/tmp/wyze_log.txt`) and revoke the token when finished.
+
+
+## Phase 20 — Two-way audio: the camera hears us
+
+The talk button was the last thing the app did that we could not do.  It turned
+out to be the *only* place the client sends real media, and it is now proven on
+hardware: a voice spoken into the app on the phone, then streamed through our server, came out of Camera 1's
+speaker (`192.168.77.12:64146`).
+
+### The capture that had the answer
+
+Everything came from one PCAPdroid capture (`/tmp/ctrltalk.pcap`, 24 MB) taken
+while the app was showing live view, then holding the talk button, then tapping
+the light and IR toggles.  Sorting it by direction and linktype was the whole
+job:
+
+| direction | linktype | count | what it is |
+|---|---|---|---|
+| app -> camera | 3 | many | AvStreamCtl (the resolution command, Phase 19) |
+| app -> camera | 4 | **130** | the talk audio, and only while the button is held |
+| app -> camera | 4 | 0 | (*not* present in a session where talk was not used) |
+
+The linktype-4 frames belong to one conv (`0x00f82bbf`) and appear **only**
+while the button is held -- zero of them in `wyze3.pcap`, 130 in this session.
+That is what identified them; nothing in the app's UI exposed a "talk stream".
+
+### Reading it
+
+The 226-byte body is RC5 with the session AV key, the trailing two bytes left
+in the clear.  Decrypted, it is six AMR-NB sub-frames behind a 34-byte header
+(`P2P_PROTOCOL.md` §13b has the byte map).  Two independent checks said AMR-NB
+12.2 kbit/s: the sub-frames are `0x3c` + 31 bytes, which is RFC 4867's ToC for
+FT=7, and re-encoding digital silence with ffmpeg's `libopencore_amrnb -b:a
+12.2k` produces the same ToC and near-identical payloads.  Concatenating the
+sub-frames as `#!AMR\n` + frames and handing them to ffmpeg decodes to 15.2 s
+of clean speech (about 3 s of silence, then bursts).
+
+### The slow-motion surprise, and the measurement that explained it
+
+First hardware test: the camera **did** speak, but in slow motion.  That single
+symptom could have been the capture, the framing or the camera, so it was
+measured rather than guessed:
+
+* **Pacing was not the cause.**  Re-computing the packet arrival times from the
+  pcap gave 129 media datagrams spanning 15.2 s, i.e. the app sent 120 ms of
+  audio every ~120 ms -- realtime.  (The p90 gap of 240 ms and one 13 s gap are
+  the session pausing between two presses.)
+* **The capture was not pitched down.**  An autocorrelation estimator said
+  50 Hz, which would have meant a 16 kHz mic fed to an 8 kHz encoder -- but
+  160 samples is exactly one AMR frame, so that was a frame-boundary artefact.
+  A cepstrum over 45 ms windows gives 86-145 Hz for the loud voiced segments:
+  an ordinary male voice, i.e. the audio itself is fine.
+* **The camera renders declared AMR time at half rate.**  Sending the *same*
+  clip 2x faster (`asetrate=16000,aresample=8000`, halving the duration and
+  doubling the pitch) read back as normal speed.  That is the whole answer:
+  feed it 2x-rate content.
+
+Whether the camera plays the 8 kHz samples at ~4 kHz or inserts a gap after
+each 20 ms frame is not known (the ear cannot tell), and it does not matter:
+both give the same rule, and it is the app's own behaviour that over-feeds the
+camera 2x.  `P2P_PROTOCOL.md` §13d records this as open.
+
+### Negative results, so nobody repeats them
+
+* Talk media is **not** needed on the high conv; only the AvStreamCtl uses it.
+* The counter field's value does not gate anything -- starting at 0 works.
+* **AMR-WB rejects** the captured frames and AMR-NB decodes them cleanly.
+* **Light / IR / detection are not on the LAN at all.**  The same capture was
+  searched for them: while the toggles were tapped, the app sent **only** UDP
+  to the cameras' `:55013` with linktype 3 and 4 -- no TCP, no local HTTP.  The
+  rest of the traffic is TLS to the cloud relay and carries no readable
+  payload.  So there is no local P2P path to find for the controls, and that
+  goal is parked as cloud-only until the cloud channel is read.
+
+### Tooling
+
+`talkplay.py` is the proof tool and stays useful:
+
+```
+python3 talkplay.py <tid> [--amr FILE] [--secs N] [--loop]
+                    [--gain D] [--speed D] [--quiet]
+```
+
+Its default source is the app's own captured talk audio from
+`/tmp/applan_a2c.bin`, so a run that makes the camera speak proves the framing,
+cipher, conv and codec all at once.  `--speed 2.0` is the slow-motion fixup and
+`--gain` is a re-encode volume knob; both need ffmpeg
+(`/opt/homebrew/bin/ffmpeg`, which has the `libopencore_amrnb` encoder).
+
+The analysis scripts that got there (`apptalk2.py` -- per-session conv
+grouping; `talkblocks.py` -- sub-block layout; `talkmap.py`, `talkrt.py` --
+timing and byte rate; `talkamr.py` -- the AMR round-trip) are kept next to it.
+
+### Product work
+
+The camera holds **one** session, and the server's worker already owns it, so
+talk cannot open its own `CameraStream`.  It has to be pushed through the same
+socket the worker is pumping -- see Phase 21.

@@ -50,32 +50,40 @@ def dump(tag, b, base=0):
               % (base + off, " ".join("%02x" % x for x in c), ascii_of(c)))
 
 
-frs = load("/tmp/applan_a2c.bin")
-calling = next(f for f in frs if f[:2] == b"\x7e\xa4")
-print("app CALLING: %d B, first16 %s" % (len(calling), calling[:16].hex()))
+def main():
+    frs = load("/tmp/applan_a2c.bin")
+    calling = next(f for f in frs if f[:2] in (b"\x7e\xa4", b"\x7f\xa4"))
+    print("app CALLING: %d B, first16 %s"
+          % (len(calling), calling[:16].hex()))
 
-d = mode1(calling)
-dump("app CALLING decrypted", d)
+    d = mode1(calling)
+    dump("app CALLING decrypted", d)
 
-print("\n-- scans in the decrypted frame --")
-for pat, name in ((b"\xc0\xa8\x00\xf0", "192.168.77.14 (app IP)"),
-                  (b"\xc0\xa8\x00\xec", "192.168.77.13 (Mac IP)"),
-                  (b"\xbb\xa3", "port 48035 (app port)")):
-    i = d.find(pat)
-    print("  %-28s at %s" % (name, i), d[i:i + 20].hex() if i >= 0 else "")
+    print("\n-- scans in the decrypted frame --")
+    for pat, name in ((b"\xc0\xa8\x00\xf0", "192.168.77.14 (app IP)"),
+                      (b"\xc0\xa8\x00\xec", "192.168.77.13 (Mac IP)"),
+                      (b"\xbb\xa3", "port 48035 (app port)")):
+        i = d.find(pat)
+        print("  %-28s at %s" % (name, i), d[i:i + 20].hex() if i >= 0 else "")
 
-# compare against our 128-byte CALLING for this camera
-try:
-    j = json.load(open("~/Downloads/wyze-re/wire/p2p_frames.json"))
-except Exception as e:
-    print("p2p_frames.json:", e)
-    j = None
-if j:
-    ent = j.get("192.168.77.10") or j.get("429728659223864")
-    if isinstance(ent, dict) and "calling" in ent:
-        ours = bytes.fromhex(ent["calling"])
-        print("\nours: %d B, first16 %s" % (len(ours), ours[:16].hex()))
-        dump("our CALLING decrypted", mode1(ours))
-    else:
-        print("\n(no entry for this camera in p2p_frames.json; keys: %s)"
-              % list(j)[:6])
+    # compare against our 128-byte CALLING for this camera
+    try:
+        j = json.load(open("~/Downloads/wyze-re/wire/p2p_frames.json"))
+    except Exception as e:
+        print("p2p_frames.json:", e)
+        j = None
+    if j:
+        ent = (j.get("devices", {}).get("429728659223864")
+               or j.get("429728659223864") or j.get("192.168.77.10"))
+        if isinstance(ent, dict) and "frames" in ent:
+            ent = ent["frames"]
+        if isinstance(ent, dict) and "calling" in ent:
+            ours = bytes.fromhex(ent["calling"])
+            print("\nours: %d B, first16 %s" % (len(ours), ours[:16].hex()))
+            dump("our CALLING decrypted", mode1(ours))
+        else:
+            print("\n(no entry for this camera in p2p_frames.json)")
+
+
+if __name__ == "__main__":
+    main()

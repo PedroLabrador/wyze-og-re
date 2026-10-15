@@ -1933,3 +1933,100 @@ two byte-identical frames were once observed to give different answers.  Never
 conclude anything from a single zero-media run; only `1920x1080` and `640x360`
 are trustworthy single-shot signals.
 
+
+## 13. Client -> camera audio (two-way talk)  [SOLVED, with one open question]
+
+This is the only direction in which the *client* sends media.  Everything else
+we send (AvStreamCtl, CALLING, KCP control) is signalling; this is user data
+that the camera renders on its speaker.
+
+### 13a. Where it goes
+
+| property | value |
+|---|---|
+| TLV linktype | **4** (media), byte[1] = **2** ("from client") |
+| conv | the **LOW** conv (the same one that carries camera->app media) |
+| cipher | RC5-ECB, same AV key as the incoming media (`CALLING[120:128]`) |
+| KCP | normal PUSH, cmd 0x81, inside the usual MTP wrapper |
+| plaintext length | 226 bytes (TLV total length field = 230 = 226 + 4) |
+
+A 226-byte plaintext is 28 full 8-byte RC5 blocks plus **2 trailing bytes that
+are NOT encrypted**.  The app does the same, and the camera accepts frames
+built that way, so the tail is deliberately left in the clear.
+
+### 13b. The 226-byte frame
+
+```
+off  bytes                     meaning
+ 0   ff ff ff 88               AV sync word (same as the camera's media)
+ 4   00 00 03 00               media type 3 (audio type 1 = u-law downlink)
+ 8   00 x12                    zero
+20   u32 counter                monotonic; the app advances it by 60 per packet
+24   00 00 00 00
+28   40 00 40 00 40 00         3 x u16 64
+34   6 x (0x3c + 31 B)         six AMR-NB frames, RFC 4867 octet-aligned
+```
+
+Each sub-frame is an AMR-NB frame in **octet-aligned** (not bandwidth-efficient)
+form: `0x3c` is the ToC octet, `P=0`, `FT=7` = the 12.2 kbit/s mode, `Q=0`.
+244-bit frames are stored in **31 bytes**, so the sub-frame is 32 bytes and six
+of them are 120 ms of audio.
+
+The counter's unit is unknown (it is not needed to make audio play); 60 per
+120 ms is what the app sent, and replaying 60-per-packet works.
+
+### 13c. The two opening frames
+
+The app sends two short frames the moment the button goes down, before any
+audio, replayed verbatim by `TALK_OPEN_FRAMES`:
+
+* 28 B: `ff ff ff 88 02 01 00 00 05 07 00 01 80 3e 00 00 40 01 00 0f f0 00 00
+  00 40 01 00 00` -- `0x3e80` = **16000** at [12:14] and `0x0140` = **320** at
+  [16:18].
+* 37 B: `ff ff ff 88 00 03 09 00 ... 0x32 at [29] ... 40 9a 50 40 01`.
+
+Only their *effect* is known; they are not needed to open the audio path (the
+camera plays audio if the 226-byte frames arrive), but they are cheap and are
+sent to stay close to the app.
+
+### 13d. Pacing and the playback-rate anomaly  [OPEN]
+
+Replaying the captured audio **byte-for-byte at the app's own interval
+(~120 ms per packet)** makes the camera play it back as *slow motion* -- the
+speech is recognisable but stretched and pitched down.
+
+Measured with the capture itself: the app sent 129 packets over 15.2 s, i.e.
+1.0x realtime in "declared" AMR time (6 x 20 ms per packet).  The audio the
+capture decodes to is **normal-pitched** speech (cepstral F0 of the loud voiced
+segments lands at 86-145 Hz, i.e. an ordinary male voice; the autocorrelation
+estimator's 50 Hz was an artefact of the 160-sample AMR frame period).
+
+The decisive experiment: **the identical clip sped up 2x**
+(`asetrate=16000,aresample=8000` before re-encoding, which halves the duration
+and doubles the pitch) read as **normal speed**.  So the camera renders
+declared AMR time at **half rate**, and to sound right the client must feed
+content that is 2x faster than natural.
+
+Two mechanisms fit the observation equally well and are not distinguished yet:
+
+1. the camera plays the decoded 8 kHz samples at ~4 kHz; or
+2. the camera inserts a gap after each 20 ms frame, so each declared second
+   occupies two real seconds.
+
+Neither is distinguishable from the ear alone, and both give the same rule.
+The app appears to be broken in the same way (it sends 120 ms of audio every
+120 ms, i.e. 2x faster than the camera consumes), which is consistent.
+
+**The rule we implement**: feed the AMR-NB encoder 16 kHz audio *declared* as
+8 kHz, so that one 20 ms declared frame encodes 10 ms of real audio, and let
+the packet rate follow the data (a 6-frame packet every ~240 ms of real time).
+This is exactly the "2x" the test asked for.
+
+### 13e. What does NOT work / is not needed
+
+* **AMR-WB does not decode**: the bytes are AMR-NB; ffmpeg's amrwb decoder
+  rejects them and the AMR-NB decoder accepts them cleanly.
+* The **counter** value is irrelevant to opening or playing audio (starting at
+  0 vs the app's ~15 000 000 made no difference to audibility).
+* **No signalling is required on the high conv**; the AvStreamCtl side is
+  independent of the audio path.
