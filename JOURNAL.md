@@ -1316,6 +1316,7 @@ now wired once, guarded by `dataset.wired`.
   instant a pump fails while the tile keeps showing a perfectly good picture.
   The badge is now driven by how stale the frames actually are (`stats.last`),
   so it reads `live` until the picture genuinely stops.
+  *(Superseded by Phase 18 — it was still conflating two different failures.)*
 * The tile footer shows `fps · frames · lag ms · -dropped`, so a viewer can
   see whether a sluggish picture is our queueing or the browser's decoding.
 
@@ -1402,6 +1403,64 @@ collapsing to 12 kB per 15 s.  Fixed; a `feedtest.js` now guards exactly this.
   resync instead of throwing.  This is the only real guard on the framing,
   because there is no browser on this machine.
 * `lagtest.py` (slow/fast), `verifyfix.py`, `camclock.py`, `fflag.py` unchanged.
+
+## Phase 18 — "it says connecting/streaming while the camera is streaming"
+
+The Phase 16 badge was still wrong, and the symptom that exposed it was precise:
+a camera that is clearly streaming sometimes shows `connecting` or `streaming`
+in the badge, and other cameras do not.
+
+### Why the word appeared
+
+The badge was falling back to the **worker's own status string** whenever the
+picture went stale.  But the worker is a poor narrator, because of one number:
+
+    # CameraStreamThread.run(), the stall check
+    if time.time() - last_h264 > 8.0:
+        raise RuntimeError("stream stalled")
+
+It only gives up on a silent camera after **8 seconds**, and until then it keeps
+reporting `streaming`.  The badge, meanwhile, declared the picture stale after
+**4 seconds**.  So for every stall there was a 4-second window in which:
+
+* the picture on screen was frozen, and
+* the badge printed `streaming` — the worker's *opinion*, which was still wrong.
+
+At 8 s the worker finally tore down and re-handshook, so the badge then printed
+`reconnecting`, then `connecting`, then `streaming` again the moment the
+handshake finished — while the frozen frame was still the last thing painted.
+That reproduces the symptom exactly, start to finish.
+
+"Other cameras don't show it" is the useful half: a camera on a healthy Wi-Fi
+path never stalls, so its badge never leaves `live`.  The badge was not
+random — it was naming the one camera whose link was dropping.
+
+### The fix: the badge describes the picture, not the worker
+
+Two failures were being conflated and are now separate words:
+
+| Badge | Meaning |
+|---|---|
+| `live` | painted a frame within 2.5 s — the picture is genuinely moving |
+| `stalled` | nothing painted for >2.5 s while the worker still claims `streaming` |
+| `no video` | the worker has a stream but this browser has never painted a frame (broken `/feed`) |
+| `connecting` / `reconnecting` / `discovering` | the worker really has lost the camera |
+| `offline` / `error` | powered off, or a hard error |
+
+The worker's words now appear **only** when the worker really has lost the
+camera; a frozen picture says `stalled` instead.  2.5 s is far above the ~50 ms
+frame interval and above ffmpeg's output bursts, so a healthy camera never
+trips it.  The badge also gained a tooltip giving the two facts side by side —
+`picture: frozen for 6.2 s` / `server: streaming` / `frames decoded: 4211` —
+which is what lets a stalling camera be told apart from a broken feed.
+
+The placeholder no longer says `streaming…` either; it is only visible when
+nothing is being painted, so it says `waiting for video…`.
+
+Not changed, deliberately: the worker's 8 s stall timeout.  Lowering it would
+recover ~3 s sooner but risks tearing down a healthy stream during a gap, and
+each teardown costs an 8–10 s re-handshake.  Revisit only with evidence that
+recovery time is the problem.
 
 `SECRETS.md` holds the OAuth `client_id` / `client_secret` and the checklist.
 

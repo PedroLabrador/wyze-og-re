@@ -973,24 +973,52 @@ function tile(c) {
   }
   el.querySelector('.name').textContent = c.name || ('Camera ' + c.tid);
   el.querySelector('.ip').textContent = c.ip || '\\u2014';
-  // The worker flips to "connecting"/"reconnecting" the instant a pump fails,
-  // but the tile keeps showing its last good picture the whole time it
-  // reconnects -- so the badge cried wolf over a perfectly live video.  Drive
-  // it from how stale the frames actually are instead: `last` is the wall
-  // clock time of the most recent decoded JPEG, so it only goes quiet when the
-  // picture really does.
+  // The badge must describe the PICTURE, not repeat the worker's opinion.
+  //
+  // Two different failures were being conflated:
+  //
+  //   * the worker has lost the camera -- it says connecting / reconnecting /
+  //     offline, and there genuinely is no stream;
+  //   * the picture stopped updating while the worker still believes it is
+  //     fine.  CameraStreamThread only gives up on a silent camera after 8 s
+  //     (the stall check in run()), so for that entire window it reports
+  //     "streaming" over a frozen frame -- and printing the raw status there
+  //     is exactly the "it says connecting/streaming while the camera is
+  //     streaming" report.  The badge was naming the worker's opinion while
+  //     the viewer was looking at the picture.
+  //
+  // So the worker's words now appear only when the worker really has lost the
+  // camera, and a picture that stopped updating says so in its own word.
+  // 2.5 s is far above the ~50 ms frame interval and above ffmpeg's bursts,
+  // so a healthy camera never trips it.
   const st = c.stats || {};
-  const serverFresh = !!st.last && (Date.now() / 1000 - st.last) < 4;
-  const painted = (AGO[c.tid] != null) ? Date.now() - AGO[c.tid] : Infinity;
-  // Once this browser has painted a frame for this camera, "fresh" should mean
-  // what it is actually showing; before the first paint, fall back to the
-  // server's own decode clock so the badge does not flash "connecting" on every
-  // page load.
-  const fresh = (LAT[c.tid] != null) ? (painted < 4000) : serverFresh;
-  el.querySelector('.dot').className =
-    'dot ' + (fresh ? 'streaming' : (c.status || ''));
-  el.querySelector('.badge').textContent =
-    fresh ? 'live' : (c.status || '');
+  const age = (AGO[c.tid] != null) ? Date.now() - AGO[c.tid] : null;
+  const live = age != null && age < 2500;
+  let state, cls;
+  if (c.status === 'offline') {
+    state = 'offline'; cls = 'offline';
+  } else if (c.status === 'error') {
+    state = 'error'; cls = 'error';
+  } else if (live) {
+    state = 'live'; cls = 'streaming';
+  } else if (age == null) {
+    // The worker has a stream but this browser has never painted a frame:
+    // either the handshake is still finishing, or /feed is not delivering.
+    state = c.status === 'streaming' ? 'no video' : (c.status || 'starting');
+    cls = c.status || 'starting';
+  } else {
+    state = 'stalled'; cls = 'connecting';
+  }
+  el.querySelector('.dot').className = 'dot ' + cls;
+  const badge = el.querySelector('.badge');
+  badge.textContent = state;
+  badge.title =
+    'picture: ' + (age == null ? 'no frame painted yet in this browser'
+      : live ? 'updating, ' + age + ' ms behind'
+             : 'frozen for ' + (age / 1000).toFixed(1) + ' s')
+    + '\\nserver: ' + (c.status || 'unknown')
+    + '\\nframes decoded on the server: ' + (st.jpg || 0)
+    + (st.fps ? ' (' + st.fps.toFixed(1) + ' fps)' : '');
 
   // Look the <canvas> up by id, NOT with el.querySelector('canvas'): while a
   // camera is fullscreen its canvas lives inside the overlay, so it is no
@@ -1008,15 +1036,19 @@ function tile(c) {
   // LAT -- otherwise the placeholder would vanish over a blank canvas at load.
   const cv = document.getElementById('view' + c.tid),
         ph = el.querySelector('.ph');
-  if (cv && LAT[c.tid] != null && c.status !== 'offline') {
+  if (cv && age != null && c.status !== 'offline') {
     cv.classList.remove('hidden');
     ph.classList.add('hidden');
   } else {
     if (cv) cv.classList.add('hidden');
     ph.classList.remove('hidden');
+    // "streaming" here would read as a contradiction -- the placeholder is
+    // only visible when nothing is being painted, so name that instead.
     ph.textContent = c.error ? c.error
       : (c.status === 'offline' ? 'camera offline (powered off?)'
-        : (c.status || 'starting') + '\\u2026');
+        : (c.status === 'streaming' || age != null)
+          ? 'waiting for video\\u2026'
+          : (c.status || 'starting') + '\\u2026');
   }
 
   const s = c.stats || {};
@@ -1055,8 +1087,7 @@ function tile(c) {
   if (FS.tid === c.tid) {
     $('.oname').textContent = c.name || ('Camera ' + c.tid);
     $('.ostat').textContent =
-      (fresh ? 'live' : (c.status || ''))
-      + (delay != null ? ' \\u00b7 ' + delay + ' ms' : '');
+      state + (delay != null ? ' \\u00b7 ' + delay + ' ms' : '');
   }
 }
 

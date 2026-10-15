@@ -86,6 +86,10 @@ def main():
               % ("fetch('/feed" in html))
         print("   snapshot taken from the canvas: %s"
               % ("cv.toBlob" in html))
+        # The badge must describe the picture, not echo the worker's status
+        # word over a frozen frame (see JOURNAL Phase 18).
+        print("   badge distinguishes a frozen picture: %s"
+              % ("'stalled'" in html and "'no video'" in html))
 
         # -- page JavaScript ------------------------------------------------
         # No browser is available here, so these are the two cheap guards: the
