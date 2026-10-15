@@ -1244,6 +1244,83 @@ microphone really is off in the camera's settings.
 
 
 
+## Phase 16 — where the delay actually was, and the UI bugs that came with it
+
+The driving concern: delay -- the stream is LAN-local, so why does it take
+this long -- plus a batch of UI bugs (JPG button slow, "connecting"
+shown mid-playback, requests stacking in pending, fullscreen has no audio
+control and no way to see whether audio is on, and a request for icons instead
+of the text labels).
+
+### Localizing the delay by measurement
+
+Rather than guess, each stage was timed (`camclock.py`, `fflag.py`).  Every
+audio AV frame carries the **camera's own capture clock** (u32 µs at offset 20,
+advancing exactly 0x4e20 = 20000 per frame), so comparing it against wall-clock
+receive time separates transport delay from everything else:
+
+| stage | measured | verdict |
+|---|---|---|
+| camera → our socket | min 68.8 / **p50 82.4** / p90 88.6 / max 118.2 ms | fine |
+| drift of `wall_recv − cam_ts` | **+0.013 ms per wall-second** over 25 s, spread 49.5 ms | flat — nothing accumulates |
+| ffmpeg decode | residual **−0.04 s** at EOF | holds no backlog |
+| server publish → socket write | `served == pub` (5564/5564), `t_write` 1.13 s over 28 min | keeps up exactly |
+
+The absolute transit needed the camera's clock epoch, which is unknown (its
+value is *uptime*, not wall time).  Anchoring it on the moment we sent
+AvStreamCtl fixes it, and transit **includes** the camera's own encoder
+buffering — the one part invisible from anywhere else.
+
+`fflag.py` feeds a captured stream into the *shipped* ffmpeg command at the real
+arrival rate and counts frames still buffered at EOF.  **`-fflags nobuffer` is
+actively worse** (218 → 158 JPEGs), so it was measured rather than assumed and
+not adopted.
+
+**Conclusion: the transport and the decoder were never the problem.**  The only
+remaining place the delay could be added was the browser.
+
+### The one real server-side bug: a viewer could never catch up
+
+`take()` returns everything newer than the cursor, so a browser reading even
+marginally slower than we write accumulates a backlog, replays it, and then
+stays that far behind **for the rest of the session** — a permanent, invisible
+delay.  `lagtest.py` reproduces it by reading ~33 kB/s against a ~50 kB/s
+camera.
+
+Frames now carry their publish time, and `_stream` drops to the newest frame
+once the oldest pending one is older than `MAX_LAG` (0.5 s — well above
+ffmpeg's natural 7-frame output burst, so healthy viewers are untouched).
+Verified both ways: a slow reader stays at **21 ms lag** with 119 stale frames
+skipped rather than replayed; a fast reader gets **0 drops**, lag 1–35 ms.
+
+### A listener-accumulation bug in the page
+
+`tile()` runs on every `/api/state` poll (2 s), and the sound button's click
+handler was registered *outside* the create-once `if (!el)` block — so a fresh
+handler was appended every 2 s.  Ten minutes in, one click on SND ran 300
+handlers against 300 separate `audioOn` closures that all read `false`.  That
+is very likely the "I cannot tell whether sound is on" symptom.  Handlers are
+now wired once, guarded by `dataset.wired`.
+
+### UI
+
+* **Icons, not emoji and not text** — inline SVG (`ICON` map, `currentColor`
+  throughout so the existing hover/active colours apply unchanged).  The
+  speaker pair is a real state change (struck-through cone vs. sound waves),
+  not a colour you have to squint at.
+* **Fullscreen gained a sound button** and the overlay bar shows the live
+  status plus the measured `lag`.  Tile and fullscreen drive the *same*
+  `<audio>` element through `setAudio()`/`syncAudioUi()`, so they cannot
+  disagree.  Closing fullscreen no longer silently mutes the camera.
+* **The false "connecting" badge** — the worker flips to `connecting` the
+  instant a pump fails while the tile keeps showing a perfectly good picture.
+  The badge is now driven by how stale the frames actually are (`stats.last`),
+  so it reads `live` until the picture genuinely stops.
+* The tile footer shows `fps · frames · lag ms · -dropped`, so a viewer can
+  see whether a sluggish picture is our queueing or the browser's decoding.
+
 `SECRETS.md` holds the OAuth `client_id` / `client_secret` and the checklist.
+
+
 Delete the plaintext token files (`/tmp/wyze_token.json`, `/tmp/wyze_live.txt`,
 `/tmp/wyze_log.txt`) and revoke the token when finished.

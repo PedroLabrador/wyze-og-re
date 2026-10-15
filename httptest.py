@@ -60,8 +60,14 @@ def main():
                     "&#9974;", "&#8635;", "&#10005;"):
             if ent in html:
                 print("   !! emoji entity still present: %s" % ent)
-        print("   emoji entities checked; SND/FS/JPG labels present: %s"
-              % all(x in html for x in ("SND", "FS", "JPG")))
+        # The emoji entities and then the SND/FS/JPG text labels are both gone:
+        # buttons are inline SVG now (see ICON in the page).
+        print("   emoji entities checked; inline SVG icons: %s"
+              % ("<svg" in html and "const ICON" in html))
+        gone = not any(x in html for x in ("&gt;FS&lt;", ">FS<", ">SND<",
+                                           ">JPG<", ">Close<", ">Fullscreen<"))
+        print("   old text labels gone: %s" % gone)
+        print("   fullscreen audio control present: %s" % ('id="fssound"' in html))
         print("   gain selector present: %s" % ('id="gain"' in html))
         print("   'textContent =' entity bug present: %s"
               % ("textContent = '&#" in html))
@@ -84,6 +90,11 @@ def main():
                                                     hdr.get("Content-Type")))
         print("   multipart: %s  jpeg SOI: %s  jpeg EOI: %s"
               % (b"--frame" in body, b"\xff\xd8" in body, b"\xff\xd9" in body))
+        # X-Time is the publish instant, so a client on this host can subtract
+        # it from Date.now() to read the frame's true end-to-end age.
+        ts = body.find(b"X-Time: ")
+        print("   X-Time stamp: %s" % (body[ts:ts + 24].decode(
+            "ascii", "replace").strip() if ts >= 0 else "MISSING"))
 
         # -- audio ---------------------------------------------------------
         st, hdr, body = get("/audio/%s.wav?gain=32" % tid, n=131072, timeout=25)

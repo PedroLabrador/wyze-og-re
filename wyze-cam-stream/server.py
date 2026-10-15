@@ -82,6 +82,13 @@ DISCOVER_ATTEMPTS = 3
 DISCOVER_DURATION = 3.0
 JPEG_SOI = b"\xff\xd8"
 JPEG_EOI = b"\xff\xd9"
+# How stale a frame may be before a viewer stops replaying it and jumps to the
+# newest one instead.  At ~20 fps this is ~10 frames.  It has to sit well above
+# ffmpeg's natural output burst (we have seen 7 JPEGs arrive at once, because
+# the producer spends its time decrypting and the pipe fills in between), or it
+# would drop frames from healthy viewers.  Chosen so a viewer can never be more
+# than half a second behind the camera.
+MAX_LAG = 0.5
 
 # The camera sends G.711 mu-law, one byte per sample.  Every audio AV frame
 # carries exactly 320 samples and its u32 timestamp advances 20000 us
@@ -197,7 +204,7 @@ class CameraStreamThread(threading.Thread):
                 pass
 
     def take(self, since_seq=0):
-        """Return `(frames, cursor)` for every frame newer than `since_seq`.
+        """Return `([(jpeg, t_pub), ...], cursor)` for frames past `since_seq`.
 
         Nothing is consumed: several browsers (or a browser plus a test
         client) can watch the same camera at once.  A draining take() would
@@ -205,10 +212,18 @@ class CameraStreamThread(threading.Thread):
         them.  Each caller keeps its own cursor; frames age out of the bounded
         deque once 120 have accumulated, so a viewer that falls that far behind
         skips ahead rather than growing without limit.
+
+        The publish time rides along with each frame so a slow viewer can be
+        BOUNDED rather than merely evicted: Handler._stream drops to the newest
+        frame once the backlog is older than MAX_LAG.  Without that a browser
+        reading marginally slower than we write accumulates a backlog, replays
+        it, and then stays that far behind reality for the rest of the session
+        -- which is exactly what "the cameras are delayed" looks like.
         """
         with self._cond:
-            got = [(s, j) for s, j in self.frames if s > since_seq]
-            return [j for _, j in got], (got[-1][0] if got else since_seq)
+            got = [(s, j, t) for s, j, t in self.frames if s > since_seq]
+            return ([(j, t) for _, j, t in got],
+                    (got[-1][0] if got else since_seq))
 
     def take_audio(self, since_seq=0):
         """Return `(chunks, cursor)` for every audio chunk newer than `since_seq`."""
@@ -229,7 +244,7 @@ class CameraStreamThread(threading.Thread):
     def _publish(self, jpeg):
         with self._cond:
             self.seq += 1
-            self.frames.append((self.seq, jpeg))
+            self.frames.append((self.seq, jpeg, time.time()))
             self.frame = jpeg            # newest, for anything that wants it
             self._cond.notify_all()
 
@@ -562,6 +577,9 @@ PAGE = """<!doctype html>
  .gainl select { background:#21262d; color:#e6edf3; border:1px solid #30363d;
                  border-radius:6px; padding:5px 6px; font-size:12px;
                  font-variant-numeric:tabular-nums; cursor:pointer; }
+ /* header icon buttons (icon only -- hover the glyph for its name) */
+ .ibtn { display:inline-flex; align-items:center; padding:7px 9px; }
+ .ibtn svg { display:block; }
  #grid { display:grid; gap:14px; padding:18px;
          grid-template-columns:repeat(auto-fit,minmax(360px,1fr)); }
  .tile { background:#161b22; border:1px solid #30363d; border-radius:10px;
@@ -592,9 +610,14 @@ PAGE = """<!doctype html>
  /* fullscreen: a tile's <img> is MOVED into this overlay, not duplicated, so
     it keeps the MJPEG connection it already has (a second <img> would open a
     second socket and double the bandwidth for the same camera). */
+ /* Icon buttons.  Icons, not the emoji entities that
+    were removed earlier and the SND/FS/JPG text that replaced them.  All
+    inline SVG using currentColor, so the existing hover/active colours keep
+    working with no per-icon CSS. */
  .fsbtn { background:none; border:0; color:#8b949e; cursor:pointer;
-          font-size:11px; font-weight:600; letter-spacing:.03em;
-          line-height:1; padding:4px 6px; border-radius:4px; }
+          line-height:1; padding:5px 6px; border-radius:4px;
+          display:inline-flex; align-items:center; }
+ .fsbtn svg { display:block; }
  .fsbtn:hover { background:#30363d; color:#e6edf3; }
  #overlay { position:fixed; inset:0; background:#000; z-index:100;
             display:none; }
@@ -611,12 +634,18 @@ PAGE = """<!doctype html>
  .obar .x { background:rgba(255,255,255,.14); border:0; color:#fff;
             padding:7px 13px; border-radius:6px; cursor:pointer; }
  .obar .x:hover { background:rgba(255,255,255,.28); }
+ /* the bar sits over video, so its speaker needs more contrast than the tiles */
+ .obar .sndbtn { color:#c9d1d9; }
+ .obar .sndbtn:hover { background:rgba(255,255,255,.16); color:#fff; }
+ .obar .sndbtn.on { color:#3fb950; background:rgba(63,185,80,.18); }
   .sndbtn { background:none; border:0; color:#8b949e; cursor:pointer;
-            font-size:11px; font-weight:600; letter-spacing:.03em;
-            line-height:1; padding:4px 6px; border-radius:4px;
-            font-variant-numeric:tabular-nums; }
+            line-height:1; padding:5px 6px; border-radius:4px;
+            display:inline-flex; align-items:center; }
+  .sndbtn svg { display:block; }
   .sndbtn:hover { background:#30363d; color:#e6edf3; }
-  .sndbtn.on { color:#3fb950; }
+  /* "on" is deliberately more than a colour change: the icon swaps to the
+     un-muted speaker AND the button lights up, because otherwise there was no way to see whether audio was on short of hearing it. */
+  .sndbtn.on { color:#3fb950; background:rgba(63,185,80,.14); }
 </style>
 
 <header>
@@ -635,8 +664,8 @@ PAGE = """<!doctype html>
       <option value="32">32x</option>
       <option value="64">64x</option>
     </select></label>
-  <button id="fsall" title="Browser fullscreen">Fullscreen</button>
-  <button id="refresh">Re-discover</button>
+  <button id="fsall" class="ibtn" title="Fullscreen a camera (Esc exits)"><svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2H2v4M10 2h4v4M10 14h4v-4M6 14H2v-4"/></svg></button>
+  <button id="refresh" class="ibtn" title="Re-scan the LAN for cameras"><svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13.4 8a5.4 5.4 0 1 1-1.6-3.8"/><path d="M13.4 2.2V5.4h-3.2"/></svg></button>
 </header>
 <div id="banner" class="hidden"></div>
 <div id="grid"></div>
@@ -647,12 +676,67 @@ PAGE = """<!doctype html>
     <strong class="oname"></strong>
     <span class="ostat"></span>
     <div class="spacer"></div>
-    <button class="x">Close</button>
+    <button id="fssound" class="sndbtn" title="Sound off (click to enable)" aria-label="Toggle sound"></button>
+    <button class="x" title="Close fullscreen"><svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M4.2 4.2l7.6 7.6M11.8 4.2l-7.6 7.6"/></svg></button>
   </div>
 </div>
 
 <script>
 const $ = s => document.querySelector(s);
+// Inline SVG icons.  Deliberately not emoji (which render differently per
+// platform and were removed once already) and not text labels.  Every path
+// uses currentColor so the CSS hover/active colours apply unchanged, and the
+// speaker pair is a real on/off state rather than a colour you have to squint
+// at: ICON.mute has the cone struck through, ICON.snd has sound waves.
+const ICON = {
+  fs: '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2H2v4M10 2h4v4M10 14h4v-4M6 14H2v-4"/></svg>',
+  cam: '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M2 5.2h2.1l1-1.7h5.8l1 1.7H14V13H2z"/><circle cx="8" cy="9.1" r="2.4"/></svg>',
+  snd: '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h2.4L8.8 3.2v9.6L5.4 10H3z"/><path d="M11.2 5.7a3.3 3.3 0 0 1 0 4.6M13.2 3.7a6.1 6.1 0 0 1 0 8.6"/></svg>',
+  mute: '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h2.4L8.8 3.2v9.6L5.4 10H3z"/><path d="M11.1 6.2l3.7 3.6M14.8 6.2l-3.7 3.6"/></svg>'
+};
+
+// -- audio -----------------------------------------------------------------
+// The on/off state lives on the <audio> element (data-on), and BOTH the tile
+// button and the fullscreen bar are driven from it.  The gap this design
+// exists for: fullscreen had no audio control and no way to see whether sound was
+// on except by hearing it.
+function sndVisual(btn, on) {
+  if (!btn) return;
+  btn.classList.toggle('on', on);
+  btn.innerHTML = on ? ICON.snd : ICON.mute;
+  btn.title = on ? 'Sound on (click to mute)' : 'Sound off (click to enable)';
+}
+
+function syncAudioUi(tid) {
+  const aud = document.getElementById('aud' + tid);
+  const on = !!aud && aud.dataset.on === '1';
+  sndVisual(document.querySelector('#c' + tid + ' .sndbtn'), on);
+  if (FS.tid === tid) sndVisual($('#fssound'), on);
+}
+
+function setAudio(tid, on) {
+  const aud = document.getElementById('aud' + tid);
+  if (!aud) return;
+  aud.dataset.on = on ? '1' : '';
+  if (!on) {
+    aud.pause();
+    aud.removeAttribute('src');
+    try { aud.load(); } catch (_) {}          // abort the HTTP stream
+  } else {
+    // Reached straight from a click, which is the user gesture browsers
+    // demand -- nothing may be awaited before play().
+    aud.src = '/audio/' + tid + '.wav?r=' + Date.now() + '&gain=' + GAIN;
+    const p = aud.play();
+    if (p && p.catch) p.catch(err => {        // autoplay / decode blocked
+      aud.dataset.on = '';
+      syncAudioUi(tid);
+      const btn = document.querySelector('#c' + tid + ' .sndbtn');
+      if (btn) btn.title =
+        'Sound blocked by the browser: ' + (err && err.name || err);
+    });
+  }
+  syncAudioUi(tid);
+}
 let LAST = [];            // latest /api/state snapshot, for fullscreen helpers
 let GAIN = 1;             // audio boost, see #gain; read at every SND click
 const gainEl = document.getElementById('gain');
@@ -687,11 +771,11 @@ function tile(c) {
       '<div class="head"><div class="dot"></div><div class="name"></div>' +
       '<div class="ip"></div><div class="badge"></div>' +
       '<button class="fsbtn" title="Fullscreen (or double-click the video)"' +
-      '>FS</button>' +
+      ' aria-label="Fullscreen">' + ICON.fs + '</button>' +
       '<button class="sndbtn" title="Sound off (click to enable)"' +
-      ' aria-label="Toggle sound">SND</button>' +
+      ' aria-label="Toggle sound">' + ICON.mute + '</button>' +
       '<button class="fsbtn" title="Save a still JPEG (snapshot)"' +
-      '>JPG</button></div>' +
+      ' aria-label="Save a snapshot">' + ICON.cam + '</button></div>' +
       '<div class="shot"><div class="ph">connecting&hellip;</div>' +
       '<img id="img' + c.tid + '" class="hidden" alt=""></div>' +
       '<audio id="aud' + c.tid + '" class="hidden" preload="none" crossorigin="anonymous"></audio>' +
@@ -718,43 +802,46 @@ function tile(c) {
   }
   // Sound button.  The <audio> streams /audio/<tid>.wav (16 kHz PCM16), so
   // the browser does the mixing and the tile's MJPEG socket is untouched.
+  // The real work lives in setAudio()/syncAudioUi() so the fullscreen bar can
+  // drive the same state.
+  //
+  // The listeners are wired exactly once per tile.  tile() is called from
+  // every /api/state poll, and this block used to sit outside the
+  // create-once `if (!el)` above -- so a fresh click handler was appended
+  // every 2 s.  Ten minutes in, one click on SND ran 300 handlers against 300
+  // separate `audioOn` closures that all read false, which is exactly the
+  // "I cannot tell whether sound is on" symptom.
   const sndb = el.querySelector('.head .sndbtn'),
         aud = document.getElementById('aud' + c.tid);
   if (sndb && aud) {
-    let audioOn = false;
-    const setOn = on => {
-      audioOn = on;
-      sndb.classList.toggle('on', on);
-      sndb.textContent = on ? 'SND ON' : 'SND';
-      sndb.title = on ? 'Sound on (click to mute)'
-                      : 'Sound off (click to enable)';
-    };
-    sndb.addEventListener('click', e => {
-      e.stopPropagation();
-      if (audioOn) {
-        aud.pause();
-        aud.removeAttribute('src');
-        try { aud.load(); } catch (_) {}   // abort the HTTP stream
-        setOn(false);
-        return;
-      }
-      // This click IS the user gesture, so play() must be called straight
-      // from here (awaiting a fetch first would lose it).
-      aud.src = '/audio/' + c.tid + '.wav?r=' + Date.now() + '&gain=' + GAIN;
-      const p = aud.play();
-      setOn(true);                         // optimistic; reverted if blocked
-      if (p && p.catch) p.catch(err => {
-        setOn(false);
-        sndb.title = 'Sound blocked by the browser: ' + (err && err.name || err);
+    sndVisual(sndb, aud.dataset.on === '1');
+    if (!sndb.dataset.wired) {
+      sndb.dataset.wired = '1';
+      sndb.addEventListener('click', e => {
+        e.stopPropagation();
+        setAudio(c.tid, aud.dataset.on !== '1');
       });
-    });
-    // The stream can die server-side (camera offline, worker restarted).
-    aud.addEventListener('error', () => { if (audioOn) setOn(false); });
+      // The stream can die server-side (camera offline, worker restarted).
+      aud.addEventListener('error', () => {
+        aud.dataset.on = '';
+        syncAudioUi(c.tid);
+      });
+    }
   }
   el.querySelector('.name').textContent = c.name || ('Camera ' + c.tid);
   el.querySelector('.ip').textContent = c.ip || '\\u2014';
-  el.querySelector('.dot').className = 'dot ' + (c.status || '');
-  el.querySelector('.badge').textContent = c.status || '';
+  // The worker flips to "connecting"/"reconnecting" the instant a pump fails,
+  // but the tile keeps showing its last good picture the whole time it
+  // reconnects -- so the badge cried wolf over a perfectly live video.  Drive
+  // it from how stale the frames actually are instead: `last` is the wall
+  // clock time of the most recent decoded JPEG, so it only goes quiet when the
+  // picture really does.
+  const st = c.stats || {};
+  const fresh = !!st.last && (Date.now() / 1000 - st.last) < 4;
+  el.querySelector('.dot').className =
+    'dot ' + (fresh ? 'streaming' : (c.status || ''));
+  el.querySelector('.badge').textContent =
+    fresh ? 'live' : (c.status || '');
 
   // Look the <img> up by id, NOT with el.querySelector('img'): while a camera
   // is fullscreen its <img> lives inside the overlay, so it is no longer a
@@ -798,18 +885,32 @@ function tile(c) {
   // started streaming -- it deliberately survives page reloads (the worker
   // keeps running so you do not pay an 8-10s discovery+handshake on refresh).
   // Label it as a worker total so it does not look like a viewer counter.
+  //
+  // lag_ms/dropped come from the stream handler and are the two numbers that
+  // matter when the picture feels behind: lag is how stale the oldest frame
+  // was when this connection last wrote it, and dropped counts frames we
+  // skipped rather than replay (replaying would leave the view permanently
+  // that far behind reality).  Low lag with dropped climbing means the
+  // browser cannot keep up; high lag would have meant our queue did it.
+  const lag = (s.lag_ms != null) ? Math.round(s.lag_ms) : null;
   el.querySelector('.f1').textContent =
-    s.jpg ? ((s.fps || 0).toFixed(1) + ' fps \\u00b7 ' + s.jpg + ' total')
+    s.jpg ? ((s.fps || 0).toFixed(1) + ' fps \\u00b7 ' + s.jpg + ' total'
+             + (lag != null ? ' \\u00b7 ' + lag + ' ms' : '')
+             + (s.dropped ? ' \\u00b7 -' + s.dropped : ''))
           : (c.status === 'streaming' ? 'starting\\u2026' : '');
   el.querySelector('.f1').title =
-    'frames decoded since this camera\\'s stream started on the server';
+    'frames decoded since this camera\\'s stream started on the server'
+    + '\\nlag: age of the oldest frame when it was written (lower is better)'
+    + '\\ndropped: stale frames skipped so the view stays live';
   el.querySelector('.f2').textContent = c.error || '';
   if (c.log && c.log.length) el.querySelector('.foot').title = c.log.join('\\n');
 
   // Keep the overlay bar in sync if this camera is the one fullscreened.
   if (FS.tid === c.tid) {
     $('.oname').textContent = c.name || ('Camera ' + c.tid);
-    $('.ostat').textContent = c.status || '';
+    $('.ostat').textContent =
+      (fresh ? 'live' : (c.status || ''))
+      + (lag != null ? ' \\u00b7 ' + lag + ' ms' : '');
   }
 }
 
@@ -837,6 +938,7 @@ function openFs(tid) {
   img.classList.remove('hidden');
   tileEl.querySelector('.ph').classList.remove('hidden');
   $('#overlay').classList.add('open');
+  syncAudioUi(tid);                         // show the bar's speaker state
 }
 
 function closeFs() {
@@ -850,9 +952,12 @@ function closeFs() {
     home.appendChild(img);                  // move it back into the tile
   }
   if (aud && audHome) {
-    audHome.appendChild(aud);               // move audio back too
-    aud.pause();
-    aud.removeAttribute('src');
+    audHome.appendChild(aud);               // move audio back into the tile
+    // Deliberately NOT paused.  Sound keeps playing when you leave fullscreen,
+    // and the tile's speaker icon stays truthful because it is driven from the
+    // same element.  It used to be killed here, so closing a fullscreen view
+    // silently muted that camera.
+    syncAudioUi(FS.tid);
   }
   // Re-run tile() so the img's hidden/visible state is recalculated for
   // its home slot instead of inheriting whatever fullscreen left behind.
@@ -864,6 +969,15 @@ function closeFs() {
 }
 
 $('#overlay .x').addEventListener('click', closeFs);
+// Sound toggle in the fullscreen bar.  Same underlying <audio> element and the
+// same data-on state as the tile's button, so the two never disagree.
+$('#fssound').addEventListener('click', e => {
+  e.stopPropagation();
+  if (FS.tid == null) return;
+  const aud = document.getElementById('aud' + FS.tid);
+  if (!aud) return;
+  setAudio(FS.tid, aud.dataset.on !== '1');
+});
 // Click the black surround (but not the picture, not the bar) to dismiss.
 $('#ovslot').addEventListener('click', e => { if (e.target.id === 'ovslot') closeFs(); });
 $('#overlay').addEventListener('dblclick', closeFs);
@@ -1048,6 +1162,7 @@ class Handler(BaseHTTPRequestHandler):
         #     burst: 19 frames served out of 132 published.  take() drains the
         #     whole burst instead.
         served, dead = 0, 0
+        dropped = 0
         # Start at the current head: a new viewer should get LIVE frames, not
         # a burst of up-to-120 stale ones buffered for earlier viewers.
         cursor = w.seq
@@ -1056,7 +1171,8 @@ class Handler(BaseHTTPRequestHandler):
         # popping a producer-owned key (jpg/h264/fps) races with the worker's
         # `self.stats["h264"] += n` and raises KeyError, which tears down the
         # stream.  Baselines let us report per-connection totals instead.
-        for k in ("served", "loops", "t_write", "first_frame_at"):
+        for k in ("served", "loops", "t_write", "first_frame_at",
+                  "lag_ms", "dropped"):
             w.stats.pop(k, None)
         w.stats["t0"] = time.time()
         w.stats["nconn"] = w.stats.get("nconn", 0) + 1
@@ -1067,6 +1183,20 @@ class Handler(BaseHTTPRequestHandler):
                 frames, cursor = w.take(cursor)
                 w.stats["pub"] = w.stats.get("jpg", 0) - base_jpg
                 if frames:
+                    # Bound the viewer's lag.  take() returns everything newer
+                    # than the cursor, so a browser reading slightly slower
+                    # than we write accumulates a backlog, replays it, and then
+                    # stays that far behind reality for the rest of the session
+                    # -- a permanent, invisible delay.  The publish timestamps
+                    # make it measurable: when the OLDEST pending frame is
+                    # older than MAX_LAG we are queueing, not streaming, so
+                    # jump to the newest frame and count the loss.
+                    lag = time.time() - frames[0][1]
+                    if lag > MAX_LAG and len(frames) > 1:
+                        dropped += len(frames) - 1
+                        frames = frames[-1:]
+                    w.stats["lag_ms"] = round(lag * 1000.0, 1)
+                    w.stats["dropped"] = dropped
                     if served == 0:
                         w.stats["first_frame_at"] = round(
                             time.time() - w.stats["t0"], 1)
@@ -1075,11 +1205,15 @@ class Handler(BaseHTTPRequestHandler):
                     try:
                         t0 = time.time()
                         # one write carrying every frame that accumulated --
-                        # a burst must not collapse into a single image
+                        # a burst must not collapse into a single image.
+                        # X-Time is the wall-clock publish time in ms; a client
+                        # on this host can subtract it from Date.now() to read
+                        # the true end-to-end delay of the frame it is showing.
                         self.wfile.write(b"".join(
                             (b"--frame\r\nContent-Type: image/jpeg\r\n"
-                             b"Content-Length: %d\r\n\r\n" % len(f))
-                            + f + b"\r\n" for f in frames))
+                             b"X-Time: %d\r\nContent-Length: %d\r\n\r\n"
+                             % (int(t * 1000), len(j)))
+                            + j + b"\r\n" for j, t in frames))
                         self.wfile.flush()
                         t_write += time.time() - t0
                         w.stats["t_write"] = round(t_write, 2)
