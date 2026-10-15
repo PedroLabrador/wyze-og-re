@@ -125,6 +125,25 @@ HD_RETRIES = 3
 # in Python 3.13, hence the hand-rolled table.
 SAMPLE_RATE = 16000
 
+# -- client -> camera audio ("talk") ---------------------------------------
+#
+# This is the only thing the page SENDS.  The camera keeps ONE session per
+# conv, so our audio cannot open its own CameraStream -- it would fight the
+# video worker for the session.  It rides the socket the worker is already
+# pumping, and the worker (not the HTTP thread) does the packing, because that
+# socket has exactly one owner.
+#
+# Wire format, and why the encoder is told 8 kHz, are in ../P2P_PROTOCOL.md 13.
+TALK_MIC_HZ = 16000            # what the browser captures and POSTs to us
+TALK_FRAMES_PER_PKT = 6        # six 20 ms AMR-NB frames = 120 ms per packet
+TALK_PKT_SECONDS = 0.120
+TALK_IDLE_TIMEOUT = 2.0        # no PCM for this long -> close the session
+# Speech bytes per AMR-NB mode, the ToC octet aside (RFC 4867 table 1).  We
+# always encode 12.2 kbit/s (mode 7, 31 bytes), but a silent mic makes the
+# encoder emit NO_DATA/SID frames, so the table has to be complete or the
+# parser drifts out of sync with the stream.
+AMR_PAYLOAD_BYTES = (12, 13, 15, 17, 19, 20, 26, 31, 5, 0, 0, 0, 0, 0, 0, 0)
+
 
 def _ulaw_decode(u):
     """One G.711 mu-law byte -> signed 16-bit linear sample."""
@@ -224,6 +243,16 @@ class CameraStreamThread(threading.Thread):
         except ValueError:
             self.definition = 2
         self.hd_fails = 0
+        # -- two-way audio (see talk_begin/talk_feed/talk_end) -------------
+        self.talk_lock = threading.Lock()
+        self.talk_on = False              # the page is holding its talk button
+        self.talk_opened = False          # the opening frames have been sent
+        self.talk_next = 0.0              # when the next packet may go out
+        self.talk_frames = collections.deque(maxlen=60)   # 31-byte AMR payloads
+        self.talk_ff = None               # the AMR encoder
+        self.talk_stop = None
+        self.talk_stats = {"pcm_bytes": 0, "frames": 0, "packets": 0,
+                           "audio_ms": 0, "last_pcm": 0.0}
 
     # -- helpers -----------------------------------------------------------
     def log(self, msg):
@@ -429,12 +458,18 @@ class CameraStreamThread(threading.Thread):
                         self._audio_cond.notify_all()
                     del st._abuf[:]
 
+                # Talk: this camera's own voice, pushed on the same session.
+                self._talk_tick(st, time.time())
+
                 # stall check
                 if time.time() - last_h264 > 8.0:
                     raise RuntimeError("stream stalled")
 
         finally:
             stop_drain.set()
+            # A talk session outlives this stream's life: the camera holds one
+            # session, so the encoder has to go with it or it keeps pushing.
+            self.talk_end()
             for closer in (lambda: ff.stdin.close(), ff.kill, st.close):
                 try:
                     closer()
@@ -462,6 +497,156 @@ class CameraStreamThread(threading.Thread):
                              % (self.definition, self.hd_fails, HD_RETRIES))
             self.set_status("reconnecting")
 
+    # -- two-way audio (client -> camera) ----------------------------------
+    def talk_begin(self):
+        """Open a talk session.  Returns None on success, else an error string.
+
+        The camera is only reachable through the worker's own CameraStream, so
+        "begin" means: start an AMR encoder and mark the stream open.  The first
+        actual bytes (the two opening frames, then 120 ms packets) go out from
+        _talk_tick on the pump thread.
+        """
+        with self.talk_lock:
+            if self.talk_on:
+                return None
+            if self.status not in ("streaming",):
+                return "camera is %s, not streaming" % self.status
+            cmd = ["ffmpeg", "-loglevel", "error", "-nostdin",
+                   # Without these, ffmpeg fills an input buffer before it
+                   # emits anything and the camera hears the first word of a
+                   # sentence seconds late.  Same trap as the video pipe.
+                   "-probesize", "32", "-analyzeduration", "0",
+                   "-f", "s16le", "-ar", str(TALK_MIC_HZ), "-ac", "1",
+                   "-i", "pipe:0",
+                   # libopencore_amrnb only accepts 8 kHz, so the resample is
+                   # what keeps the camera hearing a normal voice.
+                   "-ar", "8000", "-ac", "1",
+                   "-c:a", "libopencore_amrnb", "-b:a", "12.2k",
+                   "-f", "amr", "pipe:1"]
+            try:
+                ff = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                      stdout=subprocess.PIPE,
+                                      stderr=subprocess.DEVNULL)
+            except OSError as e:
+                return "cannot start ffmpeg: %s" % e
+            self.talk_ff = ff
+            self.talk_stop = threading.Event()
+            self.talk_frames = collections.deque(maxlen=60)
+            self.talk_opened = False
+            self.talk_next = 0.0
+            self.talk_stats.update({"pcm_bytes": 0, "frames": 0,
+                                    "packets": 0, "audio_ms": 0, "last_pcm": 0.0})
+            self.talk_on = True
+            threading.Thread(target=self._talk_reader, daemon=True,
+                             name="talk-%s" % self.camera["tid"]).start()
+            self.log("talk: session opened")
+            return None
+
+    def _talk_reader(self):
+        """ffmpeg's AMR bytes -> talk_frames, as 31-byte payloads (no ToC)."""
+        ff, stop = self.talk_ff, self.talk_stop
+        buf = bytearray()
+        hdr_done = False
+        got = frames = 0
+        while not stop.is_set():
+            try:
+                b = ff.stdout.read(1024)
+            except (OSError, ValueError):
+                break
+            if not b:
+                break
+            got += len(b)
+            buf += b
+            if not hdr_done and len(buf) >= 6:
+                if bytes(buf[:6]) == b"#!AMR\n":
+                    del buf[:6]
+                hdr_done = True
+            while buf:
+                size = AMR_PAYLOAD_BYTES[(buf[0] >> 3) & 0x0F]
+                if len(buf) < size + 1:
+                    break
+                if size:
+                    self.talk_frames.append(bytes(buf[1:1 + size]))
+                    frames += 1
+                del buf[:1 + size]
+            # Bound the queue: if the browser ever outruns the camera,
+            # send its newest audio rather than a growing backlog.
+            while len(self.talk_frames) > 2 * TALK_FRAMES_PER_PKT:
+                self.talk_frames.popleft()
+    def talk_feed(self, pcm):
+        """Accept 16 kHz PCM16 from the page.  Returns False if it is dropped."""
+        with self.talk_lock:
+            if not self.talk_on or not self.talk_ff:
+                return False
+            try:
+                self.talk_ff.stdin.write(pcm)
+                self.talk_ff.stdin.flush()
+            except (BrokenPipeError, ValueError, OSError):
+                return False
+            self.talk_stats["pcm_bytes"] += len(pcm)
+            self.talk_stats["last_pcm"] = time.time()
+            return True
+
+    def talk_end(self):
+        with self.talk_lock:
+            if not self.talk_on:
+                return
+            self.talk_on = False
+            self._talk_stop_encoder()
+            self.log("talk: session closed")
+
+    def talk_state(self):
+        """A read-only snapshot of the talk session, for /api/state."""
+        return {"on": self.talk_on, **self.talk_stats}
+
+    def _talk_stop_encoder(self):
+        ff, self.talk_ff = self.talk_ff, None
+        if self.talk_stop:
+            self.talk_stop.set()
+        if not ff:
+            return
+        for closer in (lambda: ff.stdin.close(), ff.kill):
+            try:
+                closer()
+            except Exception:
+                pass
+
+    def _talk_tick(self, st, now):
+        """Send one 120 ms packet when the encoder has six frames ready.
+
+        Runs on the pump thread: CameraStream's socket has one owner and this is
+        it.  A tiny job, which is why it is a tick and not a thread.
+        """
+        if not self.talk_on:
+            return
+        # A dead browser must not leave an encoder running forever.
+        if (now - self.talk_stats["last_pcm"] > TALK_IDLE_TIMEOUT
+                and self.talk_stats["pcm_bytes"] > 0):
+            self.log("talk: no audio for %.0f s, closing" % TALK_IDLE_TIMEOUT)
+            self.talk_end()
+            return
+        if not self.talk_opened:
+            st.open_talk()
+            self.talk_opened = True
+            self.talk_next = now
+        if (len(self.talk_frames) < TALK_FRAMES_PER_PKT
+                or now < self.talk_next):
+            return
+        batch = [self.talk_frames.popleft()
+                 for _ in range(TALK_FRAMES_PER_PKT)]
+        st.send_talk(batch)
+        self.log("talk: sent pkt %d q=%d dt=%.3f"
+                 % (self.talk_stats["packets"], len(self.talk_frames),
+                    time.time() - getattr(self, "_talk_t0", time.time())))
+        self._talk_t0 = time.time()
+        self.talk_stats["packets"] += 1
+        self.talk_stats["frames"] += len(batch)
+        self.talk_stats["audio_ms"] += TALK_PKT_SECONDS * 1000
+        # Pace at 1x the declared audio: six 20 ms frames per 120 ms.  A burst
+        # from the browser must not become a burst on the wire, or the camera
+        # buffers it and the speaker hears their own voice come back late.
+        self.talk_next = max(self.talk_next, now) + TALK_PKT_SECONDS
+
     def _discover(self):
         for _ in range(DISCOVER_ATTEMPTS):
             if self._stop.is_set():
@@ -477,6 +662,7 @@ class CameraStreamThread(threading.Thread):
         self._stop.set()
         with self._cond:
             self._cond.notify_all()
+        self.talk_end()          # a dead worker has no session to talk on
 
 
 # --------------------------------------------------------------------------
@@ -620,6 +806,7 @@ class Hub:
                     "error": w.error if w else None,
                     "seq": w.seq if w else 0,
                     "stats": self._stats_copy(w),
+                    "talk": w.talk_state() if w else None,
                     "log": list(w._log)[-6:] if w else [],
                 })
             return out
@@ -728,6 +915,22 @@ PAGE = """<!doctype html>
   /* "on" is deliberately more than a colour change: the icon swaps to the
      un-muted speaker AND the button lights up, because otherwise there was no way to see whether audio was on short of hearing it. */
   .sndbtn.on { color:#3fb950; background:rgba(63,185,80,.14); }
+  /* Hold-to-talk.  This is the page's only button that SENDS, so "on" is not
+     the green the speaker uses -- a live microphone feeding a speaker in the
+     room is better read as a live red, and it glows so it can be picked out
+     from the back of the room.  touch-action:none stops the browser's
+     press-and-hold gestures (text selection, context menu) from ending the
+     press early. */
+  .talkbtn { background:none; border:0; color:#8b949e; cursor:pointer;
+             line-height:1; padding:5px 6px; border-radius:4px;
+             display:inline-flex; align-items:center; touch-action:none;
+             user-select:none; }
+  .talkbtn svg { display:block; }
+  .talkbtn:hover { background:#30363d; color:#e6edf3; }
+  .talkbtn.on { color:#f85149; background:rgba(248,81,73,.14);
+                box-shadow:0 0 0 2px rgba(248,81,73,.22); }
+  .obar .talkbtn:hover { background:rgba(255,255,255,.16); }
+  .obar .talkbtn.on { background:rgba(248,81,73,.3); box-shadow:none; }
 </style>
 
 <header>
@@ -758,6 +961,7 @@ PAGE = """<!doctype html>
     <strong class="oname"></strong>
     <span class="ostat"></span>
     <div class="spacer"></div>
+    <button id="fstalk" class="talkbtn" title="Hold to talk to this camera" aria-label="Talk to this camera"></button>
     <button id="fssound" class="sndbtn" title="Sound off (click to enable)" aria-label="Toggle sound"></button>
     <button class="x" title="Close fullscreen"><svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M4.2 4.2l7.6 7.6M11.8 4.2l-7.6 7.6"/></svg></button>
   </div>
@@ -774,7 +978,9 @@ const ICON = {
   fs: '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2H2v4M10 2h4v4M10 14h4v-4M6 14H2v-4"/></svg>',
   cam: '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M2 5.2h2.1l1-1.7h5.8l1 1.7H14V13H2z"/><circle cx="8" cy="9.1" r="2.4"/></svg>',
   snd: '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h2.4L8.8 3.2v9.6L5.4 10H3z"/><path d="M11.2 5.7a3.3 3.3 0 0 1 0 4.6M13.2 3.7a6.1 6.1 0 0 1 0 8.6"/></svg>',
-  mute: '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h2.4L8.8 3.2v9.6L5.4 10H3z"/><path d="M11.1 6.2l3.7 3.6M14.8 6.2l-3.7 3.6"/></svg>'
+  mute: '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h2.4L8.8 3.2v9.6L5.4 10H3z"/><path d="M11.1 6.2l3.7 3.6M14.8 6.2l-3.7 3.6"/></svg>',
+  // the talk button: same house style, a mic instead of a speaker
+  mic: '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.4a2.2 2.2 0 0 1 2.2 2.2v2.8a2.2 2.2 0 0 1-4.4 0V4.6A2.2 2.2 0 0 1 8 2.4z"/><path d="M4.6 8.8a3.4 3.4 0 0 0 6.8 0M8 12.4v2"/></svg>'
 };
 
 // -- audio -----------------------------------------------------------------
@@ -818,6 +1024,160 @@ function setAudio(tid, on) {
     });
   }
   syncAudioUi(tid);
+}
+// -- talking to a camera ----------------------------------------------------
+// The page sends exactly one thing: this camera's own voice.  The camera holds
+// ONE session, so the server does not open a second connection to the camera --
+// it pushes our audio down the socket the video worker is already pumping, and
+// all this side has to do is hand over 16 kHz PCM in order.
+//
+// HOLD the button.  getUserMedia wants a user gesture, so the request goes out
+// on the first press, never at page load.  ScriptProcessor (deprecated, but
+// present in every browser and needing no build step) captures it.
+const TALK = {tid: null, ctx: null, src: null, node: null, stream: null,
+              pending: new Uint8Array(0), busy: false, err: null};
+const TALK_BUF = 512, TALK_BUF_BYTES = TALK_BUF * 2;   // 512 samples = 32 ms
+
+function talkReq(path, body) {
+  // Separate from j() because it carries the HTTP status, which is the whole
+  // difference between "busy" and "gone" here.
+  const h = {};
+  if (body !== null) {
+    h['Content-Type'] = 'application/json';
+    body = JSON.stringify(body);
+  }
+  return fetch(path, {method: 'POST', headers: h, body: body})
+    .then(r => r.json().then(d => ({status: r.status, d: d}))
+      .catch(() => ({status: r.status, d: {}})));
+}
+
+function syncTalkUi(tid) {
+  const on = TALK.tid === tid && !TALK.err;
+  const tip = TALK.err ? 'Talk: ' + TALK.err
+          : on ? 'Talking -- release to stop'
+          : 'Hold to talk to this camera';
+  for (const b of document.querySelectorAll('#c' + tid + ' .talkbtn')) {
+    b.classList.toggle('on', on);
+    b.title = tip;
+  }
+  if (FS.tid === tid) {
+    const f = $('#fstalk');
+    f.classList.toggle('on', on);
+    f.title = tip;
+  }
+}
+
+function talkStart(tid) {
+  TALK.err = null;
+  syncTalkUi(tid);
+  if (!window.isSecureContext || !(navigator.mediaDevices
+                                   && navigator.mediaDevices.getUserMedia)) {
+    TALK.err = 'microphone needs this page on http://localhost (secure context)';
+    syncTalkUi(tid);
+    return;
+  }
+  if (TALK.tid !== null && TALK.tid !== tid) talkStop(true);
+  if (TALK.tid === tid) return;
+  navigator.mediaDevices.getUserMedia(
+      {audio: {channelCount: 1, echoCancellation: true,
+               noiseSuppression: true, autoGainControl: true}})
+    .then(stream => {
+      TALK.stream = stream;
+      return talkReq('/api/talk/start', {tid: tid});
+    })
+    .then(r => {
+      if (r.status !== 200 || r.d.error) {
+        TALK.err = r.d.error || ('server refused, HTTP ' + r.status);
+        talkCleanup();
+        syncTalkUi(tid);
+        return;
+      }
+      const AC = window.AudioContext || window.webkitAudioContext;
+      TALK.ctx = new AC({sampleRate: 16000});
+      TALK.src = TALK.ctx.createMediaStreamSource(TALK.stream);
+      TALK.node = TALK.ctx.createScriptProcessor(TALK_BUF, 1, 1);
+      TALK.pending = new Uint8Array(0);
+      TALK.src.connect(TALK.node);
+      // zero gain, not the speakers: this is a microphone aimed at a speaker
+      // that is already in the room, not a monitor.
+      const mute = TALK.ctx.createGain();
+      mute.gain.value = 0;
+      TALK.node.connect(mute);
+      mute.connect(TALK.ctx.destination);
+      TALK.node.onaudioprocess = talkPcm;
+      TALK.tid = tid;
+      syncTalkUi(tid);
+    })
+    .catch(e => {
+      TALK.err = (e && e.name) || 'microphone refused';
+      talkCleanup();
+      syncTalkUi(tid);
+    });
+}
+
+function talkPcm(e) {
+  const f = e.inputBuffer.getChannelData(0);
+  const bytes = new Uint8Array(f.length * 2);
+  const dv = new DataView(bytes.buffer);
+  for (let i = 0; i < f.length; i++) {
+    let s = f[i];
+    if (s > 1) s = 1; else if (s < -1) s = -1;
+    dv.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  const merged = new Uint8Array(TALK.pending.length + bytes.length);
+  merged.set(TALK.pending);
+  merged.set(bytes, TALK.pending.length);
+  TALK.pending = merged;
+  talkFlush();
+}
+
+function talkFlush() {
+  // Await each POST before the next: the camera plays what it receives in the
+  // order it arrives, and a second request in flight is a second chance to
+  // reorder it.
+  while (TALK.pending.length >= TALK_BUF_BYTES && !TALK.busy) {
+    const out = TALK.pending.slice(0, TALK_BUF_BYTES);
+    TALK.pending = TALK.pending.slice(TALK_BUF_BYTES);
+    TALK.busy = true;
+    talkReq('/api/talk/pcm/' + TALK.tid, out).then(r => {
+      TALK.busy = false;
+      if (r.status !== 200 || r.d.ok === false) {
+        // The worker restarted or the camera closed the session.  Say so: a
+        // button that lights up and transmits nothing is worse than a dead
+        // one.
+        TALK.err = r.d.error || "lost the camera\'s session -- press again";
+        talkStop(true);
+      } else if (TALK.pending.length >= TALK_BUF_BYTES) {
+        talkFlush();
+      }
+    }).catch(() => { TALK.busy = false; talkStop(true); });
+  }
+  // Late audio is worse than missing audio: a stalled browser sheds its tail
+  // instead of having it come out minutes later.
+  if (TALK.pending.length > TALK_BUF_BYTES * 32) {
+    TALK.pending = TALK.pending.slice(-TALK_BUF_BYTES * 8);
+  }
+}
+
+function talkCleanup() {
+  const n = TALK.node, s = TALK.src, t = TALK.stream, c = TALK.ctx;
+  TALK.node = TALK.src = TALK.stream = null;
+  TALK.pending = new Uint8Array(0);
+  TALK.busy = false;
+  if (n) { n.onaudioprocess = null; try { n.disconnect(); } catch (_) {} }
+  if (s) { try { s.disconnect(); } catch (_) {} }
+  if (t) { try { t.getAudioTracks().forEach(tr => tr.stop()); } catch (_) {} }
+  if (c) { try { c.close(); } catch (_) {} }
+}
+
+function talkStop(silent) {
+  const tid = TALK.tid;
+  talkCleanup();
+  TALK.tid = null;
+  if (tid == null) return;
+  if (!silent) talkReq('/api/talk/stop', {tid: tid}).catch(() => {});
+  syncTalkUi(tid);
+  syncTalkUi(FS.tid);
 }
 // -- one connection for all video ------------------------------------------
 // Every camera's JPEGs arrive on a single fetch stream (Handler._feed), framed
@@ -941,6 +1301,8 @@ function tile(c) {
     el.innerHTML =
       '<div class="head"><div class="dot"></div><div class="name"></div>' +
       '<div class="ip"></div><div class="badge"></div>' +
+      '<button class="talkbtn" title="Hold to talk to this camera"' +
+      ' aria-label="Talk to this camera">' + ICON.mic + '</button>' +
       '<button class="fsbtn" title="Fullscreen (or double-click the video)"' +
       ' aria-label="Fullscreen">' + ICON.fs + '</button>' +
       '<button class="sndbtn" title="Sound off (click to enable)"' +
@@ -1013,6 +1375,25 @@ function tile(c) {
         syncAudioUi(c.tid);
       });
     }
+  }
+  // Hold-to-talk.  Pointer events, not click: the press IS the transmit switch.
+  // Wired once per tile -- tile() runs on every /api/state poll, so without the
+  // dataset.wired guard each poll would stack another handler on it, exactly
+  // the bug the comment above the sound button records.
+  const tb = el.querySelector('.talkbtn');
+  if (tb && !tb.dataset.wired) {
+    tb.dataset.wired = '1';
+    const down = e => { e.preventDefault(); e.stopPropagation();
+                        talkStart(c.tid); };
+    const up = e => { e.preventDefault(); e.stopPropagation();
+                      if (TALK.tid === c.tid) talkStop(); };
+    tb.addEventListener('pointerdown', down);
+    tb.addEventListener('pointerup', up);
+    tb.addEventListener('pointercancel', up);
+    // A finger that slides off the button has released it.  Without this the
+    // camera keeps "hearing" a silent room after the user let go.
+    tb.addEventListener('pointerleave', up);
+    tb.addEventListener('contextmenu', up);
   }
   el.querySelector('.name').textContent = c.name || ('Camera ' + c.tid);
   el.querySelector('.ip').textContent = c.ip || '\\u2014';
@@ -1123,7 +1504,15 @@ function tile(c) {
     + '\\n<ms>: from the frame being published on the server to it being'
     + ' painted in this browser (measured end-to-end here; lower is better)'
     + '\\ndropped: stale frames skipped so the view stays live';
-  el.querySelector('.f2').textContent = c.error || '';
+  // A talk error outranks the camera's own: it is the one a viewer can act on
+  // (press again) and the one that cannot be seen on the picture.  While a
+  // session is live the same line says how much has actually gone out, so a
+  // button that looks alive can be checked against the wire.
+  el.querySelector('.f2').textContent =
+    (TALK.tid === c.tid && TALK.err) ? TALK.err
+    : (TALK.tid === c.tid && c.talk && c.talk.on && c.talk.audio_ms)
+      ? 'talking \\u00b7 ' + (c.talk.audio_ms / 1000).toFixed(1) + ' s'
+      : (c.error || '');
   if (c.log && c.log.length) el.querySelector('.foot').title = c.log.join('\\n');
 
   // Keep the overlay bar in sync if this camera is the one fullscreened.
@@ -1197,6 +1586,25 @@ $('#fssound').addEventListener('click', e => {
   if (!aud) return;
   setAudio(FS.tid, aud.dataset.on !== '1');
 });
+// Hold-to-talk in the fullscreen bar.  Same session as the tile's button -- the
+// overlay is the same video, and the mic goes to the same camera either way.
+let fsTalk = false;
+$('#fstalk').addEventListener('pointerdown', e => {
+  if (FS.tid == null) return;
+  e.preventDefault();
+  e.stopPropagation();
+  fsTalk = true;
+  talkStart(FS.tid);
+});
+const fsTalkUp = e => {
+  if (!fsTalk) return;
+  fsTalk = false;
+  if (FS.tid != null) talkStop();
+};
+$('#fstalk').addEventListener('pointerup', fsTalkUp);
+$('#fstalk').addEventListener('pointercancel', fsTalkUp);
+$('#fstalk').addEventListener('pointerleave', fsTalkUp);
+$('#fstalk').addEventListener('contextmenu', fsTalkUp);
 // Click the black surround (but not the picture, not the bar) to dismiss.
 $('#ovslot').addEventListener('click', e => { if (e.target.id === 'ovslot') closeFs(); });
 $('#overlay').addEventListener('dblclick', closeFs);
@@ -1275,12 +1683,15 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, code, **kw):
         self._send(code, kw)
 
-    def _body(self):
+    def _raw_body(self):
         n = int(self.headers.get("Content-Length") or 0)
         if not n:
-            return {}
+            return b""
+        return self.rfile.read(n)
+
+    def _body(self):
         try:
-            return json.loads(self.rfile.read(n).decode("utf-8", "replace"))
+            return json.loads(self._raw_body().decode("utf-8", "replace"))
         except Exception:
             return {}
 
@@ -1454,8 +1865,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
-        self._body()
         if path == "/api/discover":
+            self._body()
             notes = []
             found = HUB.refresh(progress=lambda m: notes.append(m))
             if not found:
@@ -1463,8 +1874,63 @@ class Handler(BaseHTTPRequestHandler):
                              % DISCOVER_ATTEMPTS)
             self._json(200, found=len(found), ips=sorted(found),
                        note="; ".join(notes))
+        elif path.startswith("/api/talk/"):
+            self._talk(path[len("/api/talk/"):].split("/"), self._raw_body())
         else:
             self._json(404, error="not found")
+
+    # -- two-way audio --------------------------------------------------------
+    def _talk(self, parts, body):
+        """Client -> camera audio, in three tiny endpoints::
+
+            POST /api/talk/start     {"tid": N}
+            POST /api/talk/stop      {"tid": N}
+            POST /api/talk/pcm/<tid>   16 kHz mono PCM16 in the body
+
+        The PCM arrives as fixed-size POSTs because BaseHTTPRequestHandler cannot
+        read a chunked request body, and a chunked fetch POST (a ReadableStream
+        request body) is not supported by every browser either.
+        """
+        verb, rest = (parts + [""])[:2]
+        if verb == "pcm":
+            # parts is ["pcm", "<tid>"], so the id is parts[1].
+            try:
+                tid = int(parts[1])
+            except (ValueError, IndexError):
+                self._json(404, error="bad camera id")
+                return
+            w, err = HUB.ensure(tid)
+            if err:
+                self._json(503, error=err)
+                return
+            # Any length is accepted: a dropped or short chunk must not end the
+            # session, only make this one answer say "nothing to send".
+            self._json(200, ok=bool(body) and w.talk_feed(bytes(body)))
+            return
+        if verb in ("start", "stop"):
+            # _raw_body() gives bytes here: this is a real body, not _body().
+            try:
+                d = json.loads(body.decode("utf-8", "replace"))
+            except Exception:
+                d = {}
+            try:
+                tid = int(d.get("tid"))
+            except (TypeError, ValueError):
+                self._json(404, error="bad camera id")
+                return
+            w, err = HUB.ensure(tid)
+            if err:
+                self._json(503, error=err)
+                return
+            if verb == "start":
+                err = w.talk_begin()
+                self._json(200 if not err else 503,
+                           **({"error": err} if err else {"ok": True}))
+            else:
+                w.talk_end()
+                self._json(200, ok=True)
+            return
+        self._json(404, error="not found")
 
     # -- video -------------------------------------------------------------
     def _stream(self, tid):
