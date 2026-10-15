@@ -34,7 +34,14 @@ def load(path):
 
 
 def app_frames():
-    dgrams = load("/tmp/applan_a2c.bin")
+    import os
+    path = "/tmp/applan_a2c.bin"
+    if not os.path.exists(path):
+        raise SystemExit(
+            "%s is missing -- run pcapparse.py + applan.py on a PCAPdroid "
+            "capture of the phone first (see the recipe in JOURNAL.md "
+            "Phase 19)." % path)
+    dgrams = load(path)
     calling = next(d for d in dgrams if d[:2] == b"\x7e\xa4")
     ctl = None
     for d in dgrams:
