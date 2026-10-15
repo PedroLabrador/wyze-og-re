@@ -83,6 +83,36 @@ DISCOVER_DURATION = 3.0
 JPEG_SOI = b"\xff\xd8"
 JPEG_EOI = b"\xff\xd9"
 
+# The camera sends G.711 mu-law, one byte per sample.  Every audio AV frame
+# carries exactly 320 samples and its u32 timestamp advances 20000 us
+# (measured: 377 of 487 successive gaps were exactly 0x4e20, and the whole
+# timestamp span came out at 11.94 s against a 12.00 s wall clock -- so the
+# unit really is microseconds).  320 samples / 20 ms = 16 kHz, NOT the 8 kHz
+# this used to claim, and browsers vary in whether they decode a mu-law WAV,
+# so convert to 16 kHz mono PCM16 here and serve plain PCM.  audioop is gone
+# in Python 3.13, hence the hand-rolled table.
+SAMPLE_RATE = 16000
+
+
+def _ulaw_decode(u):
+    """One G.711 mu-law byte -> signed 16-bit linear sample."""
+    u = (~u) & 0xFF
+    t = (((u & 0x0F) << 3) + 0x84) << ((u & 0x70) >> 4)
+    return (0x84 - t) if (u & 0x80) else (t - 0x84)
+
+
+_ULAW_TABLE = bytes().join(struct.pack("<h", _ulaw_decode(b)) for b in range(256))
+
+
+def ulaw_to_pcm16(data):
+    """bytes of mu-law -> bytes of little-endian signed 16-bit PCM."""
+    tbl = _ULAW_TABLE
+    out = bytearray(len(data) * 2)
+    mv = memoryview(out)
+    for i, b in enumerate(data):
+        mv[2 * i:2 * i + 2] = tbl[2 * b:2 * b + 2]
+    return bytes(out)
+
 
 # --------------------------------------------------------------------------
 # camera names -- read from the local cache, never fetched at runtime
@@ -168,6 +198,16 @@ class CameraStreamThread(threading.Thread):
         with self._audio_cond:
             got = [(s, c) for s, c in self.audio_chunks if s > since_seq]
             return [c for _, c in got], (got[-1][0] if got else since_seq)
+
+    def audio_tail(self):
+        """Newest audio sequence.
+
+        A fresh listener starts here: starting at 0 would replay the whole
+        200-chunk backlog (~2 s of stale audio) as one burst the moment the
+        user presses SOUND.
+        """
+        with self._audio_cond:
+            return self.audio_chunks[-1][0] if self.audio_chunks else 0
 
     def _publish(self, jpeg):
         with self._cond:
@@ -531,7 +571,8 @@ PAGE = """<!doctype html>
     it keeps the MJPEG connection it already has (a second <img> would open a
     second socket and double the bandwidth for the same camera). */
  .fsbtn { background:none; border:0; color:#8b949e; cursor:pointer;
-          font-size:15px; line-height:1; padding:2px 6px; border-radius:4px; }
+          font-size:11px; font-weight:600; letter-spacing:.03em;
+          line-height:1; padding:4px 6px; border-radius:4px; }
  .fsbtn:hover { background:#30363d; color:#e6edf3; }
  #overlay { position:fixed; inset:0; background:#000; z-index:100;
             display:none; }
@@ -549,7 +590,9 @@ PAGE = """<!doctype html>
             padding:7px 13px; border-radius:6px; cursor:pointer; }
  .obar .x:hover { background:rgba(255,255,255,.28); }
   .sndbtn { background:none; border:0; color:#8b949e; cursor:pointer;
-            font-size:16px; line-height:1; padding:2px 6px; border-radius:4px; }
+            font-size:11px; font-weight:600; letter-spacing:.03em;
+            line-height:1; padding:4px 6px; border-radius:4px;
+            font-variant-numeric:tabular-nums; }
   .sndbtn:hover { background:#30363d; color:#e6edf3; }
   .sndbtn.on { color:#3fb950; }
 </style>
@@ -558,8 +601,8 @@ PAGE = """<!doctype html>
   <h1><span>Wyze</span> cameras</h1>
   <span class="sub" id="cnt"></span>
   <div class="spacer"></div>
-  <button id="fsall" title="Browser fullscreen">&#9974; Fullscreen</button>
-  <button id="refresh">&#8635; Re-discover</button>
+  <button id="fsall" title="Browser fullscreen">Fullscreen</button>
+  <button id="refresh">Re-discover</button>
 </header>
 <div id="banner" class="hidden"></div>
 <div id="grid"></div>
@@ -570,7 +613,7 @@ PAGE = """<!doctype html>
     <strong class="oname"></strong>
     <span class="ostat"></span>
     <div class="spacer"></div>
-    <button class="x">&#10005; Close</button>
+    <button class="x">Close</button>
   </div>
 </div>
 
@@ -594,11 +637,11 @@ function tile(c) {
       '<div class="head"><div class="dot"></div><div class="name"></div>' +
       '<div class="ip"></div><div class="badge"></div>' +
       '<button class="fsbtn" title="Fullscreen (or double-click the video)"' +
-      '>&#9974;</button>' +
-      '<button class="sndbtn" title="Toggle sound" aria-label="Toggle sound"' +
-      '>&#128266;</button>' +
+      '>FS</button>' +
+      '<button class="sndbtn" title="Sound off (click to enable)"' +
+      ' aria-label="Toggle sound">SND</button>' +
       '<button class="fsbtn" title="Save a still JPEG (snapshot)"' +
-      '>&#128247;</button></div>' +
+      '>JPG</button></div>' +
       '<div class="shot"><div class="ph">connecting&hellip;</div>' +
       '<img id="img' + c.tid + '" class="hidden" alt=""></div>' +
       '<audio id="aud' + c.tid + '" class="hidden" preload="none" crossorigin="anonymous"></audio>' +
@@ -623,29 +666,40 @@ function tile(c) {
     });
     el.addEventListener('dblclick', () => openFs(c.tid));
   }
-  // Sound button
+  // Sound button.  The <audio> streams /audio/<tid>.wav (16 kHz PCM16), so
+  // the browser does the mixing and the tile's MJPEG socket is untouched.
   const sndb = el.querySelector('.head .sndbtn'),
         aud = document.getElementById('aud' + c.tid);
   if (sndb && aud) {
     let audioOn = false;
+    const setOn = on => {
+      audioOn = on;
+      sndb.classList.toggle('on', on);
+      sndb.textContent = on ? 'SND ON' : 'SND';
+      sndb.title = on ? 'Sound on (click to mute)'
+                      : 'Sound off (click to enable)';
+    };
     sndb.addEventListener('click', e => {
       e.stopPropagation();
-      if (!audioOn) {
-        aud.src = '/audio/' + c.tid + '.wav?r=' + Date.now();
-        aud.play().catch(() => {});  // autoplay policy may block
-        sndb.classList.add('on');
-        sndb.textContent = '&#128266;';
-        sndb.title = 'Sound on (click to mute)';
-        audioOn = true;
-      } else {
+      if (audioOn) {
         aud.pause();
         aud.removeAttribute('src');
-        sndb.classList.remove('on');
-        sndb.textContent = '&#128263;';
-        sndb.title = 'Sound off (click to unmute)';
-        audioOn = false;
+        try { aud.load(); } catch (_) {}   // abort the HTTP stream
+        setOn(false);
+        return;
       }
+      // This click IS the user gesture, so play() must be called straight
+      // from here (awaiting a fetch first would lose it).
+      aud.src = '/audio/' + c.tid + '.wav?r=' + Date.now();
+      const p = aud.play();
+      setOn(true);                         // optimistic; reverted if blocked
+      if (p && p.catch) p.catch(err => {
+        setOn(false);
+        sndb.title = 'Sound blocked by the browser: ' + (err && err.name || err);
+      });
     });
+    // The stream can die server-side (camera offline, worker restarted).
+    aud.addEventListener('error', () => { if (audioOn) setOn(false); });
   }
   el.querySelector('.name').textContent = c.name || ('Camera ' + c.tid);
   el.querySelector('.ip').textContent = c.ip || '\\u2014';
@@ -997,12 +1051,18 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- audio -------------------------------------------------------------
     def _audio(self, tid):
-        """Stream raw mu-law audio (8 kHz, mono) from the camera.
+        """Stream 16 kHz mono PCM16 WAV built from the camera's mu-law audio.
 
         The camera emits audio interleaved with video on the same linktype/conv,
-        and CameraStream.raw_audio() yields complete chunks.  CameraStreamThread
-        collects them in a bounded deque and this endpoint serves them as a
-        streaming WAV (RIFF header with 0xFFFFFFFF sizes, then raw mu-law).
+        and CameraStream._abuf holds gap-filled mu-law (see
+        CameraStream._take_audio_frames, which pads every 40000 us hole with
+        mu-law zero so the timeline stays at 50 frames/s).  CameraStreamThread
+        collects it in a bounded deque; this endpoint decodes each chunk to
+        linear PCM and serves a streaming WAV (RIFF header with 0xFFFFFFFF
+        sizes, then raw PCM).
+
+        PCM rather than mu-law because browser support for format 7 is uneven
+        (Safari especially) and 32 kB/s over the LAN is free.
         """
         try:
             tid = int(tid)
@@ -1020,11 +1080,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
 
-        # Streaming WAV header: RIFF with 0xFFFFFFFF size (unknown length)
+        # Streaming WAV header: RIFF with 0xFFFFFFFF size (unknown length).
+        # fmt=1 (PCM), 1 ch, 16 kHz, 32000 B/s, 2 B/block, 16 bits.
         riff = struct.pack(
             "<4sI4s4sIHHIIHH4sI",
             b"RIFF", 0xFFFFFFFF, b"WAVE", b"fmt ", 16,
-            7, 1, 8000, 8000, 1, 8,
+            1, 1, SAMPLE_RATE, SAMPLE_RATE * 2, 2, 16,
             b"data", 0xFFFFFFFF)
         try:
             self.wfile.write(riff)
@@ -1032,13 +1093,13 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             return
 
-        cursor = 0
+        cursor = w.audio_tail()      # start live, not with the 200-chunk backlog
         dead = 0
         while True:
             chunks, cursor = w.take_audio(cursor)
             if chunks:
                 try:
-                    self.wfile.write(b"".join(chunks))
+                    self.wfile.write(ulaw_to_pcm16(b"".join(chunks)))
                     self.wfile.flush()
                     dead = 0
                 except (BrokenPipeError, ConnectionResetError):

@@ -1101,6 +1101,134 @@ awake, and the payloads stay end-to-end encrypted with a key we cannot derive
 for the new dialect.  640x360 stands as the documented outcome.
 
 
+## Phase 15 — the audio/video regression, and the frame format that was hiding in plain sight
+
+Once other camera models entered the rotation and audio was played while video
+ran, video became unwatchable and the sound stopped reproducing altogether.
+Both halves had one cause: **commit `73585b2` rewrote `p2p_client._on_tlv`.**
+
+### Root cause
+
+`73585b2` changed the type-4 body handling from "append everything to `_buf`"
+to a three-way split:
+
+```python
+if   pt[:4] == b"\xff\xff\xff\x88": _buf += pt        # "video"
+elif _looks_like_mulaw(pt):         _abuf += pt       # "audio"
+else:                               tlv_other += 1    # dropped
+```
+
+Two bugs, both fatal:
+
+1. **Video.** A frame larger than one TLV is split; only the *first* fragment
+   carries the `ff ff ff 88` header, the rest are bare H.264 continuation bytes.
+   They fail the sync test, and they fail `_looks_like_mulaw` too (mean&#124;diff&#124;
+   ≈ 80–85 vs audio's 20–32), so they were **dropped** — frames arrived truncated
+   and ffmpeg logged 20–164 decode errors.  Feeding every body instead gives
+   **0 errors** (measured repeatedly: `ALL`, `wh_ALL`, `verifyfix`).
+2. **Audio.** The audio AV frame carries the **same `ff ff ff 88` sync**, so it
+   matched the first branch and went to `_buf`.  `_abuf` therefore **never
+   received a single byte in any session** — which is exactly "sound does not
+   even reproduce".  `_looks_like_mulaw` was never reachable by real audio.
+
+### The audio frame format
+
+Established by `mixbody.py` (dumping whole bodies), `audmatch.py` and
+`audgap.py`:
+
+```
+ 0   ff ff ff 88 00 00 01 00   sync
+ 8   00 x12                     reserved
+20   u32 timestamp, microseconds (0x4e20 = 20000 per frame)
+24   u32 session byte            0x87 in one session, 0x88 in another
+28   u16 payload length = 320
+30   320 B G.711 mu-law      -> 350 B total
+```
+
+**Trap:** an earlier version of this analysis treated `[24:28] == 87 00 00 00`
+as a constant and the matcher scored **0 of 970 bodies**.  It is not constant —
+it is the high half of the timestamp word.  The tests that do hold across
+sessions are the sync, the 12 reserved zeros and a sane length.
+
+Bodies carrying audio, all measured: **350** = one frame; **700** = two
+back-to-back; **1004** = audio at `[0:350]` then video (first NAL ≈ `[379]`);
+**728** = the 28-byte AV descriptor then two frames (`28+350+350`).
+
+### Disproved along the way
+
+* *"Header-less bodies are not video."*  Disproved — dropping them is what
+  broke the feed.
+* *"All 462 media frames contain a start code, so all H.264, so no audio."*
+  **False positive:** the AV header `ff ff ff 88 00 00 01 00` contains
+  `00 00 01` at offset 4.  Count start codes from `pt[8:]`, never `pt[0:]`.
+  This is what let `P2P_PROTOCOL.md §12a-2` claim the camera sends no audio;
+  §12a-3 now documents the correction.
+* *"`_looks_like_mulaw` / entropy ≥ 6.5 can separate the two."*  Unreliable in
+  both directions; the 12-reserved-zeros test is exact.  In one capture 749
+  syncs split **512 audio + 237 video headers**, and ffmpeg decoded **236**
+  frames — a clean partition.
+* *"The payload is 8 kHz."*  No: 320 samples / 20000 µs = **16 kHz**.  The unit
+  is proved by wall clock — a 12.00 s capture spans 11.94 s of timestamps; at
+  2 µs per unit it would have been 23.88 s.
+* *"The audio is loud (rms 8231, 0.3 % full scale)."*  That measurement came
+  from `audioprobe.py`'s fixed 399-byte stride and from `whatsin.py`'s
+  `p[30:]` over *multi-frame* bodies — both leak header `00` bytes, and `00` is
+  mu-law −32124.  Correctly sliced, the stream reads rms 3–12.
+
+### Loss, and why the clip came out short
+
+The camera drops ≈1 frame in six: 110 single `40000` µs gaps across 488 frames /
+11.94 s, never two in a row, and **0 frames straddle a TLV boundary** (so
+extraction itself is lossless).  Concatenating what arrives gave 152 kB for a
+12 s view — a clip that plays **26 % fast** and out of sync with the video.
+`_take_audio_frames` now pads each hole with `0xff` (mu-law zero) using the
+timestamp: **191 kB, 11.96 s for a 12.00 s capture.**
+
+### Server side
+
+* The WAV header said `fmt=7, 8000 Hz, 8 bit` — wrong twice over.  Now
+  `fmt=1 (PCM), 1 ch, 16000 Hz, 32000 B/s, 16 bit`, with the mu-law decoded
+  server-side, because browser support for WAV format 7 is uneven (Safari
+  especially) and 32 kB/s over the LAN is free.  `audioop` is removed in
+  Python 3.13, so the table is hand-rolled and checked **256/256 against
+  `audioop.ulaw2lin`** (`audiocheck.py`).
+* A new listener now starts at `audio_tail()`, not sequence 0 — otherwise it
+  replays the whole 200-chunk backlog (~2 s) as one burst on the first click.
+* UI: the icon entities were replaced with `SND` / `FS` / `JPG`
+  labels, which also removes a real bug — `sndb.textContent = '&#128266;'`
+  writes the *entity string* literally, so after one click the button printed
+  `&#128266;`.  `play()`'s rejection is no longer swallowed: the button reverts
+  and shows the reason in its tooltip.
+* `p2p_call.py` parsed `sys.argv` at **import** time, so
+  `server.py --host 127.0.0.1` died with
+  `could not convert string to float: '127.0.0.1'`.  Its CLI flags are now read
+  only under `__main__`.
+
+### Result
+
+| | before `73585b2` fix | after |
+|---|---|---|
+| video (12 s) | 20–164 ffmpeg decode errors | **236 frames, 0 errors** (≈19.7 fps) |
+| audio bytes | **0** | 191 kB / 11.96 s (99 % of wall clock) |
+| audio frames/s | 0 | 49.7 (38.6 real + gap-filled) |
+
+Verified end-to-end over HTTP (`httptest.py`): `/` (no emoji entities),
+`/api/state`, `/stream/<tid>.mjpg` (SOI/EOI present),
+`/audio/<tid>.wav` (`fmt=1 ch=1 rate=16000`, 65514 samples decoded).
+
+### Open: the mic level is at the quantiser floor
+
+Both live cameras (`.224`, `.117`) transmit **real but extremely quiet** audio:
+per-second rms 2–4 out of 32767, 85 % digital zero, only codes
+`{ff,7f,7e,fe,7d,fd}` = {0,0,−8,+8,−16,+16} — i.e. ≈ −76 dBFS, flat for 15 s
+on both cameras.  The pipeline is right (even/odd byte histograms identical →
+byte-oriented mu-law, not PCM16; `frac_fullscale == 0` → the window never
+touches a header).  What is *not* settled is whether the rooms are genuinely
+that silent or the microphone is disabled/attenuated in the camera's settings —
+the app's `mute()` is local-only (Phase 14), so there is no session command
+holding it down.  Needs either a noise test near a camera or the phone awake.
+
+
 
 `SECRETS.md` holds the OAuth `client_id` / `client_secret` and the checklist.
 Delete the plaintext token files (`/tmp/wyze_token.json`, `/tmp/wyze_live.txt`,

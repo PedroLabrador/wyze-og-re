@@ -91,12 +91,19 @@ KCP25_LEN = 28              # inner length of giot_send_create_kcp_session_msg
 
 D_LOG = 0x840186d6001260a3  # the phone's own id, as embedded in hello/CALLING
 
-_args = [a for a in sys.argv[1:] if not a.startswith("--")]
-REWRITE = "--rewrite" in sys.argv
-KCP = "--kcp" in sys.argv
-MTPRES = "--mtpres" in sys.argv
-AV = "--av" in sys.argv
-DUR = float(_args[0]) if _args else 30.0
+# These are this file's own CLI options.  Parse them only when p2p_call is run
+# as a program: importing it (server.py does) must not read *the importer's*
+# argv, which is how `server.py --host 127.0.0.1` used to die with
+# "could not convert string to float: '127.0.0.1'".
+if __name__ == "__main__":
+    _args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    REWRITE = "--rewrite" in sys.argv
+    KCP = "--kcp" in sys.argv
+    MTPRES = "--mtpres" in sys.argv
+    AV = "--av" in sys.argv
+    DUR = float(_args[0]) if _args else 30.0
+else:
+    _args, REWRITE, KCP, MTPRES, AV, DUR = [], False, False, False, False, 30.0
 
 
 # ---------------------------------------------------------------- templates

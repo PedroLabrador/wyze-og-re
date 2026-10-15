@@ -1753,15 +1753,74 @@ Note the media frame's `[6:8]` does **not** behave as the payload length the
 8-byte header in §12a specifies; treat §12a as the app→camera user-data format
 only, and this table as authoritative for the camera→us direction.
 
-**The camera sends no audio.**  Every one of 462 media frames contained an
-Annex-B start code, i.e. all H.264, and no third `[4]`,`[5]` class exists.
-Audio is *described* — the descriptor carries a 16 kHz sample rate and
-`start_av_enc_dec(AudioType=5, …, AudioSampleRate=16000)` configures both
-directions — but none is transmitted to a plain viewer session.  It is not the
-AvStreamCtl INITREQ that withholds it: `iv_rcvpkt_AVSTREAMCTL_INITREQ` reads
-only `pkt[4:8]` (id164) and `pkt[62:64]` (w160), and the camera never sends us
-a GUTES frame asking for anything (`gutesprobe.py`: one `7ea4` ack, two `c090`
-meter requests, four AvStreamCtl replies, then media — zero GUTES).
+### 12a-3. Audio: the camera DOES transmit it  [DISPROVED the old claim]
+
+~~**The camera sends no audio.**~~  **That claim was wrong** — it rested on
+"every one of 462 media frames contained an Annex-B start code, i.e. all
+H.264".  The count started at byte 0 of the plaintext, and the AV header
+`ff ff ff 88 00 00 01 00` **itself contains `00 00 01` at offset 4**, so every
+body — audio included — "had a start code" and no third class could ever be
+seen.  Start codes must be counted from `pt[8:]`.  (Same false positive made
+`vfragprobe.py` report "439/439 have start codes".)
+
+Audio AV frames are complete, self-describing, and interleaved into the same
+linktype-4 body stream as video:
+
+```
+ 0   ff ff ff 88 00 00 01 00   sync (identical 8-byte prefix to video)
+ 8   00 x12                     reserved
+20   u32 timestamp, microseconds   advances 0x4e20 = 20000 every frame
+24   u32 session byte, 0x87 in one session / 0x88 in another
+                                 NOT a constant -- do not test on it
+28   u16 payload length = 320
+30   320 B G.711 mu-law
+---
+350  total, i.e. exactly one audio frame per 350-byte body
+```
+
+320 samples / 20 ms = **16 kHz mono**, so the descriptor's `AudioSampleRate`
+16000 is literal and the "8 kHz" guess was wrong.
+
+Where the frames sit:
+
+| body size | contents |
+|---|---|
+| 350 | one audio frame alone |
+| 700 | two audio frames back to back |
+| 1004 | audio frame at `[0:350]`, then the H.264 frame (first NAL ≈ `[379]`) |
+| 728 | the 28-byte AV descriptor, then two audio frames (`28+350+350`) |
+
+**Classification must be structural** — sync + the 12 reserved zeros — never an
+entropy/`_looks_like_mulaw` heuristic: H.264 continuation fragments have
+mean&#124;diff&#124; ≈ 80–85 against audio's 20–32, and the heuristic misfires and
+truncates video.  In one 12 s capture the 749 syncs split exactly into **512
+audio** (12 zeros) + **237 video headers**, and ffmpeg decoded **236** frames.
+
+Decoding sanity checks that will catch a wrong offset:
+
+* `0x7f` and `0xff` are **both** mu-law zero, so a correct payload reads 50–85 %
+  digital zero, and the codes come in symmetric pairs
+  (`0x7e`/`0xfe` = −8/+8, `0x7d`/`0xfd` = −16/+16).
+* even- and odd-position byte histograms are **identical** → byte-oriented, so
+  mu-law, not PCM16 (a PCM16 read of the same bytes gives a constant rms ≈
+  21000 that is pure byte structure, no variation over time).
+* `frac_fullscale == 0` — one `0x00` byte (mu-law −32124) in the window means
+  the slice has drifted into a header.
+
+**Loss and framing.**  The camera drops about one audio frame in six: 110
+single `40000` µs gaps across 488 frames / 11.94 s, never more than one at a
+time, and **0 frames straddle a TLV boundary** (so extraction is lossless).
+Consequences: without gap-filling you get 152 kB for a 12 s view and the clip
+plays 26 % fast and out of step with the video; `p2p_client` therefore pads
+every hole with `0xff` (mu-law zero).  With the pad: 191 kB, 11.96 s for a
+12.00 s capture.
+
+The timestamp unit being microseconds is proven by that wall-clock
+correspondence — a 12.00 s capture spanning 11.94 s of timestamps.  At 2 µs
+per unit the span would have been 23.88 s.
+
+`server.py` converts to 16 kHz mono PCM16 before serving, because browser
+support for WAV format 7 (mu-law) is uneven and 32 kB/s over the LAN is free.
 
 ### 12b. The user-data command: how the app selects 1920x1080
 

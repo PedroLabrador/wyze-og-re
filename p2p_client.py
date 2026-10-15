@@ -195,6 +195,7 @@ class CameraStream(object):
         self.kcp = None
         self._buf = bytearray()
         self._abuf = bytearray()          # audio (mu-law)
+        self._audio_ts = None             # last audio frame timestamp (us)
         self._started = False
 
     # -- the handshake -----------------------------------------------------
@@ -244,10 +245,33 @@ class CameraStream(object):
     def _on_tlv(self, payload):
         """A TLV frame arrived over KCP: [0]=type [2:4]=u16LE len [4:]=body.
 
-        Linktype 4 (media) is RC5 with the AV key.  Its body is either:
-          - a video frame (starts with 0xff 0xff 0xff 0x88 0x00 ...)
-          - an audio frame (mu-law, 8 kHz, mono) -- no AV header, but the
-            plaintext bytes cluster in [0x60, 0xff] with low consecutive diff.
+        Linktype 4 (media) is RC5 with the AV key.  The plaintext body is
+        a *fragment* of the camera's AV stream, not necessarily one frame:
+
+          - Video frames larger than one TLV are split.  Only the FIRST
+            fragment carries the 0xff 0xff 0xff 0x88 AV header; the rest are
+            bare H.264 continuation bytes with no header at all.  Dropping
+            those (as 73585b2 did) truncates frames -> ffmpeg decode errors.
+          - Audio AV frames are complete and self-identifying::
+
+                0   ff ff ff 88 00 00 01 00      sync
+                8   00 x12                       reserved
+                20  u32 timestamp, microseconds (0x4e20 = 20000 per frame)
+                24  u32 session-dependent byte (0x87 / 0x88 seen)
+                28  u16 payload length (320)
+                30  mu-law payload
+
+            ...and they may be *nested* inside the same TLV as video (a
+            350-byte audio frame followed by video bytes), or several audio
+            frames packed back to back (700 / 1004 byte bodies), or preceded
+            by the 28-byte stream descriptor (see wire/p2p_frames.json).
+
+        So: append every body to the H.264 feed untouched, and additionally
+        carve the audio payloads out of it.  This is safe because a mu-law
+        payload never contains an Annex-B start code -- measured over the
+        audio-classified bodies, every `00 00 01` sat at an AV frame boundary,
+        never inside the 320-byte payload.
+
         Linktype 3 is AvStreamCtl (plaintext) -- we ignore it after handshake.
         """
         if len(payload) < 5:
@@ -271,28 +295,67 @@ class CameraStream(object):
         if not pt:
             return
 
-        if pt[:4] == b"\xff\xff\xff\x88":
-            # video frame (Annex-B H.264)
-            self._buf += pt
-        elif self._looks_like_mulaw(pt):
-            # audio frame: mu-law 8 kHz mono
-            self._abuf += pt
-        else:
-            # unknown/garbage -- count it but don't corrupt either buffer
-            self.tlv_other = getattr(self, "tlv_other", 0) + 1
+        # 1) video: everything, header-less continuations included.
+        self._buf += pt
+        # 2) audio: pull every mu-law payload out of the same bytes.
+        self._take_audio_frames(pt)
 
-    @staticmethod
-    def _looks_like_mulaw(data):
-        """Heuristic: mu-law audio has >50% bytes in [0x60, 0xff] and low
-        consecutive difference (it's low-pass ~3.4 kHz)."""
-        if len(data) < 16:
-            return False
-        hi = sum(1 for b in data if b >= 0x60)
-        if hi / len(data) < 0.5:
-            return False
-        # low-pass check: mean |diff| between consecutive samples
-        diff = sum(abs(data[i] - data[i - 1]) for i in range(1, min(len(data), 200)))
-        return diff / min(len(data) - 1, 199) < 60
+    _AV_SYNC = b"\xff\xff\xff\x88"
+    _AUD_ZEROS = b"\x00" * 12
+    _AUD_PERIOD = 20000            # microseconds per audio frame (320 @ 16 kHz)
+
+    def _take_audio_frames(self, pt):
+        """Append the mu-law payload of each audio AV frame found in `pt`.
+
+        The frame header is (measured, two independent sessions)::
+
+            0   ff ff ff 88 00 00 01 00    sync
+            8   00 x12                      reserved
+            20  u32 timestamp, microseconds (advances 0x4e20 = 20000/frame)
+            24  u32 session byte, 0x87 in one session, 0x88 in another
+            28  u16 payload length (320)
+            30  mu-law payload
+
+        Bytes [24:28] are NOT a constant, so only the sync, the 12 reserved
+        zeros and a sane length are tested.  Video frames never carry the
+        12 zeros: in a 12 s capture 749 syncs split exactly into 512 audio
+        (12 zeros) + 237 video headers, and ffmpeg decoded 236 frames.
+
+        The camera drops roughly one audio frame in six on the wire (110
+        single 40000 us gaps in 488 frames / 11.94 s), so every gap is
+        back-filled with mu-law digital zero (0xff decodes to 0).  Without
+        that the 152 kB we receive would be a 9.5 s clip for a 12 s view and
+        would play back 26 % fast and out of sync with the video.
+        """
+        i = 0
+        n = len(pt)
+        while True:
+            i = pt.find(self._AV_SYNC, i)
+            if i < 0:
+                return
+            if (i + 30 <= n
+                    and pt[i:i + 8] == self._AV_SYNC + b"\x00\x00\x01\x00"
+                    and pt[i + 8:i + 20] == self._AUD_ZEROS):
+                ln = struct.unpack_from("<H", pt, i + 28)[0]
+                if 64 <= ln <= 4096 and i + 30 + ln <= n:
+                    self._audio_gap_fill(pt[i + 20:i + 24], ln)
+                    self._abuf += pt[i + 30:i + 30 + ln]
+                    i += 30 + ln                   # skip past its payload
+                    continue
+            i += 1
+
+    def _audio_gap_fill(self, tsb, ln):
+        """Insert silence for frames the camera's clock says we never got."""
+        ts = struct.unpack("<I", tsb)[0]
+        prev = self._audio_ts
+        self._audio_ts = ts
+        if prev is None:
+            return
+        delta = (ts - prev) & 0xFFFFFFFF
+        if self._AUD_PERIOD < delta <= 2000000:     # 1 frame .. 2 s
+            missing = min(delta // self._AUD_PERIOD - 1, 100)
+            # 0xff is mu-law negative zero -> PCM 0
+            self._abuf += b"\xff" * (ln * missing)
 
     def start(self):
         """Run the handshake once.  Idempotent-ish; safe to call again."""
