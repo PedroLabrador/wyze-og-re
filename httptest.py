@@ -56,11 +56,13 @@ def main():
         html = body.decode("utf-8", "replace")
         print("\nGET /          -> %d  %d B  %s" % (st, len(body),
                                                     hdr.get("Content-Type")))
-        for ent in ("&#128266;", "&#128263;", "&#128247;", "&#128269;"):
+        for ent in ("&#128266;", "&#128263;", "&#128247;", "&#128269;",
+                    "&#9974;", "&#8635;", "&#10005;"):
             if ent in html:
                 print("   !! emoji entity still present: %s" % ent)
         print("   emoji entities checked; SND/FS/JPG labels present: %s"
               % all(x in html for x in ("SND", "FS", "JPG")))
+        print("   gain selector present: %s" % ('id="gain"' in html))
         print("   'textContent =' entity bug present: %s"
               % ("textContent = '&#" in html))
 
@@ -84,9 +86,9 @@ def main():
               % (b"--frame" in body, b"\xff\xd8" in body, b"\xff\xd9" in body))
 
         # -- audio ---------------------------------------------------------
-        st, hdr, body = get("/audio/%s.wav" % tid, n=131072, timeout=25)
-        print("\nGET /audio     -> %d  %d B  %s" % (st, len(body),
-                                                    hdr.get("Content-Type")))
+        st, hdr, body = get("/audio/%s.wav?gain=32" % tid, n=131072, timeout=25)
+        print("\nGET /audio?gain=32 -> %d  %d B  %s" % (st, len(body),
+                                                       hdr.get("Content-Type")))
         if body[:4] == b"RIFF" and body[8:12] == b"WAVE":
             tag, ch, rate, brate, align, bits = struct.unpack_from(
                 "<HHIIHH", body, 20)
@@ -98,8 +100,8 @@ def main():
                 sm = struct.unpack_from("<%dh" % n, data)
                 nz = sum(1 for x in sm if x)
                 peak = max(abs(x) for x in sm)
-                print("   samples=%d nonzero=%.1f%% peak=%d"
-                      % (n, 100.0 * nz / n, peak))
+                print("   samples=%d nonzero=%.1f%% peak=%d (unity would be "
+                      "~%d)" % (n, 100.0 * nz / n, peak, peak // 32))
         else:
             print("   NOT a WAV: %r" % body[:60])
 

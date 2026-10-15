@@ -104,13 +104,30 @@ def _ulaw_decode(u):
 _ULAW_TABLE = bytes().join(struct.pack("<h", _ulaw_decode(b)) for b in range(256))
 
 
-def ulaw_to_pcm16(data):
-    """bytes of mu-law -> bytes of little-endian signed 16-bit PCM."""
-    tbl = _ULAW_TABLE
+def ulaw_to_pcm16(data, gain=1):
+    """bytes of mu-law -> bytes of little-endian signed 16-bit PCM.
+
+    `gain` multiplies before clipping.  The camera's mic idles around
+    -76 dBFS (see JOURNAL Phase 15: per-second rms 2-4 of 32767, 85 % digital
+    zero), so without gain the stream is technically correct but inaudible;
+    the app has an AGC step we never found, this is ours.
+    """
+    if gain == 1:
+        tbl = _ULAW_TABLE
+        out = bytearray(len(data) * 2)
+        mv = memoryview(out)
+        for i, b in enumerate(data):
+            mv[2 * i:2 * i + 2] = tbl[2 * b:2 * b + 2]
+        return bytes(out)
     out = bytearray(len(data) * 2)
     mv = memoryview(out)
     for i, b in enumerate(data):
-        mv[2 * i:2 * i + 2] = tbl[2 * b:2 * b + 2]
+        v = _ulaw_decode(b) * gain
+        if v > 32767:
+            v = 32767
+        elif v < -32768:
+            v = -32768
+        mv[2 * i:2 * i + 2] = struct.pack("<h", v)
     return bytes(out)
 
 
@@ -540,6 +557,11 @@ PAGE = """<!doctype html>
           border-radius:6px; padding:7px 13px; font-size:13px; cursor:pointer; }
  button:hover { background:#30363d; }
  button:disabled { opacity:.5; cursor:default; }
+ .gainl { color:#8b949e; font-size:12px; display:flex; align-items:center;
+          gap:7px; white-space:nowrap; }
+ .gainl select { background:#21262d; color:#e6edf3; border:1px solid #30363d;
+                 border-radius:6px; padding:5px 6px; font-size:12px;
+                 font-variant-numeric:tabular-nums; cursor:pointer; }
  #grid { display:grid; gap:14px; padding:18px;
          grid-template-columns:repeat(auto-fit,minmax(360px,1fr)); }
  .tile { background:#161b22; border:1px solid #30363d; border-radius:10px;
@@ -601,6 +623,18 @@ PAGE = """<!doctype html>
   <h1><span>Wyze</span> cameras</h1>
   <span class="sub" id="cnt"></span>
   <div class="spacer"></div>
+  <label class="gainl" title="The camera's mic idles at about -76 dBFS, which
+    is correct but inaudible. Raise this until you hear the room -- if even
+    64x is silent, the microphone is off in the camera's settings.">Audio gain
+    <select id="gain">
+      <option value="1">1x</option>
+      <option value="2">2x</option>
+      <option value="4">4x</option>
+      <option value="8" selected>8x</option>
+      <option value="16">16x</option>
+      <option value="32">32x</option>
+      <option value="64">64x</option>
+    </select></label>
   <button id="fsall" title="Browser fullscreen">Fullscreen</button>
   <button id="refresh">Re-discover</button>
 </header>
@@ -620,6 +654,22 @@ PAGE = """<!doctype html>
 <script>
 const $ = s => document.querySelector(s);
 let LAST = [];            // latest /api/state snapshot, for fullscreen helpers
+let GAIN = 1;             // audio boost, see #gain; read at every SND click
+const gainEl = document.getElementById('gain');
+function syncGain() { GAIN = Number(gainEl.value) || 1; }
+if (gainEl) {
+  gainEl.value = '8';     // the mic idles at -76 dBFS, unity is inaudible
+  syncGain();
+  // Re-point anything already playing so the change applies immediately.
+  gainEl.addEventListener('change', () => {
+    syncGain();
+    document.querySelectorAll('audio[id^="aud"]').forEach(a => {
+      if (a.paused || !a.src) return;
+      a.src = a.src.replace(/([?&]gain=)\d+/, '$1' + GAIN);
+      a.play().catch(() => {});
+    });
+  });
+}
 
 async function j(u, o) {
   const r = await fetch(u, o);
@@ -690,7 +740,7 @@ function tile(c) {
       }
       // This click IS the user gesture, so play() must be called straight
       // from here (awaiting a fetch first would lose it).
-      aud.src = '/audio/' + c.tid + '.wav?r=' + Date.now();
+      aud.src = '/audio/' + c.tid + '.wav?r=' + Date.now() + '&gain=' + GAIN;
       const p = aud.play();
       setOn(true);                         // optimistic; reverted if blocked
       if (p && p.catch) p.catch(err => {
@@ -1063,12 +1113,21 @@ class Handler(BaseHTTPRequestHandler):
 
         PCM rather than mu-law because browser support for format 7 is uneven
         (Safari especially) and 32 kB/s over the LAN is free.
+
+        `?gain=N` (1..64) multiplies before clipping -- the camera's mic idles
+        at about -76 dBFS, correct but inaudible.
         """
         try:
             tid = int(tid)
         except ValueError:
             self._json(404, error="bad camera id")
             return
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        try:
+            gain = int(q.get("gain", ["1"])[0])
+        except ValueError:
+            gain = 1
+        gain = max(1, min(gain, 64))
         w, err = HUB.ensure(tid)
         if err:
             self._json(503, error=err)
@@ -1099,7 +1158,7 @@ class Handler(BaseHTTPRequestHandler):
             chunks, cursor = w.take_audio(cursor)
             if chunks:
                 try:
-                    self.wfile.write(ulaw_to_pcm16(b"".join(chunks)))
+                    self.wfile.write(ulaw_to_pcm16(b"".join(chunks), gain))
                     self.wfile.flush()
                     dead = 0
                 except (BrokenPipeError, ConnectionResetError):

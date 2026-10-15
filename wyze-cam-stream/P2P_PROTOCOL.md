@@ -1821,6 +1821,9 @@ per unit the span would have been 23.88 s.
 
 `server.py` converts to 16 kHz mono PCM16 before serving, because browser
 support for WAV format 7 (mu-law) is uneven and 32 kB/s over the LAN is free.
+`?gain=1..64` multiplies after decoding and saturates: the mic idles around
+−70 dBFS, correct but inaudible, and a second `httptest.py` run on the same
+camera minutes later read −30 dBFS, so the level simply tracks the room.
 
 ### 12b. The user-data command: how the app selects 1920x1080
 

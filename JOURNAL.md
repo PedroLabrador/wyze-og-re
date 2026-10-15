@@ -1216,17 +1216,31 @@ Verified end-to-end over HTTP (`httptest.py`): `/` (no emoji entities),
 `/api/state`, `/stream/<tid>.mjpg` (SOI/EOI present),
 `/audio/<tid>.wav` (`fmt=1 ch=1 rate=16000`, 65514 samples decoded).
 
-### Open: the mic level is at the quantiser floor
+### The mic level: live, and it just tracks the room
 
-Both live cameras (`.224`, `.117`) transmit **real but extremely quiet** audio:
-per-second rms 2–4 out of 32767, 85 % digital zero, only codes
-`{ff,7f,7e,fe,7d,fd}` = {0,0,−8,+8,−16,+16} — i.e. ≈ −76 dBFS, flat for 15 s
-on both cameras.  The pipeline is right (even/odd byte histograms identical →
-byte-oriented mu-law, not PCM16; `frac_fullscale == 0` → the window never
-touches a header).  What is *not* settled is whether the rooms are genuinely
-that silent or the microphone is disabled/attenuated in the camera's settings —
-the app's `mute()` is local-only (Phase 14), so there is no session command
-holding it down.  Needs either a noise test near a camera or the phone awake.
+Both live cameras (`.224`, `.117`) transmitted **real but extremely quiet** audio
+during the long captures: per-second rms 2–4 out of 32767, 85 % digital zero,
+only codes `{ff,7f,7e,fe,7d,fd}` = {0,0,−8,+8,−16,+16} — i.e. ≈ −76 dBFS, flat
+for 15 s on both cameras.  The pipeline is right (even/odd byte histograms
+identical → byte-oriented mu-law, not PCM16; `frac_fullscale == 0` → the window
+never touches a header).
+
+That is **not** a dead mic, though: two `httptest.py` runs against the *same*
+camera (`429728658691722`) minutes apart read
+
+| run | nonzero at unity | peak at unity |
+|---|---|---|
+| first | 33.2 % | 24 (−70 dBFS) |
+| later | 70.8 % | 1024 (−30 dBFS) |
+
+so the level responds to what is actually happening in the room.  The
+App-side `mute()` is local-only (Phase 14), so nothing holds it down in-session.
+
+Because −70 dBFS is correct but inaudible, `server.py` gained `?gain=N`
+(1…64, multiply-then-clip) and the page an **Audio gain** selector in the
+header (default 8×, re-points any `<audio>` that is already playing).  It is
+both a listening aid and the diagnostic: if even 64× is pure silence, the
+microphone really is off in the camera's settings.
 
 
 
