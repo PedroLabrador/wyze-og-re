@@ -121,8 +121,19 @@ def build_avstreamctl(action=kcpav.ACT_START, blob=None):
     """The 76-byte frame iv_init_frm_AvStreamCtl builds (0x53274).
 
     Sent as the payload of a KCP PUSH -- NOT as a GUTES frame.
+
+    This is the 2.50.7 shape and always yields the 640x360 sub-stream.  Use
+    build_avstreamctl_hd() to ask for 1080p.
     """
     return kcpav.avstreamctl(action, blob=blob)
+
+
+def build_avstreamctl_hd(definition=kcpav.DEF_HD, action=kcpav.ACT_START):
+    """The 108-byte 3.23.1 AvStreamCtl -- the one that selects 1080p.
+
+    `definition` 2 = 1920x1080, 0 = 640x360.  See kcpav.avstreamctl_v2.
+    """
+    return kcpav.avstreamctl_v2(definition=definition, action=action)
 
 
 # ---- the AV cipher -------------------------------------------------------
@@ -168,7 +179,8 @@ class CameraStream(object):
     """
 
     def __init__(self, ip, p2p_port, tid, calling, local_ip=None,
-                 timeout=8.0, on_log=None, local_port=None):
+                 timeout=8.0, on_log=None, local_port=None,
+                 definition=kcpav.DEF_HD):
         self.ip = ip
         self.p2p_port = p2p_port
         self.tid = tid
@@ -192,10 +204,14 @@ class CameraStream(object):
         self.local_port = self.sock.getsockname()[1]
         self.sock.setblocking(False)
         self.conv = struct.unpack_from("<I", pt, 28)[0]
+        # None -> the 2.50.7 76-byte AvStreamCtl (640x360 only).  An int ->
+        # the 108-byte v2 frame carrying that definition (2 = 1080p).
+        self.definition = definition
         self.kcp = None
         self._buf = bytearray()
         self._abuf = bytearray()          # audio (mu-law)
         self._audio_ts = None             # last audio frame timestamp (us)
+        self._meter_logged = False
         self._started = False
 
     # -- the handshake -----------------------------------------------------
@@ -226,7 +242,12 @@ class CameraStream(object):
                 ack = make_meter_ack(data)
                 if ack:
                     self._send(ack)
-                    self.log("meter_req -> meter_ack")
+                    # One ack every ~2 s would otherwise flush everything
+                    # else out of the server's 40-line log ring, so only the
+                    # first of a run is worth recording.
+                    if not self._meter_logged:
+                        self.log("meter_req -> meter_ack (then every ~2 s)")
+                        self._meter_logged = True
                 continue
 
             # 2. KCP data: feed every matching conv.
@@ -376,11 +397,20 @@ class CameraStream(object):
 
         # request the stream.  This is the only thing that makes the camera
         # emit C0 10 -- it has nothing to send until we ask.
+        #
+        # definition is what picks the operational profile: None sends the
+        # 76-byte 2.50.7 frame (640x360), an int sends the 108-byte 3.23.1
+        # frame, where 2 asks for 1920x1080.
+        if self.definition is None:
+            ctl = build_avstreamctl()
+        else:
+            ctl = build_avstreamctl_hd(definition=self.definition)
         for kc in (self.kcp_lo, self.kcp_hi):
-            kc.push(build_avstreamctl())
+            kc.push(ctl)
             for pkt in kc.take_packets():
                 self._send(mtp_wrap(pkt, 0))
-        self.log("AvStreamCtl PUSH (KCP)")
+        self.log("AvStreamCtl PUSH (KCP, definition=%s)"
+                 % ("v1" if self.definition is None else self.definition))
         self._started = True
 
     # -- the data path -----------------------------------------------------
@@ -468,6 +498,22 @@ def selftest():
     ack = make_meter_ack(fake)
     assert ack is not None and mtp_unwrap(ack)[0][1] == 2
     print("[ok] meter_req -> meter_ack flips inner[1] to 2")
+
+    # the v2 AvStreamCtl -- the frame that actually asks for 1080p
+    v1 = build_avstreamctl()
+    assert len(v1) == 76 and v1[0] == 3 and v1[2:4] == b"\x4c\x00"
+    v2 = build_avstreamctl_hd()
+    assert len(v2) == 108, len(v2)
+    assert v2[0] == 3 and v2[1] == 2
+    assert struct.unpack_from("<H", v2, 2)[0] == 108
+    assert v2[4:8] == kcpav.MAGIC_V2
+    # v1 fields sit 8 bytes later in the v2 layout
+    assert v2[16:20] == v1[8:12], "action moved"
+    assert v2[20:24] == v1[0xc:0x10], "action byte moved"
+    assert struct.unpack_from("<I", v2, 24)[0] == kcpav.DEF_HD
+    assert build_avstreamctl_hd(definition=kcpav.DEF_SD)[24:28] == b"\x00" * 4
+    assert set(v2[28:]) == {0}, "v2 tail must be zero"
+    print("[ok] v2 AvStreamCtl: 108 B, definition word at [24:28]")
     print("ALL OK")
     return True
 

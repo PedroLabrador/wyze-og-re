@@ -148,6 +148,67 @@ def avstreamctl(action=ACT_START, id164=0, ac=0, b0=0, w160=0,
     return bytes(buf)
 
 
+# ---- the v2 / HD AvStreamCtl --------------------------------------------
+#
+# The 76-byte frame above is the 2.50.7 shape.  The 3.23.1 app sends a
+# 108-byte one, and THAT is what selects 1080p: replaying our 76-byte frame
+# always yields the 640x360 sub-stream, while the app's 108-byte frame (or
+# this reconstruction of it) yields 1920x1080 @ ~1.2 Mbps.
+#
+# Recovered by sending the app's own captured stream request (see appkcp.py)
+# to the camera through our ordinary KCP channel and bisecting:
+#
+#     * the trailing 32-hex-character token .......... irrelevant (zero it)
+#     * the tail bytes at body[60:72] ................ irrelevant (zero it)
+#     * the eight-byte v2 header ..................... REQUIRED
+#     * field offsets shifted +8 (v2 layout) ......... REQUIRED
+#     * definition word (v1 `ac`, v2 body[20:24]) .... REQUIRED
+#          2 -> 1920x1080 @ 1.2 Mbps
+#          0 ->  640x360  @ 0.26 Mbps   (the SD sub-stream)
+#          1 or 3 -> the camera stops sending anything
+#
+# So the camera picks its interpretation from the frame LENGTH and, in the v2
+# layout, from the definition word.  Only ac == 2 is known good.
+#
+# v2 wire layout (108 bytes, `03 02 6c 00` + 104-byte body):
+#
+#     [0]     3                     KCP-ctrl msg type (same as v1)
+#     [1]     2                     same flag bit as v1
+#     [2:4]   108 (u16 LE)          total length -- the branch selector
+#     [4:8]   85 9f 76 f7           constant; a random value works too
+#     [8:12]  1                     constant in every capture
+#     [12:16] obj->0x164            v1 [4:8]
+#     [16:20] action                v1 [8:12]
+#     [20:24] action byte           v1 [0xc]
+#     [24:28] definition            v1 [0x10]  <-- the quality knob
+#     [28:108] zero in every capture
+MAGIC_V2 = b"\x85\x9f\x76\xf7"
+DEF_SD = 0             # 640x360
+DEF_HD = 2             # 1920x1080
+
+
+def avstreamctl_v2(definition=DEF_HD, id164=0, action=ACT_START, size=108):
+    """The 108-byte AvStreamCtl the 3.23.1 app sends -- selects 1080p.
+
+    `definition` is the only field the camera reads for quality: 0 is the
+    640x360 sub-stream, 2 is 1920x1080.  Anything else observed (1, 3) makes
+    the camera drop the session, so this is a strict enum.
+    """
+    if size < 28:
+        raise ValueError("v2 AvStreamCtl is at least 28 bytes")
+    buf = bytearray(size)
+    buf[0] = 3
+    buf[1] = 2
+    buf[2:4] = struct.pack("<H", size)
+    buf[4:8] = MAGIC_V2
+    buf[8:12] = struct.pack("<I", 1)
+    buf[12:16] = struct.pack("<I", id164 & 0xFFFFFFFF)
+    buf[16:20] = struct.pack("<I", action & 0xFFFFFFFF)
+    buf[20:24] = struct.pack("<I", action & 0xFF)
+    buf[24:28] = struct.pack("<I", definition & 0xFFFFFFFF)
+    return bytes(buf)
+
+
 class KCP(object):
     """Minimal ikcp: enough to PUSH one message and read what comes back.
 

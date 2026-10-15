@@ -486,6 +486,10 @@ camera (**none required** — see Phase 9), and cam4 having no capture of its ow
 
 ## Phase 11 -- the resolution question (640x360 vs 1920x1080)
 
+> Phases 11–14 close this as "a client-side ceiling" and are **wrong**; the
+> answer is Phase 19 / §12d. Kept verbatim as a record of what was ruled out
+> and why the wrong conclusion looked airtight at the time.
+
 Goal after Phase 10: the app streams 1920x1080 and we stream 640x360, both at
 20 fps.  Find the byte that selects the profile.
 
@@ -975,6 +979,12 @@ AvStreamCtl exchange field by field.
 
 ## Phase 14 -- the client side is exhausted; 640x360 is the camera's decision
 
+> **Superseded by Phase 19.** The conclusion below is wrong, and the reason is
+> instructive: the v1 AvStreamCtl fields really are inert, so every experiment
+> here was correct *and* correctly reported — but the camera switches layouts
+> (and quality) on the frame's **length**, and 3.23.1 sends a 108-byte one
+> whose `definition` word selects 1080p. Read §12d of `P2P_PROTOCOL.md`.
+
 Phase 13 left one live candidate: `w160`, the only field the camera's INITREQ
 handler actually parses.  This phase tested it properly and closed it, then
 mapped the last unread frame and checked the cloud.  Nothing reachable from a
@@ -1461,6 +1471,142 @@ Not changed, deliberately: the worker's 8 s stall timeout.  Lowering it would
 recover ~3 s sooner but risks tearing down a healthy stream during a gap, and
 each teardown costs an 8–10 s re-handshake.  Revisit only with evidence that
 recovery time is the problem.
+
+---
+
+## Phase 19 — 1080p. The stream *request* was the switch, not the login
+
+Phases 11–14 concluded that 640×360 was a client-side ceiling and closed the
+question.  It was reopened twice more, and this phase closes it for real: the
+camera was always able to send 1080p, and the difference is **one 32-bit word
+in the AvStreamCtl** — the stream *request*, not the CALLING, not the token,
+not the login.
+
+### The evidence that had never existed before
+
+Phase 12–14 had to guess, because two things were invisible:
+
+1. The app's actual **camera** dialogue was never captured — `cap_relay.py`
+   sits in the *cloud* path (Mars / list-server), which is a different
+   conversation with a different peer.  Several "facts" recorded from
+   `/tmp/cap_relay_323.log` are about the cloud protocol and say nothing
+   about resolution.
+2. We could never see a KCP packet on the wire, so the AvStreamCtl's real
+   contents were unknown — `kcpav.FIELDS` was a parameter sweep over fields
+   we had to guess.
+
+Both gaps closed by capturing the phone itself: **PCAPdroid** (Android's
+VPN-API capture, no root, no LAN changes — see the recipe at the end of this
+file).  `wyze3.pcap` (13.1 MB) is 30 s of the app's live view:
+
+* the app streams **direct LAN UDP** to `192.168.77.10:55013`; the SDK does
+  **not** bypass the VPN, so the capture sees everything;
+* ~3.2 Mbps camera→app, in **our** dialect (`7ea4`, `c090`, `c010`, `7eb9`);
+* the app's CALLING is **213 bytes** where ours is 128, and its AvStreamCtl
+  is **108 bytes** where ours is 76.
+
+`pcapparse.py` reads the pcap (DLT_RAW, not Ethernet), `applan.py` splits it
+into the two flow-direction files, `appkcp.py` reassembles the app's KCP
+push stream and prints its TLVs.  That last one is what produced the fix.
+
+### What did *not* matter — every negative, so nobody repeats it
+
+| Tried | Result |
+|---|---|
+| Replay the app's 213-byte CALLING **verbatim** | still 640×360 / 267 kbps |
+| Replay it with a rewritten conv / key / IP | camera ignores it entirely |
+| The 32-hex-character token in the CALLING | irrelevant |
+| The same token inside the AvStreamCtl | irrelevant (zero it: still HD) |
+| The AvStreamCtl's trailing bytes `body[60:72]` | irrelevant |
+| The v2 header's *value* (`85 9f 76 f7`) | irrelevant (random works) |
+| `definition` = 1 or 3 | camera stops sending entirely |
+| A 76-byte or 84-byte frame carrying `definition`=2 | camera stops sending entirely |
+| Our own CALLING (128 B, 2.50.7) + the app's request | **1920×1080** [OK] |
+
+That last row is the whole answer: the CALLING was never the problem.
+
+### What mattered: a 108-byte v2 AvStreamCtl
+
+The camera picks its interpretation of an AvStreamCtl from the frame **length**,
+and the definition word lives in the v2 layout.  The complete frame is 28
+meaningful bytes plus 80 zero bytes:
+
+```
+03 02 6c 00                        TLV: linktype 3, length 108
+85 9f 76 f7 01 00 00 00            v2 header (constant)
+00 00 00 00                        obj->0x164     (v1 [4:8])
+01 00 00 00                        action = START (v1 [8:12])
+01 00 00 00                        action byte    (v1 [0xc])
+02 00 00 00                        definition     (v1 [0x10])  <-- the knob
+00 .. 00                           unchanged in every capture
+```
+
+    definition 2 -> 1920x1080 @ ~1.2 Mbps
+    definition 0 ->  640x360  @ ~0.26 Mbps   (the SD sub-stream)
+
+`kcpav.avstreamctl_v2()` builds it and `p2p_client.build_avstreamctl_hd()`
+exposes it; the bytes are byte-identical to the frame captured from the app.
+
+### A methodological trap, recorded because it cost an hour
+
+The camera holds **one session per conv**, so a probe that reuses the same
+CALLING starts colliding with its own previous session.  The symptom is
+poisonous: **two byte-identical frames produced different results** (`our7`
+gave nothing, `mintail` gave 1080p), which looks exactly like "the camera
+rejects this field" and isn't.  Rules that follow from it:
+
+* a "no media at all" result is **not** evidence on its own — re-run it;
+* only re-running with spacing isolates a real rejection;
+* rewriting the CALLING to get a fresh conv does **not** work (the camera
+  ignores a re-signed frame), so probes are inherently serialized;
+* the trustworthy signals are `1920x1080` (positive) and `640x360` (the
+  camera's own fallback), never zero.
+
+### Product changes
+
+* `CameraStream(..., definition=2)` sends the v2 request; `definition=None`
+  keeps the old 76-byte frame.  **Default is now HD.**
+* A camera that refuses the HD request answers with *no media*, not with SD,
+  so the worker counts empty runs and falls back to definition 0 only after
+  `HD_RETRIES` (3) of them — a single transient collision must not silently
+  pin a camera to 640×360 for the rest of the run.  `WYZE_DEFINITION=2|0`
+  overrides the starting value.
+* `WYZE_WIDTH` now defaults to **1280** instead of 640.  Four native 1080p
+  JPEG encodes pin the CPU, and a saturated encoder *is* user-visible delay:
+
+  | WYZE_WIDTH | idle | fps (4 cams) | JPEG traffic |
+  |---|---|---|---|
+  | 0 (native 1920×1080) | ~10 % | 15.5–21.2, jittery | ~20 MB/s |
+  | 1280×720 | ~66 % | ~20–23, steady | ~9 MB/s |
+  | 960×540 | ~54 % | ~20.2–20.6, steady | ~7 MB/s |
+
+  1280 is 4× the pixels of the old 640×360 for ~2.5× the bytes.
+  `WYZE_WIDTH=0` restores native 1080p.
+
+Verified with all four cameras streaming **1920×1080** at once through the
+full product path (server → ffmpeg → `/feed` → canvas), and per-camera with
+our own CALLING via `ctlsweep.py`.
+
+### Reproduction, from zero
+
+```
+# 1. capture the app's LAN dialogue (phone must be showing live view)
+adb install -r PCAPdroid_v2.0.2.apk
+adb shell am start -e action start -e pcap_dump_mode pcap_file \
+  -e pcap_name wyze.pcap -e app_filter com.hualai \
+  -n com.emanuelef.remote_capture/.activities.CaptureCtrl
+python3 adtap.py 14                 # tap the Spanish consent/VPN dialogs
+# ...watch the app... then:
+adb shell am start -e action stop -n com.emanuelef.remote_capture/.activities.CaptureCtrl
+adb pull /sdcard/Download/PCAPdroid/wyze.pcap /tmp/
+# 2. pull the app's stream request out of it
+python3 pcapparse.py /tmp/wyze.pcap
+python3 applan.py    /tmp/wyze.pcap
+python3 appkcp.py a2c               # prints the linktype-3 AvStreamCtl
+# 3. confirm against a live camera
+python3 ctlsweep.py <tid> 9 45 mintail
+python3 ctlsweep.py <tid> 9 45 ours
+```
 
 `SECRETS.md` holds the OAuth `client_id` / `client_secret` and the checklist.
 

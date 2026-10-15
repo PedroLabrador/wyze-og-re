@@ -1855,6 +1855,9 @@ The profile the session *starts* with is declared earlier and separately:
 **Sending this frame does not change our cameras' resolution** — verified in
 six KCP framings (see `defprobe.py` and JOURNAL Phase 11).  It is documented
 here because the format is correct, not because the experiment succeeded.
+The mechanism that *does* work is in §12d — and note that `changeDefinition`'s
+`def` values (`2 = HD, 1 = SD, 0 = auto`) line up with the AvStreamCtl
+definition word, so the two are almost certainly the same enum.
 
 ### 12c. AvStreamCtl's real send path and length field
 
@@ -1883,4 +1886,50 @@ The camera's own AvStreamCtl replies are **parameterless** — four arrive per
 session and every byte except `[0]=3`, `[2:4]=0x004c` and `[8:12]=action`
 (2, 6, 2, 6) is zero.  Those fields therefore cannot be how resolution is
 negotiated, and sweeping them changes nothing (`sweepprobe.py`).
+
+That last conclusion was **wrong**, and §12d corrects it: 2.50.7's *outgoing*
+AvStreamCtl is 76 bytes and parameterless in the fields we knew, but 3.23.1
+sends a **108-byte** one whose length is exactly how the camera decides which
+layout — and which quality — to use.
+
+### 12d. The v2 AvStreamCtl — the actual resolution switch  [SOLVED]
+
+Captured from the phone with PCAPdroid (`wyze3.pcap`; `pcapparse.py` +
+`applan.py` + `appkcp.py`).  The 3.23.1 app's stream request, reassembled out
+of its KCP push stream, is linktype 3 and **108 bytes** where ours is 76:
+
+```
+03 02 6c 00                        TLV: linktype 3, length 108  <- the selector
+85 9f 76 f7 01 00 00 00            v2 header  (value is irrelevant)
+00 00 00 00                        obj->0x164        v1 [4:8]
+01 00 00 00                        action = START    v1 [8:12]
+01 00 00 00                        action byte       v1 [0xc]
+02 00 00 00                        definition        v1 [0x10]
+00 .. 00                           zero in every capture (80 bytes)
+```
+
+Everything after the definition is zero in the capture, and the trailing
+32-hex-character token the app also appends is **not** needed.  Ground truth:
+
+| definition | camera output |
+|---|---|
+| 2 | 1920×1080 @ ~1.2 Mbps |
+| 0 | 640×360 @ ~0.26 Mbps |
+| 1 or 3 | camera stops sending entirely |
+
+So the word at v1 `[0x10]` (`obj->0xac` in the 2.50.7 code, which §12c lists
+as merely copied) is the **quality selector**, and it only takes effect in the
+v2 layout — a 76- or 84-byte frame carrying `definition=2` kills the session.
+
+Confirmed to work with our own 128-byte 2.50.7 CALLING, i.e. the CALLING is
+not involved: `ctlsweep.py <tid> 9 45 mintail` → 1920×1080.
+
+Implemented as `kcpav.avstreamctl_v2()` / `p2p_client.build_avstreamctl_hd()`,
+and `CameraStream(definition=…)` sends it.
+
+**Probe hygiene.** The camera keeps one session per conv, so two probes sharing
+a CALLING collide.  A collision and a rejection both look like "no media", and
+two byte-identical frames were once observed to give different answers.  Never
+conclude anything from a single zero-media run; only `1920x1080` and `640x360`
+are trustworthy single-shot signals.
 

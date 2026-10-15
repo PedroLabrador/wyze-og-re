@@ -107,6 +107,14 @@ JPEG_EOI = b"\xff\xd9"
 # than half a second behind the camera.
 MAX_LAG = 0.5
 
+# The stream request (AvStreamCtl) can ask the camera for either its 1080p
+# profile (definition 2) or the 640x360 sub-stream (0).  A camera that refuses
+# the HD request answers with no media at all, not with the SD fallback, so a
+# run that produced zero bytes of H.264 is the signal to try again -- and only
+# after this many consecutive empty runs is the camera treated as SD-only.
+# Override the starting value with WYZE_DEFINITION.
+HD_RETRIES = 3
+
 # The camera sends G.711 mu-law, one byte per sample.  Every audio AV frame
 # carries exactly 320 samples and its u32 timestamp advances 20000 us
 # (measured: 377 of 487 successive gaps were exactly 0x4e20, and the whole
@@ -207,6 +215,15 @@ class CameraStreamThread(threading.Thread):
         self._stop = threading.Event()
         self._on_status = on_status
         self._log = []
+        # 2 = the camera's 1080p profile, 0 = its 640x360 sub-stream.  The
+        # definition lives in the 108-byte v2 AvStreamCtl (kcpav.avstreamctl_v2).
+        # If a camera refuses the HD request (no media at all) the worker
+        # drops to SD for good rather than re-asking forever.
+        try:
+            self.definition = int(os.environ.get("WYZE_DEFINITION", "2"))
+        except ValueError:
+            self.definition = 2
+        self.hd_fails = 0
 
     # -- helpers -----------------------------------------------------------
     def log(self, msg):
@@ -308,13 +325,22 @@ class CameraStreamThread(threading.Thread):
         # half a minute.
         st = CameraStream(self.camera["ip"], self.camera["p2p_port"],
                           self.camera["tid"], self.camera["calling"],
-                          local_port=0, timeout=12.0, on_log=self.log)
+                          local_port=0, timeout=12.0, on_log=self.log,
+                          definition=self.definition)
+        # The camera is now asked for its 1080p profile, so the frames that
+        # arrive are 1920x1080.  Encoding four of those to JPEG every frame
+        # pins the CPU (measured: ~10 % idle at native vs ~54 % at 960 and
+        # ~66 % at 1280) and a saturated encoder IS user-visible delay, so the
+        # default scales down to 1280 wide -- still 4x the pixels of the old
+        # 640x360, at only ~2.5x the bytes.  WYZE_WIDTH=0 keeps the camera's
+        # native 1920x1080 for maximum sharpness; any other width scales.
+        width = int(os.environ.get("WYZE_WIDTH", "1280"))
+        vf = ["-vf", "scale=%d:-2" % width] if width > 0 else []
         ff = subprocess.Popen(
             ["ffmpeg", "-loglevel", "error",
              "-probesize", "32", "-analyzeduration", "0",
              "-f", "h264", "-i", "pipe:0",
-             "-an",
-             "-vf", "scale=%d:-2" % int(os.environ.get("WYZE_WIDTH", 640)),
+             "-an"] + vf + [
              "-f", "mjpeg", "-q:v", "5", "pipe:1"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE)
@@ -368,6 +394,7 @@ class CameraStreamThread(threading.Thread):
                                  name="drain-%s" % self.camera["tid"])
         drain.start()
 
+        h264_before = self.stats["h264"]
         st.start()  # handshake + KCP up + AvStreamCtl
 
         # Single pump loop: feed video AND audio from one CameraStream
@@ -417,6 +444,22 @@ class CameraStreamThread(threading.Thread):
                 drain.join(timeout=2.0)
             except Exception:
                 pass
+            # An AvStreamCtl the camera dislikes leaves us with NO media at
+            # all, not the SD fallback -- so a run that produced zero bytes of
+            # H.264 is the signal to retry, and only a few consecutive such
+            # runs mean the camera will not do HD.
+            if self.stats["h264"] != h264_before:
+                self.hd_fails = 0            # this session produced video
+            elif self.definition != 0:
+                self.hd_fails += 1
+                if self.hd_fails >= HD_RETRIES:
+                    self.log("definition=%d gave no video %d times -- using "
+                             "the SD sub-stream (640x360)"
+                             % (self.definition, self.hd_fails))
+                    self.definition = 0
+                else:
+                    self.log("definition=%d gave no video (attempt %d/%d)"
+                             % (self.definition, self.hd_fails, HD_RETRIES))
             self.set_status("reconnecting")
 
     def _discover(self):
