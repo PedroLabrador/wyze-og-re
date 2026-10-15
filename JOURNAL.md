@@ -1319,6 +1319,90 @@ now wired once, guarded by `dataset.wired`.
 * The tile footer shows `fps · frames · lag ms · -dropped`, so a viewer can
   see whether a sluggish picture is our queueing or the browser's decoding.
 
+## Phase 17 — the delay was the browser's connection budget *(the last hop)*
+
+Phase 16 proved the camera→server path costs ~82 ms and that the server writes
+immediately (`served == pub`, 1.13 s of writes in 28 min).  Two complaints were
+still open and turned out to be **the same bug**:
+
+* "sometimes state endpoint ends in pending, it just queues a lot of requests,
+  and all of them stack in pending"
+* "jpg button didn't work / took minutes"
+
+### The cause: six connections per origin
+
+Chrome allows only **six** HTTP/1.1 connections to one origin.  The page used
+one `GET /stream/<tid>.mjpg` per camera, and those sockets never close, so four
+powered-on cameras held four slots permanently.  Switch sound on and each
+camera's `<audio>` held another.  A `POST /api/discover`, a `/api/state` poll or
+the snapshot's `<a download>` then had nothing left to run on and sat in
+"pending" until some stream ended — which, for a live MJPEG socket, is never.
+the delay on screen was therefore not transport, decoder or server
+queueing: it was the browser replaying/starving on a saturated pool.
+
+### The fix: one connection for every camera
+
+New `GET /feed` multiplexes all cameras onto a **single** fetch stream, framed
+as a 20-byte header then the JPEG::
+
+    <Q tid   u64   camera id
+    <Q t_ms  u64   publish time, epoch milliseconds
+    <I len   u32   JPEG size
+
+Binary rather than multipart so the client slices frames with a `DataView` and
+never scans for a boundary.  The page reads it with
+`fetch().body.getReader()` and paints each camera into its own `<canvas>`
+(`<img>` cannot be fed from JS).  Socket cost is now **1 feed + one `<audio>`
+per camera you actually switch on**, so the pool is essentially empty and
+`/api/state` can no longer queue.  Polling also went 2 s → 2.5 s.
+
+Per-camera latency is now bounded *at the painting layer too*: `slot` holds only
+the **newest** frame per camera, overwriting rather than queueing, so a slow
+decode drops frames instead of building the backlog `MAX_LAG` exists to
+prevent.
+
+### The snapshot button no longer touches the network
+
+It is now `canvas.toBlob()` on the frame already on screen, downloaded via a
+`blob:` URL.  No HTTP request at all, which is why it can no longer hang: the
+old `<a download href="/snapshot/...">` needed a free connection that never
+came.  `/snapshot/<tid>.jpg` is kept on the server for scripting.
+
+### The delay is now measurable *in the browser*
+
+`X-Time` on a multipart part is unreadable to JS, so the browser could never see
+its own contribution.  Now the page subtracts the header's publish time from
+`Date.now()` and prints the result in each tile's footer — the true end-to-end
+delay, published → painted.  Server and browser share a clock here, so the
+number is direct rather than estimated.
+
+Measured by `httptest.py` against a live camera: **3–50 ms** end-to-end
+(`end-to-end age of the newest local camera frame`).  If the picture
+still feels behind while that footer reads single/two-digit ms, the remaining
+delay is inside the camera or the browser's compositor, not in our code.
+
+### A mistake worth recording
+
+The first `/feed` implementation **forgot to append the JPEG bytes** after the
+header (`out += j`).  The symptom was deceptive: the server looked healthy and
+burned 12.8 % CPU, but the page never painted because the parser kept waiting
+for payload that was never sent (`frames ok=0`, 20 bytes per frame).  Two
+`httptest.py` runs hung for 30 s on it before `curl` showed the byte rate
+collapsing to 12 kB per 15 s.  Fixed; a `feedtest.js` now guards exactly this.
+
+### Tests
+
+* `httptest.py` — page, `/api/state`, `/feed` framing (ok/bad/cameras/age),
+  `/stream`, `/audio?gain=32`, JS parses, ids referenced by
+  `getElementById` all exist, and no regression back to `<img>` per camera.
+* `feedtest.js` (**new**) — pulls the page's own `parseFeed()` out of the served
+  `<script>` and runs it against a 24-frame, 4-camera synthetic stream at chunk
+  sizes 1, 2, 7, 19, 20, 21, 1024, 65536 and "everything at once"; plus a
+  header split in half, a truncated tail, and a corrupt 4 GB length that must
+  resync instead of throwing.  This is the only real guard on the framing,
+  because there is no browser on this machine.
+* `lagtest.py` (slow/fast), `verifyfix.py`, `camclock.py`, `fflag.py` unchanged.
+
 `SECRETS.md` holds the OAuth `client_id` / `client_secret` and the checklist.
 
 

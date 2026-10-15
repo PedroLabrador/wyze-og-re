@@ -3,13 +3,20 @@
 
 Checks:
   * /            serves the page, and the old emoji entities are gone
+  * /            page <script> parses (node --check) and every getElementById
+                 prefix has a matching id in the markup
   * /api/state   lists a camera
+  * /feed        one connection carrying every camera, framed <Q tid><Q ms>
+                 <I len> + JPEG
   * /stream/..   multipart MJPEG with a JPEG SOI inside
   * /audio/..    WAV header == PCM1, 1 ch, 16000 Hz, 16 bit, then PCM data
 
 Usage: python3 -u httptest.py [port]
 """
 import json
+import os
+import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -71,6 +78,54 @@ def main():
         print("   gain selector present: %s" % ('id="gain"' in html))
         print("   'textContent =' entity bug present: %s"
               % ("textContent = '&#" in html))
+        # Regression guards for the connection-pool fix: the page must not go
+        # back to one MJPEG socket (<img>) per camera.
+        print("   video rendered to canvas, not <img>: %s"
+              % ('id="view' in html and 'id="img' not in html))
+        print("   one video connection via fetch('/feed'): %s"
+              % ("fetch('/feed" in html))
+        print("   snapshot taken from the canvas: %s"
+              % ("cv.toBlob" in html))
+
+        # -- page JavaScript ------------------------------------------------
+        # No browser is available here, so these are the two cheap guards: the
+        # page's <script> must parse, and every getElementById('x'+tid) must
+        # have an id="x..." somewhere in the served markup.
+        m = re.search(r"<script>\n(.*?)\n</script>", html, re.S)
+        if not m:
+            print("   !! no <script> block found")
+        elif not shutil.which("node"):
+            print("   node not installed; skipped JS syntax check")
+        else:
+            js_path = os.path.join(HERE, "_page.js")
+            with open(js_path, "w") as fh:
+                fh.write(m.group(1))
+            p = subprocess.run(["node", "--check", js_path],
+                               capture_output=True, text=True)
+            print("   JS parses (node --check): %s %s"
+                  % (p.returncode == 0, p.stderr.strip()[:200]))
+            # Exercise the page's own feed parser (feedtest.js pulls the
+            # function out of the served script) -- the framing is now the
+            # single point of failure for ALL video on the page.
+            ft = os.path.join(os.path.dirname(HERE), "feedtest.js")
+            if os.path.exists(ft):
+                q = subprocess.run(["node", ft, js_path],
+                                   capture_output=True, text=True, timeout=60)
+                lines = [x for x in q.stdout.splitlines() if x.strip()]
+                print("   feed framing test: %s  %s"
+                      % (q.returncode == 0,
+                         lines[-1].strip() if lines else q.stderr.strip()[:150]))
+                if q.returncode != 0:
+                    print(q.stdout)
+            os.unlink(js_path)
+            ids = set(re.findall(r'id="([A-Za-z]+)', html))
+            ids |= set(re.findall(r"\.id = '([A-Za-z]+)'", m.group(1)))
+            used = set(re.findall(r"getElementById\('([A-Za-z]+)'", m.group(1)))
+            missing = sorted(used - ids)
+            print("   getElementById prefixes %s -> ids present: %s"
+                  % (sorted(used), not missing))
+            if missing:
+                print("   !! no element id starts with: %s" % ", ".join(missing))
 
         # -- state ---------------------------------------------------------
         st, hdr, body = get("/api/state")
@@ -83,6 +138,36 @@ def main():
             return 0
         tid = str(tids[0])
         print("   using tid %s" % tid)
+
+        # -- feed: every camera multiplexed onto ONE connection -------------
+        # This is what keeps the page inside the browser's six-connection
+        # per-origin budget, so the framing has to be exactly right.
+        r = urllib.request.urlopen("http://127.0.0.1:%d/feed" % PORT,
+                                   timeout=30)
+        print("\nGET /feed      -> %d  %s"
+              % (r.status, r.headers.get("Content-Type")))
+        raw = r.read(400000)
+        r.close()
+        ok = bad = 0
+        seen, age = set(), None
+        off = 0
+        while off + 20 <= len(raw):
+            ftid, fms, flen = struct.unpack_from("<QQI", raw, off)
+            if flen > (4 << 20) or off + 20 + flen > len(raw):
+                break
+            jpg = raw[off + 20:off + 20 + flen]
+            if jpg[:2] == b"\xff\xd8" and jpg[-2:] == b"\xff\xd9":
+                ok += 1
+                seen.add(ftid)
+                if ftid == int(tid):
+                    age = time.time() * 1000.0 - fms
+            else:
+                bad += 1
+            off += 20 + flen
+        print("   frames ok=%d bad=%d cameras=%d  bytes used=%d/%d"
+              % (ok, bad, len(seen), off, len(raw)))
+        print("   end-to-end age of the newest local camera frame: %s"
+              % ("%.0f ms" % age if age is not None else "n/a"))
 
         # -- mjpeg ---------------------------------------------------------
         st, hdr, body = get("/stream/%s.mjpg" % tid, n=400000, timeout=25)

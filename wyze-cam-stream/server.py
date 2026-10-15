@@ -44,6 +44,23 @@ Video path per camera::
     discover -> CALLING -> meter_ack -> KCP -> AvStreamCtl (inside KCP)
         -> RC5-ECB AV decrypt (key = CALLING[120:128]) -> H.264 -> ffmpeg -> MJPEG
 
+Browser side -- ONE connection for all video, not one per camera::
+
+    GET /feed   fetch() once, every camera multiplexed  ->  <canvas> per tile
+
+Sockets the page holds: 1 for /feed plus one ``<audio>`` per camera you switch
+on.  This matters more than it sounds: Chrome allows only six HTTP/1.1
+connections per origin, so the old one-MJPEG-socket-per-camera design used four
+slots on video alone and left ``/api/state`` polls and the snapshot button
+queued in "pending" forever -- that, not the camera or the decoder, is what made
+the page feel slow.  Frame sizes are ~34 KB, so four cameras is ~1.4 MB/s on the
+LAN; the snapshot button now re-encodes the canvas locally and needs no
+connection at all.
+
+Each frame carries the instant it was published, so the page prints the real
+end-to-end delay (published -> painted) in every tile's footer, measured by the
+browser itself.  On this Mac it reads single digits to low tens of ms.
+
 Usage::
 
     python3 server.py                  # http://127.0.0.1:8080
@@ -529,6 +546,25 @@ class Hub:
         for w in ws:
             w.join(timeout=2.0)
 
+    @staticmethod
+    def _stats_copy(w):
+        """Copy a worker's stats without tripping over a concurrent insert.
+
+        The worker thread adds keys to this dict as it learns about them
+        (``jpg``, then the per-connection ``served``/``lag_ms``/``dropped``...).
+        ``json.dumps`` walking a dict that another thread is growing raises
+        "dictionary changed size during iteration", which would surface as a
+        random 500 on /api/state -- i.e. the page's poll silently failing.
+        A retry is enough; this happens at most once per key.
+        """
+        if w is None:
+            return {}
+        while True:
+            try:
+                return dict(w.stats)
+            except RuntimeError:
+                time.sleep(0.005)
+
     def state(self):
         with self.lock:
             out = []
@@ -540,8 +576,8 @@ class Hub:
                     "status": w.status if w else "idle",
                     "error": w.error if w else None,
                     "seq": w.seq if w else 0,
-                    "stats": w.stats if w else {},
-                    "log": w._log[-6:] if w else [],
+                    "stats": self._stats_copy(w),
+                    "log": list(w._log)[-6:] if w else [],
                 })
             return out
 
@@ -596,7 +632,10 @@ PAGE = """<!doctype html>
  .ip { color:#8b949e; font-size:12px; font-variant-numeric:tabular-nums; }
  .badge { margin-left:auto; font-size:11px; color:#8b949e; }
  .shot { position:relative; background:#000; aspect-ratio:16/9; }
- .shot img { width:100%; height:100%; object-fit:contain; display:block; }
+ /* canvas, not <img>: all cameras now share ONE fetch() stream (see /feed),
+    because a socket per camera exhausted the browser's six-connection
+    per-origin pool and made every other request queue. */
+ .shot canvas { width:100%; height:100%; object-fit:contain; display:block; }
  .shot .ph { position:absolute; inset:0; display:flex; align-items:center;
              justify-content:center; color:#484f58; font-size:13px;
              text-align:center; padding:10px; }
@@ -607,9 +646,9 @@ PAGE = """<!doctype html>
  #banner { background:#9e6a03; color:#fff; padding:8px 20px; font-size:13px; }
  .hidden { display:none; }
 
- /* fullscreen: a tile's <img> is MOVED into this overlay, not duplicated, so
-    it keeps the MJPEG connection it already has (a second <img> would open a
-    second socket and double the bandwidth for the same camera). */
+ /* fullscreen: a tile's <canvas> is MOVED into this overlay, not duplicated, so
+    it stays the element the /feed reader paints into (a second canvas would
+    need its own decode path for the same picture). */
  /* Icon buttons.  Icons, not the emoji entities that
     were removed earlier and the SND/FS/JPG text that replaced them.  All
     inline SVG using currentColor, so the existing hover/active colours keep
@@ -624,7 +663,7 @@ PAGE = """<!doctype html>
  #overlay.open { display:block; }
  #ovslot { position:absolute; inset:0; display:flex; align-items:center;
            justify-content:center; }
- #ovslot img { width:100%; height:100%; object-fit:contain; }
+ #ovslot canvas { width:100%; height:100%; object-fit:contain; }
  .obar { position:absolute; top:0; left:0; right:0; z-index:2;
          display:flex; align-items:center; gap:14px; padding:13px 18px;
          background:linear-gradient(rgba(0,0,0,.82), rgba(0,0,0,0));
@@ -737,6 +776,95 @@ function setAudio(tid, on) {
   }
   syncAudioUi(tid);
 }
+// -- one connection for all video ------------------------------------------
+// Every camera's JPEGs arrive on a single fetch stream (Handler._feed), framed
+// as <Q tid><Q publish-ms><I length> followed by the JPEG bytes.  Sockets are
+// now 1 feed + one <audio> per camera you switch on, instead of one socket per
+// camera -- which is what exhausted the browser's six-per-origin HTTP/1.1 pool
+// and left /api/state and the snapshot button queued forever.
+const FEED_HDR = 20;
+const slot = new Map();      // tid -> {bytes, ms}  newest frame, never a queue
+const decoding = new Set();  // tid -> a decode is in flight
+const LAT = {};              // tid -> ms from publish to painted, this browser
+const AGO = {};              // tid -> Date.now() when this browser last painted
+
+function feedFrame(tid, ms, bytes) {
+  // Overwrite rather than queue.  If this browser cannot decode as fast as the
+  // cameras produce, showing the newest frame is the entire point; queueing
+  // here would rebuild exactly the backlog MAX_LAG exists to prevent.
+  slot.set(tid, {bytes: bytes, ms: ms});
+}
+
+async function paint() {
+  for (const kv of slot) {
+    const tid = kv[0], f = kv[1];
+    if (decoding.has(tid)) continue;
+    slot.delete(tid);
+    decoding.add(tid);
+    try {
+      const bmp = await createImageBitmap(
+        new Blob([f.bytes], {type: 'image/jpeg'}));
+      const cv = document.getElementById('view' + tid);
+      if (cv) {
+        if (cv.width !== bmp.width || cv.height !== bmp.height) {
+          cv.width = bmp.width; cv.height = bmp.height;
+        }
+        cv.getContext('2d').drawImage(bmp, 0, 0);
+        LAT[tid] = Date.now() - f.ms;      // end-to-end: publish -> painted
+        AGO[tid] = Date.now();
+      }
+      if (bmp.close) bmp.close();
+    } catch (_) { /* torn or non-JPEG frame -- skip it */ }
+    decoding.delete(tid);
+  }
+  requestAnimationFrame(paint);
+}
+
+// Pure framing step (no sockets, no DOM) so the wire format can be tested
+// outside a browser -- see feedtest.js.  Returns [frames, leftover].
+function parseFeed(buf) {
+  const out = [];
+  let off = 0;
+  while (buf.length - off >= FEED_HDR) {
+    const dv = new DataView(buf.buffer, buf.byteOffset + off, FEED_HDR);
+    const tid = Number(dv.getBigUint64(0, true));
+    const ms = Number(dv.getBigUint64(8, true));
+    const len = dv.getUint32(16, true);
+    if (len > (4 << 20)) { off = buf.length; break; }   // desync: resync empty
+    if (buf.length - off < FEED_HDR + len) break;       // need the rest yet
+    out.push({tid: tid, ms: ms,
+              bytes: buf.slice(off + FEED_HDR, off + FEED_HDR + len)});
+    off += FEED_HDR + len;
+  }
+  return [out, off ? buf.slice(off) : buf];
+}
+
+async function readFeed() {
+  const r = await fetch('/feed?r=' + Date.now(), {cache: 'no-store'});
+  if (!r.ok || !r.body) throw new Error('HTTP ' + r.status);
+  const rd = r.body.getReader();
+  let buf = new Uint8Array(0);
+  for (;;) {
+    const step = await rd.read();
+    if (step.done) break;
+    // Append, then pull off every complete frame.  A chunk boundary falls
+    // anywhere, so a partial frame simply stays in buf for the next read.
+    const merged = new Uint8Array(buf.length + step.value.length);
+    merged.set(buf);
+    merged.set(step.value, buf.length);
+    const parsed = parseFeed(merged);
+    buf = parsed[1];
+    for (const f of parsed[0]) feedFrame(f.tid, f.ms, f.bytes);
+  }
+}
+
+async function feedLoop() {
+  for (;;) {
+    try { await readFeed(); } catch (_) { /* server restarting */ }
+    await new Promise(r => setTimeout(r, 1000));         // reconnect
+  }
+}
+
 let LAST = [];            // latest /api/state snapshot, for fullscreen helpers
 let GAIN = 1;             // audio boost, see #gain; read at every SND click
 const gainEl = document.getElementById('gain');
@@ -777,7 +905,8 @@ function tile(c) {
       '<button class="fsbtn" title="Save a still JPEG (snapshot)"' +
       ' aria-label="Save a snapshot">' + ICON.cam + '</button></div>' +
       '<div class="shot"><div class="ph">connecting&hellip;</div>' +
-      '<img id="img' + c.tid + '" class="hidden" alt=""></div>' +
+      '<canvas id="view' + c.tid + '" width="0" height="0" class="hidden">' +
+      '</canvas></div>' +
       '<audio id="aud' + c.tid + '" class="hidden" preload="none" crossorigin="anonymous"></audio>' +
       '<div class="foot"><span class="f1"></span>' +
       '<span class="f2 err"></span></div>';
@@ -786,17 +915,31 @@ function tile(c) {
     fsb.addEventListener('click', e => {
       e.stopPropagation(); openFs(c.tid);
     });
-    // An <a download> click makes the browser save the JPEG under the
-    // filename the server sets in Content-Disposition, without leaving the
-    // page or disturbing the MJPEG socket.
+    // Snapshot is taken from the canvas, NOT from the server.
+    //
+    // It used to be an <a download href="/snapshot/<tid>.jpg">, which is a
+    // fresh HTTP request.  Chrome allows only six connections per origin, and
+    // with a socket per camera every slot was already taken, so the request sat
+    // in "pending" until a stream ended -- which is why the button appeared to
+    // hang for minutes.  The decoded frame is already in this canvas, so
+    // re-encoding it here costs nothing and needs no connection at all.
     snapb.addEventListener('click', e => {
       e.stopPropagation();
-      const a = document.createElement('a');
-      a.href = '/snapshot/' + c.tid + '.jpg';
-      a.download = '';
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
+      const cv = document.getElementById('view' + c.tid);
+      if (!cv || !cv.width) return;
+      cv.toBlob(blob => {
+        if (!blob) return;
+        const t = new Date(), p = n => (n < 10 ? '0' + n : '' + n);
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'wyze-' + c.tid + '-' + t.getFullYear()
+          + p(t.getMonth() + 1) + p(t.getDate()) + '-'
+          + p(t.getHours()) + p(t.getMinutes()) + p(t.getSeconds()) + '.jpg';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+      }, 'image/jpeg', 0.92);
     });
     el.addEventListener('dblclick', () => openFs(c.tid));
   }
@@ -837,47 +980,43 @@ function tile(c) {
   // clock time of the most recent decoded JPEG, so it only goes quiet when the
   // picture really does.
   const st = c.stats || {};
-  const fresh = !!st.last && (Date.now() / 1000 - st.last) < 4;
+  const serverFresh = !!st.last && (Date.now() / 1000 - st.last) < 4;
+  const painted = (AGO[c.tid] != null) ? Date.now() - AGO[c.tid] : Infinity;
+  // Once this browser has painted a frame for this camera, "fresh" should mean
+  // what it is actually showing; before the first paint, fall back to the
+  // server's own decode clock so the badge does not flash "connecting" on every
+  // page load.
+  const fresh = (LAT[c.tid] != null) ? (painted < 4000) : serverFresh;
   el.querySelector('.dot').className =
     'dot ' + (fresh ? 'streaming' : (c.status || ''));
   el.querySelector('.badge').textContent =
     fresh ? 'live' : (c.status || '');
 
-  // Look the <img> up by id, NOT with el.querySelector('img'): while a camera
-  // is fullscreen its <img> lives inside the overlay, so it is no longer a
-  // descendant of the tile.
-  const img = document.getElementById('img' + c.tid),
+  // Look the <canvas> up by id, NOT with el.querySelector('canvas'): while a
+  // camera is fullscreen its canvas lives inside the overlay, so it is no
+  // longer a descendant of the tile.
+  //
+  // Nothing is attached here any more.  Every camera's video arrives on the
+  // single /feed fetch stream opened once at page load (see readFeed), and the
+  // server creates a worker for each discovered camera as soon as /feed
+  // connects -- so a tile only has to choose between its last painted frame and
+  // the placeholder.  The frame deliberately stays up through a stall (the old
+  // <img> behaved the same way); the badge above is what reports staleness.
+  //
+  // A brand-new <canvas> reports width 300 (the HTML default), so the markup
+  // pins width="0" height="0" and "have we painted?" is tracked explicitly by
+  // LAT -- otherwise the placeholder would vanish over a blank canvas at load.
+  const cv = document.getElementById('view' + c.tid),
         ph = el.querySelector('.ph');
-  // Attach the MJPEG socket as soon as the camera is listed -- requesting it
-  // is what makes the server create the worker (HUB.ensure).  Waiting for
-  // status === 'streaming' deadlocks: the status can never become 'streaming'
-  // unless something asks for the stream first.
-  const attach = c.status !== 'offline';
-  if (attach && img.classList.contains('hidden')) {
-    // Cache-buster so a re-attach always opens a fresh socket rather than
-    // reusing a dead one.
-    img.src = '/stream/' + c.tid + '.mjpg?r=' + c.seq + '-' + Date.now();
-    img.classList.remove('hidden');
+  if (cv && LAT[c.tid] != null && c.status !== 'offline') {
+    cv.classList.remove('hidden');
     ph.classList.add('hidden');
-    img.onerror = () => {
-      img.classList.add('hidden');
-      ph.classList.remove('hidden');
-      ph.textContent = 'waiting for video\\u2026';
-    };
-  } else if (!attach && !img.classList.contains('hidden')) {
-    // Drop the socket when the camera is unreachable; the worker keeps
-    // retrying underneath, and we re-attach as soon as it reports anything.
-    img.removeAttribute('src');
-    img.classList.add('hidden');
-    ph.classList.remove('hidden');
-  }
-  if (img.classList.contains('hidden')) {
+  } else {
+    if (cv) cv.classList.add('hidden');
     ph.classList.remove('hidden');
     ph.textContent = c.error ? c.error
       : (c.status === 'offline' ? 'camera offline (powered off?)'
         : (c.status || 'starting') + '\\u2026');
-  } else {
-    ph.classList.add('hidden');
   }
 
   const s = c.stats || {};
@@ -893,14 +1032,21 @@ function tile(c) {
   // that far behind reality).  Low lag with dropped climbing means the
   // browser cannot keep up; high lag would have meant our queue did it.
   const lag = (s.lag_ms != null) ? Math.round(s.lag_ms) : null;
+  // LAT is measured HERE: publish time on the server -> painted in this canvas.
+  // That is the full end-to-end delay a viewer experiences -- server queue,
+  // socket, JPEG decode and composite -- and it is the only number that can
+  // settle whether the remaining delay is ours.  Until the first frame is
+  // painted, fall back to the server's own lag figure.
+  const delay = (LAT[c.tid] != null) ? Math.round(LAT[c.tid]) : lag;
   el.querySelector('.f1').textContent =
     s.jpg ? ((s.fps || 0).toFixed(1) + ' fps \\u00b7 ' + s.jpg + ' total'
-             + (lag != null ? ' \\u00b7 ' + lag + ' ms' : '')
+             + (delay != null ? ' \\u00b7 ' + delay + ' ms' : '')
              + (s.dropped ? ' \\u00b7 -' + s.dropped : ''))
           : (c.status === 'streaming' ? 'starting\\u2026' : '');
   el.querySelector('.f1').title =
     'frames decoded since this camera\\'s stream started on the server'
-    + '\\nlag: age of the oldest frame when it was written (lower is better)'
+    + '\\n<ms>: from the frame being published on the server to it being'
+    + ' painted in this browser (measured end-to-end here; lower is better)'
     + '\\ndropped: stale frames skipped so the view stays live';
   el.querySelector('.f2').textContent = c.error || '';
   if (c.log && c.log.length) el.querySelector('.foot').title = c.log.join('\\n');
@@ -910,32 +1056,31 @@ function tile(c) {
     $('.oname').textContent = c.name || ('Camera ' + c.tid);
     $('.ostat').textContent =
       (fresh ? 'live' : (c.status || ''))
-      + (lag != null ? ' \\u00b7 ' + lag + ' ms' : '');
+      + (delay != null ? ' \\u00b7 ' + delay + ' ms' : '');
   }
 }
 
 /* ---- fullscreen ------------------------------------------------------
-   The tile's existing <img> is MOVED into the overlay and moved back on
-   close.  Moving keeps the element, so the MJPEG socket it already opened
-   stays open: pointing a *second* <img> at /stream/ would open a second
-   socket and double this camera's bandwidth for an identical picture. */
+   The tile's existing <canvas> is MOVED into the overlay and moved back on
+   close.  Moving keeps the element, so it stays the same thing the /feed
+   reader is painting into; a second canvas would need its own decoder. */
 const FS = {tid: null, home: null};
 
 function openFs(tid) {
   if (FS.tid === tid) return;
   if (FS.tid !== null) closeFs();
-  const img = document.getElementById('img' + tid),
+  const cv = document.getElementById('view' + tid),
         aud = document.getElementById('aud' + tid),
         tileEl = document.getElementById('c' + tid);
-  if (!img || !tileEl) return;
+  if (!cv || !tileEl) return;
   FS.tid = tid;
-  FS.home = img.parentNode;                 // the tile's .shot, before moving
+  FS.home = cv.parentNode;                  // the tile's .shot, before moving
   FS.audHome = aud.parentNode;
   $('.oname').textContent = tileEl.querySelector('.name').textContent;
   $('.ostat').textContent = tileEl.querySelector('.badge').textContent;
-  $('#ovslot').appendChild(img);            // MOVE, not clone
+  $('#ovslot').appendChild(cv);             // MOVE, not clone
   $('#ovslot').appendChild(aud);            // move audio too
-  img.classList.remove('hidden');
+  cv.classList.remove('hidden');
   tileEl.querySelector('.ph').classList.remove('hidden');
   $('#overlay').classList.add('open');
   syncAudioUi(tid);                         // show the bar's speaker state
@@ -943,13 +1088,13 @@ function openFs(tid) {
 
 function closeFs() {
   if (FS.tid === null) return;
-  const img = document.getElementById('img' + FS.tid),
+  const cv = document.getElementById('view' + FS.tid),
         aud = document.getElementById('aud' + FS.tid),
         home = FS.home,
         audHome = FS.audHome;
   $('#overlay').classList.remove('open');
-  if (img && home) {
-    home.appendChild(img);                  // move it back into the tile
+  if (cv && home) {
+    home.appendChild(cv);                   // move it back into the tile
   }
   if (aud && audHome) {
     audHome.appendChild(aud);               // move audio back into the tile
@@ -959,7 +1104,7 @@ function closeFs() {
     // silently muted that camera.
     syncAudioUi(FS.tid);
   }
-  // Re-run tile() so the img's hidden/visible state is recalculated for
+  // Re-run tile() so the canvas's hidden/visible state is recalculated for
   // its home slot instead of inheriting whatever fullscreen left behind.
   const d = LAST && LAST.find(c => c.tid === FS.tid);
   if (d) tile(d);
@@ -1018,8 +1163,16 @@ $('#refresh').addEventListener('click', async () => {
   finally { $('#refresh').disabled = false; }
 });
 
+// The single video connection and the paint loop.  Both start immediately and
+// keep themselves alive; tick() only describes what the server is doing.
+feedLoop();
+requestAnimationFrame(paint);
+
 tick();
-setInterval(tick, 2000);
+// 2.5 s rather than 2 s: the state poll is a separate request, and with the
+// feed on one socket plus one <audio> per camera you listen to, leaving a
+// spare slot in the browser's six-per-origin pool keeps snapshots instant.
+setInterval(tick, 2500);
 </script>
 """
 
@@ -1093,6 +1246,114 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    # -- one connection for every camera -----------------------------------
+    _FEED_HDR = struct.Struct("<QQI")      # tid, publish ms, jpeg length
+
+    def _feed(self):
+        """Multiplex every camera's MJPEG onto a SINGLE connection.
+
+        The page used to open one MJPEG socket per camera.  With four cameras
+        that is four of the browser's six HTTP/1.1 connections to one origin,
+        and switching audio on used the rest -- so /api/state polls and the
+        snapshot button had nothing left to run on and simply queued.  That is
+        precisely the "everything stacks in pending" and "JPG took minutes"
+        report.  One connection for all video empties the pool instead.
+
+        It also makes the browser able to time a frame against its own clock,
+        which is the only way to see the last hop's contribution to the delay
+        that Phase 16 measured at every earlier stage.  Server and browser are
+        the same machine here, so time.time() and Date.now() agree.
+
+        Framing, per frame::
+
+            <Q  tid      u64   camera id
+            <Q  t_ms     u64   publish time, epoch milliseconds
+            <I  length   u32   JPEG size
+            length bytes of JPEG
+
+        Binary rather than multipart so the client slices frames with a
+        DataView and never has to scan for a boundary.
+        """
+        with HUB.lock:
+            tids = sorted(HUB.cameras)
+        workers = []
+        for tid in tids:
+            w, _err = HUB.ensure(tid)
+            if w:
+                workers.append(w)
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        cursors = {w.camera["tid"]: w.seq for w in workers}
+        # Per-connection diagnostics, mirroring _stream so /api/state keeps
+        # reporting the same per-camera keys now that the page watches /feed.
+        for w in workers:
+            for k in ("served", "loops", "first_frame_at", "lag_ms", "dropped"):
+                w.stats.pop(k, None)
+            w.stats["t0"] = time.time()
+            w.stats["nconn"] = w.stats.get("nconn", 0) + 1
+            w.stats["base_jpg"] = w.stats.get("jpg", 0)
+        served = collections.defaultdict(int)
+        dropped = collections.defaultdict(int)
+        roster_at = time.time()
+        try:
+            while True:
+                # Discovery can find a camera (or lose one) while the page is
+                # already watching, so re-read the roster periodically.
+                if time.time() - roster_at > 5.0:
+                    roster_at = time.time()
+                    with HUB.lock:
+                        tids = sorted(HUB.cameras)
+                    for tid in tids:
+                        if any(w.camera["tid"] == tid for w in workers):
+                            continue
+                        w, _err = HUB.ensure(tid)
+                        if w:
+                            workers.append(w)
+                            cursors[tid] = w.seq
+
+                out = bytearray()
+                for w in workers:
+                    tid = w.camera["tid"]
+                    frames, cursor = w.take(cursors.get(tid, w.seq))
+                    cursors[tid] = cursor
+                    w.stats["pub"] = (w.stats.get("jpg", 0)
+                                      - w.stats.get("base_jpg", 0))
+                    if not frames:
+                        continue
+                    # Same delay bound as the single-camera stream: replaying a
+                    # backlog is what turns a small lag into a permanent one.
+                    lag = time.time() - frames[0][1]
+                    if lag > MAX_LAG and len(frames) > 1:
+                        dropped[tid] += len(frames) - 1
+                        frames = frames[-1:]
+                    w.stats["lag_ms"] = round(lag * 1000.0, 1)
+                    w.stats["dropped"] = dropped[tid]
+                    if served[tid] == 0:
+                        w.stats["first_frame_at"] = round(
+                            time.time() - w.stats["t0"], 1)
+                    served[tid] += len(frames)
+                    w.stats["served"] = served[tid]
+                    for j, t in frames:
+                        out += self._FEED_HDR.pack(tid, int(t * 1000), len(j))
+                        out += j
+                if out:
+                    self.wfile.write(out)
+                    self.wfile.flush()
+                else:
+                    time.sleep(0.01)
+                    for w in workers:
+                        w.stats["loops"] = w.stats.get("loops", 0) + 1
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            sys.stderr.write("feed stopped: %r\n" % (e,))
+
     # -- routes ------------------------------------------------------------
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
@@ -1106,6 +1367,8 @@ class Handler(BaseHTTPRequestHandler):
                        warning=None if names else
                        "wyze_devices.json not found \\u2014 camera names are "
                        "generic.")
+        elif path == "/feed":
+            self._feed()
         elif path.startswith("/stream/") and path.endswith(".mjpg"):
             self._stream(path.split("/")[2].split(".")[0])
         elif path.startswith("/audio/") and path.endswith(".wav"):

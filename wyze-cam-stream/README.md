@@ -45,7 +45,22 @@ working; discovery retries every 2 s from the UI, or on demand with
 | `GET /` | the grid UI |
 | `GET /api/state` | cameras + per-camera status/fps/error |
 | `POST /api/discover` | rescan the LAN |
-| `GET /stream/<tid>.mjpg` | multipart MJPEG for one camera |
+| `GET /feed` | **every camera on one connection** — what the page actually uses |
+| `GET /stream/<tid>.mjpg` | multipart MJPEG for one camera (scripting/fallback) |
+| `GET /audio/<tid>.wav?gain=N` | 16 kHz mono PCM16 audio (`gain` 1–64) |
+| `GET /snapshot/<tid>.jpg` | newest decoded JPEG as a download |
+
+`/feed` exists because Chrome allows only **six** HTTP/1.1 connections per
+origin.  One MJPEG socket per camera held four of them forever, so `/api/state`
+polls and the snapshot button sat in "pending" — which is what made the page
+feel slow.  The page now holds one `/feed` socket plus one `<audio>` per camera
+you switch on, reads it with `fetch().body.getReader()` and paints each camera
+into its own `<canvas>`.  The snapshot button re-encodes that canvas locally, so
+it needs no request at all.  See `../JOURNAL.md` Phase 17.
+
+Each `/feed` frame is a 20-byte header then the JPEG — `<Q tid><Q publish-ms>
+<I length>` — so the page can subtract the publish time from its own clock and
+print the **true end-to-end delay** in each tile's footer.
 
 **Why no auth is needed** (each verified — see `../JOURNAL.md` Phase 9):
 discovery is a LAN broadcast the cameras answer unconditionally; the CALLING

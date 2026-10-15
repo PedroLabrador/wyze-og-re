@@ -1,9 +1,10 @@
 # STATUS — where we are, what's next
 
-> Last updated: **2026-10-13**. Companion docs: [`REVERSE_ENGINEERING.md`](./REVERSE_ENGINEERING.md)
+> Last updated: **2026-10-15**. Companion docs: [`REVERSE_ENGINEERING.md`](./REVERSE_ENGINEERING.md)
 > (full findings + **VERDICT BOARD** of [OK] confirmed vs [X] disproved), [`SECRETS.md`](./SECRETS.md),
 > [`P2P_PROTOCOL.md`](./P2P_PROTOCOL.md) (**new — the wire protocol as actually reversed**),
-> [`README.md`](./README.md) (stale — flagged).
+> [`README.md`](./README.md) (stale for the RE sections; its HTTP API table is current),
+> [`../JOURNAL.md`](../JOURNAL.md) (chronology; **Phase 17** rebuilt the browser transport).
 
 ## [!] READ THIS FIRST — big update (2026-10-13)
 
