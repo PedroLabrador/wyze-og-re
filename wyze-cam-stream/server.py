@@ -134,7 +134,9 @@ SAMPLE_RATE = 16000
 # socket has exactly one owner.
 #
 # Wire format, and why the encoder is told 8 kHz, are in ../P2P_PROTOCOL.md 13.
-TALK_MIC_HZ = 16000            # what the browser captures and POSTs to us
+TALK_MIC_HZ = 16000            # what the page asks for, and usually gets
+TALK_MIC_MIN_HZ = 8000         # ... but it is the browser's choice, so the
+TALK_MIC_MAX_HZ = 96000        # client reports what it really captured (talk_begin)
 TALK_FRAMES_PER_PKT = 6        # six 20 ms AMR-NB frames = 120 ms per packet
 TALK_PKT_SECONDS = 0.120
 TALK_IDLE_TIMEOUT = 2.0        # no PCM for this long -> close the session
@@ -153,6 +155,8 @@ TALK_IDLE_TIMEOUT = 2.0        # no PCM for this long -> close the session
 #      half the time, which is what "sounds cut, sounds cut" was.
 TALK_CAMERA_PLAYOUT = 0.5      # real seconds the camera spends per declared s
 TALK_PKT_REAL_SECONDS = TALK_PKT_SECONDS * TALK_CAMERA_PLAYOUT    # 60 ms
+# The content rate for the default 16 kHz client; talk_begin derives the same
+# number from whatever rate the page reports it actually captured at.
 TALK_CONTENT_HZ = int(TALK_MIC_HZ * TALK_CAMERA_PLAYOUT)          # 8000
 # Head start given to the camera's own jitter buffer when talk opens.  It is
 # pure added latency, so it is deliberately small: enough to cover the pump
@@ -280,6 +284,7 @@ class CameraStreamThread(threading.Thread):
         self.talk_frames = collections.deque(maxlen=TALK_QUEUE_FRAMES)  # payloads
         self.talk_ff = None               # the AMR encoder
         self.talk_stop = None
+        self.talk_mic_hz = TALK_MIC_HZ     # rate the client reported (talk_begin)
         self.talk_stats = {"pcm_bytes": 0, "frames": 0, "packets": 0,
                            "audio_ms": 0, "last_pcm": 0.0}
 
@@ -527,32 +532,48 @@ class CameraStreamThread(threading.Thread):
             self.set_status("reconnecting")
 
     # -- two-way audio (client -> camera) ----------------------------------
-    def talk_begin(self):
+    def talk_begin(self, rate=None):
         """Open a talk session.  Returns None on success, else an error string.
 
         The camera is only reachable through the worker's own CameraStream, so
         "begin" means: start an AMR encoder and mark the stream open.  The first
         actual bytes (the two opening frames, then 120 ms packets) go out from
         _talk_tick on the pump thread.
+
+        `rate` is the sample rate the client really captured at (the page hands
+        us its AudioContext's rate).  The page *asks* for 16 kHz but is not
+        obliged to give us one -- a browser may hand back the hardware rate --
+        and a mislabelled input is a pitch error we cannot hear from this end,
+        so we trust the report and build the encoder around it.  asetrate is
+        always half of the input rate, which keeps the 2x declared/real the
+        camera wants true whatever that rate is.
         """
         with self.talk_lock:
             if self.talk_on:
                 return None
             if self.status not in ("streaming",):
                 return "camera is %s, not streaming" % self.status
+            try:
+                mic_hz = int(rate) if rate else TALK_MIC_HZ
+            except (TypeError, ValueError):
+                mic_hz = TALK_MIC_HZ
+            if not TALK_MIC_MIN_HZ <= mic_hz <= TALK_MIC_MAX_HZ:
+                return "client sample rate %s out of range" % rate
+            content_hz = int(mic_hz * TALK_CAMERA_PLAYOUT)
             cmd = ["ffmpeg", "-loglevel", "error", "-nostdin",
                    # Without these, ffmpeg fills an input buffer before it
                    # emits anything and the camera hears the first word of a
                    # sentence seconds late.  Same trap as the video pipe.
                    "-probesize", "32", "-analyzeduration", "0",
-                   "-f", "s16le", "-ar", str(TALK_MIC_HZ), "-ac", "1",
+                   "-f", "s16le", "-ar", str(mic_hz), "-ac", "1",
                    "-i", "pipe:0",
-                   # asetrate *relabels* the 16 kHz samples as 8 kHz: the same
-                   # samples, twice the declared duration, half the pitch.  That
-                   # is the content the camera's own 2x playout expects (see
-                   # TALK_CAMERA_PLAYOUT).  aresample then guarantees the 8 kHz
-                   # stream that libopencore_amrnb insists on really is 8 kHz.
-                   "-af", "asetrate=%d,aresample=8000" % TALK_CONTENT_HZ,
+                   # asetrate *relabels* the incoming samples at half the rate
+                   # they were captured at: the same samples, twice the declared
+                   # duration, half the pitch -- the content the camera's own 2x
+                   # playout expects (see TALK_CAMERA_PLAYOUT).  aresample then
+                   # guarantees the 8 kHz stream libopencore_amrnb insists on
+                   # really is 8 kHz.
+                   "-af", "asetrate=%d,aresample=8000" % content_hz,
                    "-ar", "8000", "-ac", "1",
                    "-c:a", "libopencore_amrnb", "-b:a", "12.2k",
                    "-f", "amr", "pipe:1"]
@@ -563,6 +584,7 @@ class CameraStreamThread(threading.Thread):
             except OSError as e:
                 return "cannot start ffmpeg: %s" % e
             self.talk_ff = ff
+            self.talk_mic_hz = mic_hz
             self.talk_stop = threading.Event()
             self.talk_frames = collections.deque(maxlen=TALK_QUEUE_FRAMES)
             self.talk_opened = False
@@ -572,7 +594,8 @@ class CameraStreamThread(threading.Thread):
             self.talk_on = True
             threading.Thread(target=self._talk_reader, daemon=True,
                              name="talk-%s" % self.camera["tid"]).start()
-            self.log("talk: session opened")
+            self.log("talk: session opened (client %d Hz -> %d Hz content)"
+                     % (mic_hz, content_hz))
             return None
 
     def _talk_reader(self):
@@ -1135,7 +1158,14 @@ function talkStart(tid) {
                noiseSuppression: true, autoGainControl: true}})
     .then(stream => {
       TALK.stream = stream;
-      return talkReq('/api/talk/start', {tid: tid});
+      const AC = window.AudioContext || window.webkitAudioContext;
+      TALK.ctx = new AC({sampleRate: 16000});
+      // We *ask* for 16 kHz and then report whatever we actually got: a browser
+      // may hand back the hardware rate instead, and the server sizes the
+      // encoder around this number, so a wrong guess here cannot reach the
+      // camera as a wrong pitch.
+      return talkReq('/api/talk/start',
+                     {tid: tid, rate: TALK.ctx.sampleRate});
     })
     .then(r => {
       if (r.status !== 200 || r.d.error) {
@@ -1144,8 +1174,6 @@ function talkStart(tid) {
         syncTalkUi(tid);
         return;
       }
-      const AC = window.AudioContext || window.webkitAudioContext;
-      TALK.ctx = new AC({sampleRate: 16000});
       TALK.src = TALK.ctx.createMediaStreamSource(TALK.stream);
       TALK.node = TALK.ctx.createScriptProcessor(TALK_BUF, 1, 1);
       TALK.pending = new Uint8Array(0);
@@ -1935,7 +1963,7 @@ class Handler(BaseHTTPRequestHandler):
     def _talk(self, parts, body):
         """Client -> camera audio, in three tiny endpoints::
 
-            POST /api/talk/start     {"tid": N}
+            POST /api/talk/start     {"tid": N, "rate": Hz}
             POST /api/talk/stop      {"tid": N}
             POST /api/talk/pcm/<tid>   16 kHz mono PCM16 in the body
 
@@ -1975,7 +2003,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(503, error=err)
                 return
             if verb == "start":
-                err = w.talk_begin()
+                err = w.talk_begin(rate=d.get("rate"))
                 self._json(200 if not err else 503,
                            **({"error": err} if err else {"ok": True}))
             else:
