@@ -2009,6 +2009,17 @@ sent to stay close to the app.
 > at its own 8 kHz, and sped up 2x -- and ask which one is their normal voice.
 > That is a clean A/B of the capture alone.  All of Phase 21's product work
 > assumes the "natural" reading; see JOURNAL Phase 21.
+>
+> One more constraint, from §13c's opening frame: it declares **16000 Hz and
+> 320 samples**, i.e. 20 ms per frame, while the AMR-NB frames it precedes
+> carry 160 samples.  A camera that resamples 160 -> 320 and plays at 16 kHz
+> gets exactly the 20 ms the frame declares, which is *natural* playback and
+> would make the app's 1x content correct.  The half-rate reading therefore
+> requires the camera to ignore its own declared sample rate -- possible, but
+> it is now the reading that needs the evidence, not the other one.
+>
+> Cash 2x in only if a clean 1x-vs-2x camera test (one trip, both clips in the
+> same session) says so.
 
 Replaying the captured audio **byte-for-byte at the app's own interval
 (~120 ms per packet)** makes the camera play it back as *slow motion* -- the
