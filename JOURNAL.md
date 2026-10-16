@@ -2069,3 +2069,85 @@ anything from one bad run.
 * `getUserMedia` still asks for `echoCancellation` / `noiseSuppression` /
   `autoGainControl`; those are now the prime suspects for real-talk *quality*
   (they cannot explain anything measured in Phases 23 or 24).
+
+
+## Phase 25 -- what night vision actually changes in the feed
+
+The question: the cameras switch to night vision on their own -- does the video feed look
+the same when it does?  Night vision is three
+things stacked, and only the last is about the feed:
+
+1. **the control** -- `night-shot` / `night-shot-state` / `infrared-mode`
+   ("infrared night vision LEDs"), a **cloud thing-model property**
+   (`assets/get_capabilities_mock_response_api.json`), consistent with Phase 19's
+   finding that the camera's controls have no LAN path.  In Auto the camera
+   also drives it from its own ambient light sensor, so this is not ours to
+   command and not ours to see coming;
+2. **the picture** -- the IR-cut filter slides out and the IR LEDs come on, so
+   the sensor sees infrared and the firmware goes monochrome;
+3. **the feed** -- H.264 in the profile *we* asked for, the frame rate, and what
+   the encoder spends on the new picture.
+
+### The instrument
+
+`nightprobe.py` (new, silent, safe to run while the page streams): it reads the
+server's own `/snapshot/<tid>.jpg` -- the newest decoded frame, which the server
+keeps beside the viewer deque exactly so a still cannot steal a frame from a
+live viewer -- and decodes it with ffmpeg at 64x36 to get two numbers:
+
+* **chroma** decides day vs night.  IR-cut out plus monochrome processing
+  collapses colour, so mean chroma falls to ~0.  Brightness does **not** decide
+  it, and the measurement shows why: the IR LEDs made the night frame *brighter*
+  than the day frame.
+* **JPEG bytes/frame** is what the encoder is spending, which is the closest
+  thing to "is the feed the same" that can be read off the wire.
+
+### The measurement (camera 1, lights switched off and back on)
+
+| | day (70 samples) | night (34) | change |
+|---|---|---|---|
+| colour (mean chroma) | 35.0 | **2.9** | **-92 %** -- monochrome |
+| brightness (mean luma) | 119.5 | 151.1 | **+26 %** -- the IR LEDs light the room |
+| JPEG bytes/frame (median) | 84,693 | **67,099** | **-21 %** -- no chroma left to encode |
+| **frame rate** | 20.0 | **15.1** | **-24 %** |
+
+Controlled, not assumed: over the same window cameras 4, 3 and 2 sat in day mode
+at **20.0 fps** each, so the frame-rate drop belongs to camera 1's night mode and
+not to load from the probe.  Camera 1 returned to day mode at t=170 s and back to
+21.6 fps with it.
+
+The switch is not instant: the first night frame is **blown out (luma 254)** and
+auto-exposure hunts for roughly **8-9 s** (109 -> 168 -> 54 -> 142) before it
+settles.  Judged by eye from the saved JPEG, the settled night picture is
+genuinely good -- crisp monochrome, IR-lit, no visible noise.
+
+### What this does and does not settle
+
+* **Does settle**: the transport does not change.  Same session, same conv, same
+  codec, same AvStreamCtl profile, no renegotiation -- the camera switches
+  internally and our side never sees a protocol event.
+* **Does not settle**: the camera's **raw** resolution.  The probe sees
+  `1280x720` in both states, but that is *ours*: `_stream` scales with `-vf
+  scale=WYZE_WIDTH:-2` and `WYZE_WIDTH` defaults to **1280**.  A camera-side
+  change of the H.264 geometry would be invisible here (though visible to
+  ffmpeg).  `WYZE_WIDTH=0` would serve the camera's native size, and an SPS
+  fingerprint is the clean way to check it properly.
+* **Why it would not matter anyway**: the page sizes its canvas from the decoded
+  bitmap (`cv.width = bmp.width`), ffmpeg is size-agnostic, and the canvas is
+  repainted per frame -- so a resolution change anywhere in this chain is
+  transparent, not a breakage.
+
+So the answer is: **yes for the feed's shape, no for its
+content.**  Nothing about the stream's structure changes, and nothing in our
+viewer needs to; but the picture goes monochrome and brighter, the encoder
+spends ~21 % less per frame, and the camera itself drops to about 15 fps.
+
+### Notes for next time
+
+Put **`nightprobe.py`** at the top of the tool list for anything about picture
+quality: it is silent, it never touches a camera, it is safe beside a live page,
+and `chroma`/`luma`/`jpeg bytes` are three numbers that make "is the image
+worse?" answerable.  A **probe every 2 s is cheap** (one snapshot + one ffmpeg
+at 64x36) -- arming one *before* changing anything is what
+caught the transition and the 8 s of auto-exposure hunting, which a
+before/after pair would have missed entirely.
