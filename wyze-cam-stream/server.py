@@ -262,6 +262,7 @@ class CameraStreamThread(threading.Thread):
         self.stats = {"h264": 0, "jpg": 0, "fps": 0.0, "last": 0.0}
         self.audio_stats = {"bytes": 0, "chunks": 0}
         self.audio_chunks = collections.deque(maxlen=200)
+        self.audio_last_t = 0.0        # when the newest audio chunk was published
         self._audio_cond = threading.Condition()
         self._cond = threading.Condition()
         self._stop = threading.Event()
@@ -285,8 +286,13 @@ class CameraStreamThread(threading.Thread):
         self.talk_ff = None               # the AMR encoder
         self.talk_stop = None
         self.talk_mic_hz = TALK_MIC_HZ     # rate the client reported (talk_begin)
+        self.talk_dry = False              # counting only, nothing to a camera
+        self.talk_first = 0.0              # first PCM of this session, for the rate
+        self.talk_srcs = set()             # client connections that fed this session
+        self.talk_text_said = False        # already complained about a text body
         self.talk_stats = {"pcm_bytes": 0, "frames": 0, "packets": 0,
-                           "audio_ms": 0, "last_pcm": 0.0}
+                           "audio_ms": 0, "last_pcm": 0.0,
+                           "posts": 0, "maxpost": 0}
 
     # -- helpers -----------------------------------------------------------
     def log(self, msg):
@@ -487,6 +493,7 @@ class CameraStreamThread(threading.Thread):
                     with self._audio_cond:
                         audio_cursor += 1
                         self.audio_chunks.append((audio_cursor, bytes(st._abuf)))
+                        self.audio_last_t = time.time()
                         self.audio_stats["bytes"] += len(st._abuf)
                         self.audio_stats["chunks"] += 1
                         self._audio_cond.notify_all()
@@ -532,7 +539,7 @@ class CameraStreamThread(threading.Thread):
             self.set_status("reconnecting")
 
     # -- two-way audio (client -> camera) ----------------------------------
-    def talk_begin(self, rate=None):
+    def talk_begin(self, rate=None, dry=False):
         """Open a talk session.  Returns None on success, else an error string.
 
         The camera is only reachable through the worker's own CameraStream, so
@@ -547,11 +554,16 @@ class CameraStreamThread(threading.Thread):
         so we trust the report and build the encoder around it.  asetrate is
         always half of the input rate, which keeps the 2x declared/real the
         camera wants true whatever that rate is.
+
+        `dry` opens a session that accepts and counts the client's PCM but
+        starts no encoder and sends nothing: the whole capture path can then be
+        exercised from a browser without a camera hearing any of it.  See the
+        ?drytalk=1 flag in PAGE.
         """
         with self.talk_lock:
             if self.talk_on:
                 return None
-            if self.status not in ("streaming",):
+            if not dry and self.status not in ("streaming",):
                 return "camera is %s, not streaming" % self.status
             try:
                 mic_hz = int(rate) if rate else TALK_MIC_HZ
@@ -560,42 +572,51 @@ class CameraStreamThread(threading.Thread):
             if not TALK_MIC_MIN_HZ <= mic_hz <= TALK_MIC_MAX_HZ:
                 return "client sample rate %s out of range" % rate
             content_hz = int(mic_hz * TALK_CAMERA_PLAYOUT)
-            cmd = ["ffmpeg", "-loglevel", "error", "-nostdin",
-                   # Without these, ffmpeg fills an input buffer before it
-                   # emits anything and the camera hears the first word of a
-                   # sentence seconds late.  Same trap as the video pipe.
-                   "-probesize", "32", "-analyzeduration", "0",
-                   "-f", "s16le", "-ar", str(mic_hz), "-ac", "1",
-                   "-i", "pipe:0",
-                   # asetrate *relabels* the incoming samples at half the rate
-                   # they were captured at: the same samples, twice the declared
-                   # duration, half the pitch -- the content the camera's own 2x
-                   # playout expects (see TALK_CAMERA_PLAYOUT).  aresample then
-                   # guarantees the 8 kHz stream libopencore_amrnb insists on
-                   # really is 8 kHz.
-                   "-af", "asetrate=%d,aresample=8000" % content_hz,
-                   "-ar", "8000", "-ac", "1",
-                   "-c:a", "libopencore_amrnb", "-b:a", "12.2k",
-                   "-f", "amr", "pipe:1"]
-            try:
-                ff = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                      stdout=subprocess.PIPE,
-                                      stderr=subprocess.DEVNULL)
-            except OSError as e:
-                return "cannot start ffmpeg: %s" % e
+            ff = None
+            if not dry:
+                cmd = ["ffmpeg", "-loglevel", "error", "-nostdin",
+                       # Without these, ffmpeg fills an input buffer before it
+                       # emits anything and the camera hears the first word of a
+                       # sentence seconds late.  Same trap as the video pipe.
+                       "-probesize", "32", "-analyzeduration", "0",
+                       "-f", "s16le", "-ar", str(mic_hz), "-ac", "1",
+                       "-i", "pipe:0",
+                       # asetrate *relabels* the incoming samples at half the
+                       # rate they were captured at: the same samples, twice the
+                       # declared duration, half the pitch -- the content the
+                       # camera's own 2x playout expects (see
+                       # TALK_CAMERA_PLAYOUT).  aresample then guarantees the
+                       # 8 kHz stream libopencore_amrnb insists on really is
+                       # 8 kHz.
+                       "-af", "asetrate=%d,aresample=8000" % content_hz,
+                       "-ar", "8000", "-ac", "1",
+                       "-c:a", "libopencore_amrnb", "-b:a", "12.2k",
+                       "-f", "amr", "pipe:1"]
+                try:
+                    ff = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                          stdout=subprocess.PIPE,
+                                          stderr=subprocess.DEVNULL)
+                except OSError as e:
+                    return "cannot start ffmpeg: %s" % e
             self.talk_ff = ff
             self.talk_mic_hz = mic_hz
+            self.talk_dry = bool(dry)
             self.talk_stop = threading.Event()
             self.talk_frames = collections.deque(maxlen=TALK_QUEUE_FRAMES)
             self.talk_opened = False
             self.talk_next = 0.0
+            self.talk_first = 0.0
+            self.talk_srcs = set()
+            self.talk_text_said = False
             self.talk_stats.update({"pcm_bytes": 0, "frames": 0,
-                                    "packets": 0, "audio_ms": 0, "last_pcm": 0.0})
+                                    "packets": 0, "audio_ms": 0, "last_pcm": 0.0,
+                                    "posts": 0, "maxpost": 0})
             self.talk_on = True
-            threading.Thread(target=self._talk_reader, daemon=True,
-                             name="talk-%s" % self.camera["tid"]).start()
-            self.log("talk: session opened (client %d Hz -> %d Hz content)"
-                     % (mic_hz, content_hz))
+            if ff:
+                threading.Thread(target=self._talk_reader, daemon=True,
+                                 name="talk-%s" % self.camera["tid"]).start()
+            self.log("talk: %s opened (client %d Hz -> %d Hz content)"
+                     % ("dry run" if dry else "session", mic_hz, content_hz))
             return None
 
     def _talk_reader(self):
@@ -635,17 +656,25 @@ class CameraStreamThread(threading.Thread):
                     self.talk_frames.append(bytes(buf[1:1 + size]))
                 del buf[:1 + size]
 
-    def talk_feed(self, pcm):
-        """Accept 16 kHz PCM16 from the page.  Returns False if it is dropped."""
+    def talk_feed(self, pcm, src=None):
+        """Accept PCM16 from the page.  Returns False if it is dropped."""
         with self.talk_lock:
-            if not self.talk_on or not self.talk_ff:
+            if not self.talk_on or (not self.talk_ff and not self.talk_dry):
                 return False
-            try:
-                self.talk_ff.stdin.write(pcm)
-                self.talk_ff.stdin.flush()
-            except (BrokenPipeError, ValueError, OSError):
-                return False
+            if self.talk_ff:
+                try:
+                    self.talk_ff.stdin.write(pcm)
+                    self.talk_ff.stdin.flush()
+                except (BrokenPipeError, ValueError, OSError):
+                    return False
+            if not self.talk_stats["pcm_bytes"]:
+                self.talk_first = time.time()
+            if src is not None:
+                self.talk_srcs.add(src)
             self.talk_stats["pcm_bytes"] += len(pcm)
+            self.talk_stats["posts"] += 1
+            if len(pcm) > self.talk_stats["maxpost"]:
+                self.talk_stats["maxpost"] = len(pcm)
             self.talk_stats["last_pcm"] = time.time()
             return True
 
@@ -654,12 +683,49 @@ class CameraStreamThread(threading.Thread):
             if not self.talk_on:
                 return
             self.talk_on = False
+            dry = self.talk_dry
+            self.talk_dry = False
             self._talk_stop_encoder()
-            self.log("talk: session closed")
+            n, first = self.talk_stats["pcm_bytes"], self.talk_first
+            el = (time.time() - first) if first else 0.0
+            srcs = len(self.talk_srcs)
+            if n and el > 0.3:
+                # Say how fast the page actually fed us, and from how many
+                # connections.  A stream that arrives much faster than the rate
+                # the page reported is the signature of more than one live
+                # microphone, and it used to be invisible from here: the encoder
+                # overran, the packet queue dropped most of it, and all anyone
+                # saw was "garbage".
+                arr, want = n / el, self.talk_mic_hz * 2
+                extra = ""
+                if arr > want * 1.4:
+                    extra = ("  *** %.1fx the %.0f B/s it claimed from %d client "
+                             "connection%s -- more than one microphone?"
+                             % (arr / want, want, srcs,
+                                "" if srcs == 1 else "s"))
+                self.log("talk: %s closed, %.1f s of PCM at %.0f B/s in %d "
+                         "POSTs (max %d B) from %d connection%s%s"
+                         % ("dry run" if dry else "session", el, arr,
+                            self.talk_stats["posts"], self.talk_stats["maxpost"],
+                            srcs, "" if srcs == 1 else "s", extra))
+            else:
+                self.log("talk: %s closed"
+                         % ("dry run" if dry else "session"))
 
     def talk_state(self):
         """A read-only snapshot of the talk session, for /api/state."""
-        return {"on": self.talk_on, **self.talk_stats}
+        st = {"on": self.talk_on, "dry": self.talk_dry,
+              "mic_hz": self.talk_mic_hz, **self.talk_stats}
+        # Report what the page is really delivering against what it claimed.
+        # The UI shows a worker's last log line, so a mismatch surfaces as a
+        # warning on the tile instead of as unexplained garbage from a speaker.
+        st["arrival"] = 0
+        if self.talk_first and self.talk_stats["pcm_bytes"]:
+            st["arrival"] = int(self.talk_stats["pcm_bytes"]
+                                / max(0.25, time.time() - self.talk_first))
+            if st["arrival"] > self.talk_mic_hz * 2 * 1.4:
+                st["too_fast"] = True
+        return st
 
     def _talk_stop_encoder(self):
         ff, self.talk_ff = self.talk_ff, None
@@ -680,6 +746,15 @@ class CameraStreamThread(threading.Thread):
         it.  A tiny job, which is why it is a tick and not a thread.
         """
         if not self.talk_on:
+            return
+        if self.talk_dry:
+            # A dry run sends nothing, so there is nothing to pace and nothing
+            # to open -- only the liveness check, so a forgotten dry session
+            # closes itself the way a real one does.
+            if (now - self.talk_stats["last_pcm"] > TALK_IDLE_TIMEOUT
+                    and self.talk_stats["pcm_bytes"] > 0):
+                self.log("talk: dry run idle, closing")
+                self.talk_end()
             return
         # A dead browser must not leave an encoder running forever.
         if (now - self.talk_stats["last_pcm"] > TALK_IDLE_TIMEOUT
@@ -882,6 +957,18 @@ class Hub:
                     "seq": w.seq if w else 0,
                     "stats": self._stats_copy(w),
                     "talk": w.talk_state() if w else None,
+                    "audio": None if not w else {
+                        # How fast the server hands audio to whoever is
+                        # listening, which is the part of the inbound delay
+                        # that is OURS.  q is how many 20 ms chunks are waiting
+                        # and age is how long the newest one has been waiting:
+                        # both should sit near zero, because /audio drains in a
+                        # tight loop and starts at the tail, not the backlog.
+                        "q": len(w.audio_chunks),
+                        "age": (time.time() - w.audio_last_t)
+                               if w.audio_last_t else None,
+                        "chunks": w.audio_stats["chunks"],
+                    },
                     "log": list(w._log)[-6:] if w else [],
                 })
             return out
@@ -1063,6 +1150,22 @@ const ICON = {
 // button and the fullscreen bar are driven from it.  The gap this design
 // exists for: fullscreen had no audio control and no way to see whether sound was
 // on except by hearing it.
+//
+// The element is still the state holder, but it no longer plays anything.
+// Sound is scheduled on an AudioContext instead, for the reason the sound
+// button used to feel broken: an <audio> element pointed at a live stream is a
+// media player, and a media player fills a read-ahead buffer so it can ride
+// out a stall it has no other defence against.  Measured on this Mac, that
+// buffer sat at buffered.end() - currentTime = 2.47 s while the newest audio
+// had reached the *server* 24-50 ms earlier: the entire 2.4 s inbound delay
+// was the element, none of it was the camera.  A fetch() reader whose buffers
+// we start ourselves on the context clock can be held to a fixed lead, so the
+// camera's room arrives on the same timescale as its video.
+const SND = new Map();       // tid -> session {ctx, gain, next, live[], ...}
+const SND_LEAD = 0.15;       // seconds of audio scheduled ahead of the clock
+const SND_MAX_AHEAD = 0.60;  // past this we are replaying history, not listening
+const SND_MIN_BYTES = 320;   // one 20 ms frame of 16 kHz PCM16
+
 function sndVisual(btn, on) {
   if (!btn) return;
   btn.classList.toggle('on', on);
@@ -1077,26 +1180,91 @@ function syncAudioUi(tid) {
   if (FS.tid === tid) sndVisual($('#fssound'), on);
 }
 
+function sndStop(tid) {
+  const st = SND.get(tid);
+  if (!st) return;
+  SND.delete(tid);
+  for (const s of st.live) { try { s.stop(); } catch (_) {} }
+  try { if (st.reader) st.reader.cancel(); } catch (_) {}
+  try { st.gain.disconnect(); } catch (_) {}
+  try { st.ctx.close(); } catch (_) {}
+}
+
+function sndSchedule(st, bytes) {
+  const ctx = st.ctx, n = bytes.length >> 1;
+  const buf = ctx.createBuffer(1, n, 16000);   // the node resamples to the device
+  const ch = buf.getChannelData(0);
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.length);
+  for (let i = 0; i < n; i++) ch[i] = dv.getInt16(i * 2, true) / 32768;
+  let at = st.next;
+  if (at < ctx.currentTime + SND_LEAD) at = ctx.currentTime + SND_LEAD;
+  if (at > ctx.currentTime + SND_MAX_AHEAD) {
+    // Slower than real time somewhere upstream has turned into replaying old
+    // audio.  Drop what is queued and jump to live -- the same decision the
+    // video path makes with MAX_LAG, for the same reason: being behind is
+    // worse than losing a moment.
+    st.dropped++;
+    for (const s of st.live) { try { s.stop(); } catch (_) {} }
+    st.live = [];
+    at = ctx.currentTime + SND_LEAD;
+  }
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  src.connect(st.gain);
+  src.onended = () => { const i = st.live.indexOf(src); if (i >= 0) st.live.splice(i, 1); };
+  src.start(at);
+  st.live.push(src);
+  st.next = at + n / 16000;
+  st.played += n;
+}
+
+async function sndRun(tid, st) {
+  while (SND.get(tid) === st) {
+    try {
+      const r = await fetch('/pcm/' + tid + '?r=' + Date.now(),
+                            {cache: 'no-store'});
+      if (!r.ok || !r.body) throw new Error('HTTP ' + r.status);
+      st.reader = r.body.getReader();
+      st.recv = 0; st.since = performance.now();
+      let pend = new Uint8Array(0);
+      for (;;) {
+        const step = await st.reader.read();
+        if (step.done) break;
+        if (SND.get(tid) !== st) return;
+        st.recv += step.value.length;
+        const merged = new Uint8Array(pend.length + step.value.length);
+        merged.set(pend); merged.set(step.value, pend.length);
+        pend = merged;
+        const whole = (pend.length >> 1) << 1;       // complete int16 samples
+        if (whole >= SND_MIN_BYTES) {
+          sndSchedule(st, pend.subarray(0, whole));
+          pend = pend.slice(whole);
+        }
+      }
+    } catch (_) { /* server restarting, or the reader was cancelled */ }
+    st.reader = null;
+    if (SND.get(tid) !== st) return;
+    await new Promise(r => setTimeout(r, 1000));     // then try again
+  }
+}
+
 function setAudio(tid, on) {
   const aud = document.getElementById('aud' + tid);
   if (!aud) return;
   aud.dataset.on = on ? '1' : '';
-  if (!on) {
-    aud.pause();
-    aud.removeAttribute('src');
-    try { aud.load(); } catch (_) {}          // abort the HTTP stream
-  } else {
+  sndStop(tid);
+  if (on) {
     // Reached straight from a click, which is the user gesture browsers
-    // demand -- nothing may be awaited before play().
-    aud.src = '/audio/' + tid + '.wav?r=' + Date.now() + '&gain=' + GAIN;
-    const p = aud.play();
-    if (p && p.catch) p.catch(err => {        // autoplay / decode blocked
-      aud.dataset.on = '';
-      syncAudioUi(tid);
-      const btn = document.querySelector('#c' + tid + ' .sndbtn');
-      if (btn) btn.title =
-        'Sound blocked by the browser: ' + (err && err.name || err);
-    });
+    // demand for an AudioContext -- nothing may be awaited before this.
+    const AC = window.AudioContext || window.webkitAudioContext;
+    const st = {ctx: new AC(), live: [], dropped: 0, recv: 0, played: 0,
+                next: 0, since: performance.now()};
+    st.gain = st.ctx.createGain();      // the boost is applied here, in float,
+    st.gain.gain.value = GAIN;          // so the slider no longer restarts the
+    st.gain.connect(st.ctx.destination); // stream -- see syncGain()
+    st.next = st.ctx.currentTime + SND_LEAD;
+    SND.set(tid, st);
+    sndRun(tid, st);
   }
   syncAudioUi(tid);
 }
@@ -1110,7 +1278,12 @@ function setAudio(tid, on) {
 // on the first press, never at page load.  ScriptProcessor (deprecated, but
 // present in every browser and needing no build step) captures it.
 const TALK = {tid: null, ctx: null, src: null, node: null, stream: null,
-              pending: new Uint8Array(0), busy: false, err: null};
+              pending: new Uint8Array(0), busy: false, err: null,
+              sess: 0, starting: false, dry: false};
+// ?drytalk=1 runs the whole capture path against a server that counts the PCM
+// and hands it to no camera.  That is how the capture side gets tested without
+// pointing a speaker at anyone -- see the dry branch in CameraStreamThread.
+const TALK_DRY = /(^|[?&])drytalk=1/.test(location.search);
 const TALK_BUF = 512, TALK_BUF_BYTES = TALK_BUF * 2;   // 512 samples = 32 ms
 
 function talkReq(path, body) {
@@ -1118,8 +1291,19 @@ function talkReq(path, body) {
   // difference between "busy" and "gone" here.
   const h = {};
   if (body !== null) {
-    h['Content-Type'] = 'application/json';
-    body = JSON.stringify(body);
+    if (body instanceof Uint8Array || body instanceof ArrayBuffer) {
+      // Raw bytes on the wire.  This is not a detail: JSON.stringify() of a
+      // Uint8Array is an OBJECT of indices -- {"0":12,"1":7,...} -- which is
+      // about nine times the length AND is not PCM at all, so the camera plays
+      // the braces, quotes and decimal digits as audio.  That was the entire
+      // difference between the file-driven path (raw bytes from Python, clean)
+      // and the browser path (always garbage), and it is why the arrival rate
+      // measured 9x the rate the page claimed to send.
+      h['Content-Type'] = 'application/octet-stream';
+    } else {
+      h['Content-Type'] = 'application/json';
+      body = JSON.stringify(body);
+    }
   }
   return fetch(path, {method: 'POST', headers: h, body: body})
     .then(r => r.json().then(d => ({status: r.status, d: d}))
@@ -1129,7 +1313,8 @@ function talkReq(path, body) {
 function syncTalkUi(tid) {
   const on = TALK.tid === tid && !TALK.err;
   const tip = TALK.err ? 'Talk: ' + TALK.err
-          : on ? 'Talking -- release to stop'
+          : on ? (TALK.dry ? 'Talk test (no camera) -- release to stop'
+                           : 'Talking -- release to stop')
           : 'Hold to talk to this camera';
   for (const b of document.querySelectorAll('#c' + tid + ' .talkbtn')) {
     b.classList.toggle('on', on);
@@ -1151,12 +1336,30 @@ function talkStart(tid) {
     syncTalkUi(tid);
     return;
   }
-  if (TALK.tid !== null && TALK.tid !== tid) talkStop(true);
   if (TALK.tid === tid) return;
+  if (TALK.tid !== null || TALK.starting) talkStop(true);
+  // Claim the slot BEFORE the async work and stamp the session.  getUserMedia
+  // plus the start POST take 100-300 ms, and a tap inside that window used to
+  // be unstoppable: the release found TALK.tid still null and did nothing, and
+  // the session it left behind kept the microphone open with its own
+  // onaudioprocess for the rest of the page's life.  A handful of taps is a
+  // handful of live microphones feeding one queue at a multiple of real time --
+  // the encoder overflows, and the camera plays a sliced hiss that never stops,
+  // even when nobody is speaking.  Claiming the slot first means the release
+  // always has something to stop.
+  const sess = ++TALK.sess;
+  TALK.tid = tid;            // now, so a release can stop a start in flight
+  TALK.starting = true;
+  TALK.dry = TALK_DRY;
+  syncTalkUi(tid);
   navigator.mediaDevices.getUserMedia(
       {audio: {channelCount: 1, echoCancellation: true,
                noiseSuppression: true, autoGainControl: true}})
     .then(stream => {
+      if (sess !== TALK.sess) {              // released while we waited
+        stream.getAudioTracks().forEach(t => t.stop());
+        return null;
+      }
       TALK.stream = stream;
       const AC = window.AudioContext || window.webkitAudioContext;
       TALK.ctx = new AC({sampleRate: 16000});
@@ -1165,15 +1368,27 @@ function talkStart(tid) {
       // encoder around this number, so a wrong guess here cannot reach the
       // camera as a wrong pitch.
       return talkReq('/api/talk/start',
-                     {tid: tid, rate: TALK.ctx.sampleRate});
+                     {tid: tid, rate: TALK.ctx.sampleRate, dry: TALK.dry});
     })
     .then(r => {
-      if (r.status !== 200 || r.d.error) {
-        TALK.err = r.d.error || ('server refused, HTTP ' + r.status);
-        talkCleanup();
-        syncTalkUi(tid);
+      if (r === null) return;                // already torn down above
+      if (sess !== TALK.sess) {              // released while the start was out
+        talkReq('/api/talk/stop', {tid: tid}).catch(() => {});
         return;
       }
+      if (r.status !== 200 || r.d.error) {
+        TALK.err = r.d.error || ('server refused, HTTP ' + r.status);
+        talkStop(true);
+        return;
+      }
+      TALK.starting = false;
+      TALK.micHz = TALK.ctx.sampleRate;
+      // What this capture actually delivers, counted from inside the page.  A
+      // rate far above micHz means something else is contributing samples --
+      // another microphone the page leaked, or a second tab -- and the server
+      // compares this against what it receives.
+      TALK.m = {t0: performance.now(), cb: 0, samples: 0, maxlen: 0,
+                others: 0, ctxRate: TALK.ctx.sampleRate, posted: 0, posts: 0};
       TALK.src = TALK.ctx.createMediaStreamSource(TALK.stream);
       TALK.node = TALK.ctx.createScriptProcessor(TALK_BUF, 1, 1);
       TALK.pending = new Uint8Array(0);
@@ -1184,18 +1399,30 @@ function talkStart(tid) {
       mute.gain.value = 0;
       TALK.node.connect(mute);
       mute.connect(TALK.ctx.destination);
-      TALK.node.onaudioprocess = talkPcm;
-      TALK.tid = tid;
+      // Bound to its own session, so a node that outlives its session cannot
+      // write into the next one's buffer.
+      TALK.node.onaudioprocess = e => talkPcm(e, sess);
       syncTalkUi(tid);
     })
     .catch(e => {
+      if (sess !== TALK.sess) return;
       TALK.err = (e && e.name) || 'microphone refused';
-      talkCleanup();
-      syncTalkUi(tid);
+      talkStop(true);
     });
 }
 
-function talkPcm(e) {
+function talkPcm(e, sess) {
+  // Count before the guard: a callback from a node that is no longer the
+  // current one is exactly the thing worth reporting.
+  const m = TALK.m;
+  if (m) {
+    const n = e.inputBuffer.length;
+    m.cb++;
+    m.samples += n;
+    if (n > m.maxlen) m.maxlen = n;
+    if (e.target !== TALK.node) m.others++;
+  }
+  if (sess !== TALK.sess) return;   // a node from a session we have left behind
   const f = e.inputBuffer.getChannelData(0);
   const bytes = new Uint8Array(f.length * 2);
   const dv = new DataView(bytes.buffer);
@@ -1218,6 +1445,7 @@ function talkFlush() {
   while (TALK.pending.length >= TALK_BUF_BYTES && !TALK.busy) {
     const out = TALK.pending.slice(0, TALK_BUF_BYTES);
     TALK.pending = TALK.pending.slice(TALK_BUF_BYTES);
+    if (TALK.m) { TALK.m.posted += TALK_BUF_BYTES; TALK.m.posts++; }
     TALK.busy = true;
     talkReq('/api/talk/pcm/' + TALK.tid, out).then(r => {
       TALK.busy = false;
@@ -1239,11 +1467,31 @@ function talkFlush() {
   }
 }
 
+function talkReport() {
+  // The page's own account of what it captured: samples per second into the
+  // buffer, how many callbacks that took, and whether any of them came from a
+  // node that is not the current one.  Sent at the end of every session, so a
+  // session that misbehaves leaves a record rather than only an anecdote.
+  const m = TALK.m;
+  TALK.m = null;
+  if (!m || !m.cb || !m.t0) return;
+  const wall = (performance.now() - m.t0) / 1000;
+  if (wall < 0.3) return;
+  talkReq('/api/micprobe', {main: {
+    mic_hz: TALK.micHz, ctxRate: m.ctxRate, rate: Math.round(m.samples / wall),
+    samples: m.samples, wall: wall, callbacks: m.cb,
+    per_sec: Math.round(m.cb / wall), maxlen: m.maxlen, others: m.others,
+    posted: m.posted, posts: m.posts,
+    post_rate: Math.round(m.posted / wall), dry: TALK.dry}}).catch(() => {});
+}
+
 function talkCleanup() {
+  talkReport();
   const n = TALK.node, s = TALK.src, t = TALK.stream, c = TALK.ctx;
-  TALK.node = TALK.src = TALK.stream = null;
+  TALK.node = TALK.src = TALK.stream = TALK.ctx = null;
   TALK.pending = new Uint8Array(0);
   TALK.busy = false;
+  TALK.starting = false;
   if (n) { n.onaudioprocess = null; try { n.disconnect(); } catch (_) {} }
   if (s) { try { s.disconnect(); } catch (_) {} }
   if (t) { try { t.getAudioTracks().forEach(tr => tr.stop()); } catch (_) {} }
@@ -1252,6 +1500,11 @@ function talkCleanup() {
 
 function talkStop(silent) {
   const tid = TALK.tid;
+  // Invalidate whatever start might still be in flight before doing anything
+  // else: its .then must not come back and install a microphone that nobody is
+  // holding.  That is the whole fix -- a release now always cancels a start,
+  // even one that has not finished yet.
+  TALK.sess++;
   talkCleanup();
   TALK.tid = null;
   if (tid == null) return;
@@ -1349,21 +1602,19 @@ async function feedLoop() {
 }
 
 let LAST = [];            // latest /api/state snapshot, for fullscreen helpers
-let GAIN = 1;             // audio boost, see #gain; read at every SND click
+let GAIN = 1;             // audio boost, see #gain; applied in the gain node
 const gainEl = document.getElementById('gain');
-function syncGain() { GAIN = Number(gainEl.value) || 1; }
+function syncGain() {
+  GAIN = Number(gainEl.value) || 1;
+  // Sound is mixed here, in float, not multiplied into 16-bit samples on the
+  // server -- so a change takes effect at once and far more gracefully than
+  // the old "re-point the <audio> src at ?gain=N" did.
+  SND.forEach(st => { try { st.gain.gain.value = GAIN; } catch (_) {} });
+}
 if (gainEl) {
   gainEl.value = '8';     // the mic idles at -76 dBFS, unity is inaudible
   syncGain();
-  // Re-point anything already playing so the change applies immediately.
-  gainEl.addEventListener('change', () => {
-    syncGain();
-    document.querySelectorAll('audio[id^="aud"]').forEach(a => {
-      if (a.paused || !a.src) return;
-      a.src = a.src.replace(/([?&]gain=)\d+/, '$1' + GAIN);
-      a.play().catch(() => {});
-    });
-  });
+  gainEl.addEventListener('change', syncGain);
 }
 
 async function j(u, o) {
@@ -1449,11 +1700,9 @@ function tile(c) {
         e.stopPropagation();
         setAudio(c.tid, aud.dataset.on !== '1');
       });
-      // The stream can die server-side (camera offline, worker restarted).
-      aud.addEventListener('error', () => {
-        aud.dataset.on = '';
-        syncAudioUi(c.tid);
-      });
+      // No 'error' listener on the element any more: the Web Audio reader owns
+      // the stream now and reconnects itself (see sndRun), so a camera going
+      // away leaves the button lit and simply resumes -- switching it off silently was its own small lie about what is happening.
     }
   }
   // Hold-to-talk.  Pointer events, not click: the press IS the transmit switch.
@@ -1700,7 +1949,29 @@ $('#fsall').addEventListener('click', () => {
 
 async function tick() {
   try {
-    const d = await j('/api/state');
+    // Tell the server how far behind live this browser's speakers are.  For a
+    // live WAV that the browser has no end for, buffered.end() is the newest
+    // audio it has downloaded and currentTime is what is reaching the speaker
+    // now -- so the difference is the delay that is neither the camera's nor
+    // the server's, it is the media element's own read-ahead.  Sent on the
+    // poll that already happens rather than as another request.
+    const lag = [];
+    SND.forEach((st, tid) => {
+      // Scheduled-ahead is exactly the delay: audio already queued against the
+      // context clock but not yet at the speakers, plus at most one 20 ms frame
+      // the reader has not unpacked.  Same meaning as the <audio> element's
+      // buffered.end() - currentTime, which is what this replaces.
+      let b = -1;
+      try { b = st.next - st.ctx.currentTime; } catch (_) {}
+      lag.push(tid + ':' + (b < 0 ? -1 : b.toFixed(2)) + ':' + st.dropped);
+    });
+    // The same trip: what this browser measured publish -> painted for video,
+    // so the two directions can be compared with no stopwatch involved.
+    const vid = Object.keys(LAT).map(t => t + ':' + Math.round(LAT[t]));
+    const qs = [];
+    if (lag.length) qs.push('aud=' + lag.join(','));
+    if (vid.length) qs.push('vid=' + vid.join(','));
+    const d = await j('/api/state' + (qs.length ? '?' + qs.join('&') : ''));
     const cams = d.cameras || [];
     LAST = cams;
     cams.forEach(tile);
@@ -1739,6 +2010,170 @@ setInterval(tick, 2500);
 """
 
 
+# -- microphone self-test ---------------------------------------------------
+# The talk path's one unverifiable step is the browser's own capture: the page
+# asks for a 16 kHz AudioContext and reports TALK.ctx.sampleRate, but a rate
+# that is merely *claimed* cannot be trusted -- if the capture really runs at
+# another rate, the server sizes the encoder wrongly, produces audio far faster
+# than the camera consumes it, and the playout becomes a sliced, hissing
+# garble that the pacing hides.  This page measures what the browser actually
+# delivers instead of asking it: open /probe, press once, read the numbers.
+# It touches no camera and plays no sound.
+PROBE_PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Wyze microphone self-test</title>
+<style>
+ body { font: 14px/1.55 -apple-system, system-ui, sans-serif; background:#0d1117;
+        color:#e6edf3; margin:0; padding:28px; max-width:720px; }
+ h1 { font-size:17px; margin:0 0 6px; }
+ p { color:#8b949e; margin:8px 0; }
+ button { font:inherit; padding:10px 16px; border-radius:8px;
+          border:1px solid #30363d; background:#21262d; color:#e6edf3;
+          cursor:pointer; }
+ button:hover { background:#30363d; }
+ table { border-collapse:collapse; margin-top:18px; }
+ th, td { padding:6px 18px 6px 0; text-align:left; vertical-align:top; }
+ th { color:#8b949e; font-weight:500; }
+ .big { font-size:20px; font-weight:600; color:#3fb950; }
+ .bad { color:#f85149; }
+ code { color:#58a6ff; }
+</style></head><body>
+<h1>Microphone self-test</h1>
+<p>Measures what this browser really hands the talk feature. Silent: nothing is
+sent to a camera and nothing is played. It does open the microphone, so the
+browser will ask permission.</p>
+<p><button id="go">Run the self-test (about 6 s)</button></p>
+<div id="out"></div>
+<script>
+const CONSTRAINTS = {audio: {channelCount: 1, echoCancellation: true,
+                             noiseSuppression: true, autoGainControl: true}};
+
+function one(label, makeCtx) {
+  return navigator.mediaDevices.getUserMedia(CONSTRAINTS).then(stream => {
+    const track = stream.getAudioTracks()[0];
+    const set = track.getSettings ? track.getSettings() : {};
+    const ctx = makeCtx();
+    const src = ctx.createMediaStreamSource(stream);
+    const node = ctx.createScriptProcessor(512, 1, 1);
+    const mute = ctx.createGain();
+    mute.gain.value = 0;
+    src.connect(node); node.connect(mute); mute.connect(ctx.destination);
+    let samples = 0, calls = 0, peak = 0, sum = 0, n = 0;
+    node.onaudioprocess = e => {
+      const f = e.inputBuffer.getChannelData(0);
+      samples += f.length; calls++;
+      for (let i = 0; i < f.length; i++) {
+        const a = Math.abs(f[i]);
+        if (a > peak) peak = a;
+        sum += f[i] * f[i]; n++;
+      }
+    };
+    const t0 = performance.now();
+    return new Promise(res => setTimeout(res, 3000)).then(() => {
+      const r = {
+        label: label, ctxRate: ctx.sampleRate, ctxState: ctx.state,
+        trackRate: set.sampleRate || null,
+        trackChannels: set.channelCount || null,
+        device: track.label || '',
+        seconds: (performance.now() - t0) / 1000,
+        samples: samples, callbacks: calls, peak: peak,
+        rms: Math.sqrt(sum / Math.max(1, n)),
+      };
+      node.onaudioprocess = null;
+      try { src.disconnect(); node.disconnect(); } catch (_) {}
+      stream.getAudioTracks().forEach(t => t.stop());
+      try { ctx.close(); } catch (_) {}
+      return r;
+    });
+  });
+}
+
+document.getElementById('go').onclick = () => {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  const out = document.getElementById('out');
+  out.innerHTML = '<p>measuring &mdash; stay quiet or talk normally, either is '
+                + 'fine&hellip;</p>';
+  const asked = () => one('asked for 16000 Hz', () => new AC({sampleRate: 16000}));
+  const plain = () => one('browser default', () => new AC());
+  asked().then(a => plain().then(b => {
+    let rows = '';
+    for (const r of [a, b]) {
+      const rate = r.samples / r.seconds;
+      const ok = Math.abs(rate - r.ctxRate) < r.ctxRate * 0.05;
+      rows += '<tr><th>' + r.label + '</th>'
+            + '<td class="' + (ok ? 'big' : 'big bad') + '">'
+            + Math.round(rate).toLocaleString() + ' samples/s</td>'
+            + '<td>' + r.samples.toLocaleString() + ' samples in '
+            + r.seconds.toFixed(2) + ' s (' + r.callbacks + ' callbacks)</td></tr>'
+            + '<tr><th></th><td colspan="2">context says <code>'
+            + r.ctxRate + ' Hz</code> (' + r.ctxState + ') &middot; mic track '
+            + r.trackRate + ' Hz / ' + r.trackChannels + ' ch<br>device: '
+            + r.device + '<br>peak ' + r.peak.toFixed(3) + ' &middot; rms '
+            + r.rms.toFixed(4) + '</td></tr>';
+    }
+    out.innerHTML = '<table>' + rows + '</table>'
+      + '<p>The first column is the truth; the context&rsquo;s own figure is '
+      + 'only a claim. Green means they agree within 5%.<br>'
+      + '<span id="sent">reporting&hellip;</span></p>';
+    // Three channels to the same endpoint.  A browser that quietly drops one
+    // of them still tells the server what it measured -- and the "reporting:"
+    // line says which one got through, which is itself worth knowing.
+    const payload = JSON.stringify({asked: a, plain: b});
+    const sent = [];
+    fetch('/api/micprobe', {method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: payload})
+      .then(r => sent.push('fetch HTTP ' + r.status))
+      .catch(e => sent.push('fetch failed (' + ((e && e.name) || e) + ')'))
+      .then(() => {
+        const el = document.getElementById('sent');
+        if (el) el.textContent = 'reporting: ' + sent.join(', ');
+      });
+    try {
+      if (navigator.sendBeacon) {
+        navigator.sendBeacon('/api/micprobe',
+                             new Blob([payload], {type: 'application/json'}));
+      }
+    } catch (_) {}
+    try {
+      new Image().src = '/api/micprobe?d=' + encodeURIComponent(payload);
+    } catch (_) {}
+  })).catch(e => {
+    out.innerHTML = '<p class="bad">' + ((e && e.name) || e) + ': '
+                  + ((e && e.message) || 'getUserMedia failed') + '</p>';
+  });
+};
+</script></body></html>
+"""
+
+LAST_PROBE = {}
+
+# What the page's own <audio> element says it is playing behind live, per
+# camera: buffered.end() - currentTime is, by definition, the audio that the
+# browser has already downloaded but has not reached the speaker yet.  That is
+# the whole inbound delay if our server is handing chunks over promptly, so the
+# page reports it on every state poll and the server just records it.
+AUD_LAG = {}
+
+# PCM that arrived when no session could accept it.  A page whose microphone
+# outlived its session -- the leak the session stamp in PAGE fixes -- goes on
+# POSTing forever, so this counter is the fingerprint of a stray capture, and
+# its rate divided by the ~32 kB/s one 16 kHz microphone delivers is roughly
+# how many of them are still out there.  Exposed through /api/state.
+TALK_JUNK = {"bytes": 0, "srcs": set(), "first": 0.0, "last": 0.0}
+
+
+def note_talk_junk(n, src=None):
+    if not n:
+        return
+    if not TALK_JUNK["first"]:
+        TALK_JUNK["first"] = time.time()
+    if src is not None:
+        TALK_JUNK["srcs"].add(src)
+    TALK_JUNK["bytes"] += n
+    TALK_JUNK["last"] = time.time()
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "WyzeCam/1.0"
     protocol_version = "HTTP/1.1"
@@ -1774,6 +2209,41 @@ class Handler(BaseHTTPRequestHandler):
             return json.loads(self._raw_body().decode("utf-8", "replace"))
         except Exception:
             return {}
+
+    def _micprobe(self, d):
+        """Record what the browser measured about its own capture.
+
+        Kept in a module global rather than a worker because it is a property
+        of the browser, not of any camera, and exposed through /api/state so
+        it can be read back without hunting through a log.  It is also the
+        only honest answer to "what rate is the page really giving us": the
+        page *claims* an AudioContext rate, and a claim cannot be trusted.
+        """
+        if not isinstance(d, dict):
+            d = {"raw": str(d)[:300]}
+        LAST_PROBE.clear()
+        LAST_PROBE.update(d)
+        r = d.get("main")
+        if isinstance(r, dict):
+            print("micprobe main: the talk page measured %.0f samples/s captured "
+                  "over %.2f s (%d callbacks, %.0f/s, longest %s samples), and "
+                  "POSTed %s B (%.0f B/s in %d POSTs); claimed %s Hz, %s "
+                  "callbacks from another node"
+                  % (r.get("rate", 0), r.get("wall", 0), r.get("callbacks", 0),
+                     r.get("per_sec", 0), r.get("maxlen"), r.get("posted"),
+                     r.get("post_rate", 0), r.get("posts"), r.get("ctxRate"),
+                     r.get("others")), flush=True)
+        for k in ("asked", "plain"):
+            r = d.get(k)
+            if isinstance(r, dict):
+                print("micprobe %s: %.0f samples/s delivered, context says "
+                      "%s Hz, track %s Hz/%s ch, peak %.3f rms %.4f"
+                      % (k, r.get("samples", 0)
+                         / max(0.001, r.get("seconds", 1) or 1),
+                         r.get("ctxRate"), r.get("trackRate"),
+                         r.get("trackChannels"), r.get("peak", 0),
+                         r.get("rms", 0)), flush=True)
+        return {"ok": True}
 
     # -- stills ------------------------------------------------------------
     def _snapshot(self, tid):
@@ -1927,17 +2397,61 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/favicon.ico":
             self._send(204, b"", "image/x-icon")
         elif path == "/api/state":
+            # The page reports what its <audio> elements are actually playing
+            # behind live (?aud=tid:seconds,tid:seconds).  See AUD_LAG.
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            now = time.time()
+            for pair in (q.get("aud", [""])[0] or "").split(","):
+                if ":" in pair:
+                    parts = pair.split(":")
+                    try:
+                        tid_i = int(parts[0])
+                        AUD_LAG.setdefault(tid_i, {})
+                        AUD_LAG[tid_i].update(behind=float(parts[1]), t=now)
+                        if len(parts) > 2:
+                            AUD_LAG[tid_i]["drop"] = int(parts[2])
+                    except ValueError:
+                        pass
+            for pair in (q.get("vid", [""])[0] or "").split(","):
+                if ":" in pair:
+                    tid_s, ms_s = pair.split(":", 1)
+                    try:
+                        AUD_LAG.setdefault(int(tid_s), {})
+                        AUD_LAG[int(tid_s)].update(vid_ms=float(ms_s), t=now)
+                    except ValueError:
+                        pass
             names = load_devices_file()
             self._json(200, cameras=HUB.state(),
+                       micprobe=LAST_PROBE,
+                       audio_lag=AUD_LAG,
+                       talk_junk={"bytes": TALK_JUNK["bytes"],
+                                  "srcs": len(TALK_JUNK["srcs"]),
+                                  "first": TALK_JUNK["first"],
+                                  "last": TALK_JUNK["last"]},
                        warning=None if names else
                        "wyze_devices.json not found \\u2014 camera names are "
                        "generic.")
         elif path == "/feed":
             self._feed()
+        elif path == "/probe":
+            self._send(200, PROBE_PAGE.encode(), "text/html; charset=utf-8")
+        elif path == "/api/micprobe":
+            # The probe page's fallback channel: an image GET carries the
+            # measurement in the query string, in case fetch is the thing that
+            # is not working.
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            try:
+                d = json.loads(q.get("d", ["{}"])[0])
+            except Exception:
+                d = {"raw": q.get("d", [""])[0][:300]}
+            self._json(200, **self._micprobe(d))
         elif path.startswith("/stream/") and path.endswith(".mjpg"):
             self._stream(path.split("/")[2].split(".")[0])
         elif path.startswith("/audio/") and path.endswith(".wav"):
             self._audio(path.split("/")[2].split(".")[0])
+        elif path.startswith("/pcm/"):
+            # Same audio, no WAV header: what the page's Web Audio reader wants.
+            self._audio(path.split("/")[2], wav=False)
         elif path.startswith("/snapshot/") and path.endswith(".jpg"):
             self._snapshot(path.split("/")[2].split(".")[0])
         else:
@@ -1956,6 +2470,8 @@ class Handler(BaseHTTPRequestHandler):
                        note="; ".join(notes))
         elif path.startswith("/api/talk/"):
             self._talk(path[len("/api/talk/"):].split("/"), self._raw_body())
+        elif path == "/api/micprobe":
+            self._json(200, **self._micprobe(self._body()))
         else:
             self._json(404, error="not found")
 
@@ -1977,15 +2493,38 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 tid = int(parts[1])
             except (ValueError, IndexError):
+                note_talk_junk(len(body), self.client_address)
                 self._json(404, error="bad camera id")
                 return
             w, err = HUB.ensure(tid)
             if err:
+                note_talk_junk(len(body), self.client_address)
                 self._json(503, error=err)
+                return
+            # A body that is entirely printable ASCII is not PCM16: real
+            # samples use all 256 byte values, and even pure silence is zeros.
+            # Text here means a client JSON-encoded its samples -- an object of
+            # indices, nine characters per byte -- which the camera would play
+            # as braces and decimal digits.  Refuse it and say why, so the page
+            # shows the reason on the button instead of anyone hearing garbage.
+            if body[:1] in (b"{", b"[") and all(0x20 <= c <= 0x7e for c in body):
+                if not w.talk_text_said:
+                    w.talk_text_said = True
+                    w.log("talk: refusing text bodies from the page (%d B "
+                          "starting %r) -- PCM must be raw samples"
+                          % (len(body), bytes(body[:16])))
+                self._json(400, error="the page is sending text, not PCM "
+                                      "samples -- reload it")
                 return
             # Any length is accepted: a dropped or short chunk must not end the
             # session, only make this one answer say "nothing to send".
-            self._json(200, ok=bool(body) and w.talk_feed(bytes(body)))
+            # The client's address is recorded so a session can report how many
+            # separate connections fed it: a page that leaked microphones, or a
+            # second tab, shows up here as more than one.
+            ok = bool(body) and w.talk_feed(bytes(body), src=self.client_address)
+            if body and not ok:
+                note_talk_junk(len(body), self.client_address)
+            self._json(200, ok=ok)
             return
         if verb in ("start", "stop"):
             # _raw_body() gives bytes here: this is a real body, not _body().
@@ -2003,7 +2542,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(503, error=err)
                 return
             if verb == "start":
-                err = w.talk_begin(rate=d.get("rate"))
+                err = w.talk_begin(rate=d.get("rate"), dry=bool(d.get("dry")))
                 self._json(200 if not err else 503,
                            **({"error": err} if err else {"ok": True}))
             else:
@@ -2117,19 +2656,23 @@ class Handler(BaseHTTPRequestHandler):
                   % (served, t_write))
 
     # -- audio -------------------------------------------------------------
-    def _audio(self, tid):
-        """Stream 16 kHz mono PCM16 WAV built from the camera's mu-law audio.
+    def _audio(self, tid, wav=True):
+        """Stream 16 kHz mono PCM16 built from the camera's mu-law audio.
+
+        Two shapes, same audio.  `/audio/<tid>.wav` is a streaming WAV for an
+        <audio> element or a shell tool; `/pcm/<tid>` is the same PCM with no
+        header, for the page, which reads it with fetch() and schedules it on
+        an AudioContext.  The page stopped using <audio> because a media
+        element insists on buffering ~2.5 s of a live stream (measured:
+        buffered.end() - currentTime) to protect itself against stalls it
+        cannot otherwise survive -- a delay our own reader can simply decline.
 
         The camera emits audio interleaved with video on the same linktype/conv,
         and CameraStream._abuf holds gap-filled mu-law (see
         CameraStream._take_audio_frames, which pads every 40000 us hole with
         mu-law zero so the timeline stays at 50 frames/s).  CameraStreamThread
         collects it in a bounded deque; this endpoint decodes each chunk to
-        linear PCM and serves a streaming WAV (RIFF header with 0xFFFFFFFF
-        sizes, then raw PCM).
-
-        PCM rather than mu-law because browser support for format 7 is uneven
-        (Safari especially) and 32 kB/s over the LAN is free.
+        linear PCM.
 
         `?gain=N` (1..64) multiplies before clipping -- the camera's mic idles
         at about -76 dBFS, correct but inaudible.
@@ -2151,7 +2694,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         self.send_response(200)
-        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Content-Type",
+                         "audio/wav" if wav else "application/octet-stream")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Connection", "close")
         self.end_headers()
@@ -2164,8 +2708,9 @@ class Handler(BaseHTTPRequestHandler):
             1, 1, SAMPLE_RATE, SAMPLE_RATE * 2, 2, 16,
             b"data", 0xFFFFFFFF)
         try:
-            self.wfile.write(riff)
-            self.wfile.flush()
+            if wav:
+                self.wfile.write(riff)
+                self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             return
 
