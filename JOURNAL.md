@@ -1920,3 +1920,152 @@ starved camera and a stretched voice.  Record the camera's speaker with the
 Mac's external mic (`ffmpeg -f avfoundation -i ":1"`) and always take a
 silent-room control first -- with it, one 90-second sitting settled what two
 phases of adjectives could not.
+
+
+## Phase 23 -- live browser talk: the page was JSON-encoding the audio
+
+Phase 22's file-driven talk was clean and verified by ear; the browser path was
+not, and had never been. The two paths differ in exactly one place -- who POSTs
+the PCM -- so the fault had to sit on the page's side of that boundary. It did,
+and it was one line.
+
+### The instrument that found it
+
+Everything below is one tab, dry (`?drytalk=1`, no camera involved):
+
+| reading | value |
+|---|---|
+| what the page captured | 15,823 samples/s, 121 callbacks at 31/s, longest 512, **0 callbacks from another node** |
+| what the page said it POSTed | 123,904 B in 121 POSTs (= 121 x 1024) |
+| what the server counted receiving, while broken | **293,324 B/s from 1 connection** = **9.2x** the 32,000 B/s a 16 kHz microphone sends |
+| idle junk (`TALK_JUNK`) | **0 B/s** |
+
+The last row is the one that mattered. A stray tab or an orphaned capture node
+would have appeared as junk, and there was none -- so this was not eight leaked
+microphones, it was one honest page whose bytes were nevertheless nine times too
+long. That left the bytes themselves.
+
+### The bug
+
+`talkReq()` JSON-encoded every body it was handed. `TALK.pending.slice()` is a
+`Uint8Array`, and `JSON.stringify()` of a `Uint8Array` is not a list, it is an
+**object of indices**:
+
+    {"0":42,"1":42,...,"1023":7}
+
+about **nine characters per audio byte**, and not PCM at all. The camera was
+being fed braces, quote marks and decimal digits. One fact explains every
+symptom at once: the continuous noise, the unintelligible voice, "it makes
+sound even when I am not speaking", and the 9.2x arrival rate. It is also
+exactly the difference between the two paths, because the file-driven test
+posted raw bytes from Python. `json.dumps` of a real 1024-byte chunk came to
+**14,380 bytes** (14x), which brackets the measured 9.2x across the range of
+sample values.
+
+### The fix, and the guard that keeps it fixed
+
+* Binary bodies now go as `application/octet-stream`; only JSON objects are
+  stringified.
+* The server **refuses** any body that is entirely printable ASCII with
+  `HTTP 400 "the page is sending text, not PCM samples"`, logged once. PCM16
+  uses all 256 byte values and silence is zeros, so an all-printable body is
+  never audio -- a stale page can only ever put a message on the button, never
+  text into a speaker.
+
+### Verified at both ends, live
+
+    page: 43,008 B in 42 POSTs      server: 43,008 B in 42 POSTs at 32,329 B/s
+    page: 35,840 B in 35 POSTs      server: 35,840 B in 35 POSTs at 32,095 B/s
+    102 AMR frames -> 17 packets, 2040 ms declared, 1 connection, junk 0
+
+By ear: **"It worked - it's my voice."**
+
+### Kept, but not the cause
+
+The race the session stamp fixes is real and worth keeping: `talkStart()` sets
+`TALK.tid` only after `getUserMedia` and the start POST resolve, so a tap inside
+that ~100-300 ms window made `talkStop()` a no-op *and* let a second capture
+node start, whose microphone then stayed open. Slots are now claimed
+synchronously, sessions are stamped, and a stale node's callbacks are inert.
+It is a real leak -- but it was not the 9.2x, and the 0 B/s junk reading is what
+ruled it out.
+
+### The lesson
+
+Both halves of the evidence were needed, and neither alone would have found it.
+The page's *claim* (15.8 kHz, one node) and the server's *count* (293 kB/s)
+disagreed 9x, and the honest conclusion was neither "the page is lying" nor "the
+server is miscounting" but "the same bytes are longer than they should be".
+Counting one quantity at both ends of the same session is what made a one-line
+bug visible.
+
+
+## Phase 24 -- the camera's sound was 2.4 s late, and it was the browser
+
+The symptom, right after Phase 23: our voice reaches the camera almost
+instantly, but the sound *from* the camera takes seconds to reach the stream. They are two different mechanisms, and only one of them is ours.
+
+| direction | who owns it | measured |
+|---|---|---|
+| us -> camera | our own paced push (`TALK_PREBUFFER` 0.18 s) | ~0.2 s |
+| camera -> server | `_abuf` -> `audio_chunks`, drained in a tight loop, starting at the **tail** and never the backlog | newest chunk is **24-50 ms** old (`audio.age`) |
+| **server -> speaker** | the page's `<audio>` element | **2.47 s** |
+
+`/audio/<tid>.wav` is a streaming WAV (RIFF with 0xFFFFFFFF sizes), and an
+`<audio>` element pointed at a live stream is a *media player*: it fills a
+read-ahead buffer so that a stall cannot make it stutter, and it cannot be told
+"stay 150 ms behind and no more". `buffered.end() - currentTime` is exactly that
+buffer, and having the page report it on the poll it already makes produced the
+2.47 s -- while the same page measured the video at **7-21 ms** publish to
+painted. The delay was neither the camera nor Python.
+
+### The replacement
+
+* `GET /pcm/<tid>` -- the same 16 kHz mono PCM16, no WAV header.
+* The page reads it with `fetch()` + `body.getReader()` and schedules 16 kHz
+  `AudioBuffer`s on an `AudioContext` at `SND_LEAD` = 0.15 s ahead. The node
+  resamples to the device rate, so the page never has to know it.
+* `SND_MAX_AHEAD` = 0.6 s is the inbound twin of the video path's `MAX_LAG`:
+  past it we are replaying history rather than listening, so the queue is
+  dropped and the timeline jumps back to live.
+* The gain slider is now a `GainNode` -- instant, in float, and no longer
+  restarts the stream.
+
+### Measured result
+
+| | before | after |
+|---|---|---|
+| behind live (the page's own report) | 2.47 s | **0.23-0.30 s** |
+| dropped / resyncs | -- | **0** |
+| `/pcm` delivery | -- | 32,133 B/s = real time, first bytes in 50 ms, 8.02 s of audio per 8.00 s |
+
+By ear: **"Delay is gone - it's in sync."** The zero drops is the part that
+matters -- the latency is not being bought with glitches.
+
+### What the residual 0.25 s is, and what would go below it
+
+`behind` is `SND_LEAD` plus one delivery unit. The camera's audio reaches
+`_abuf` and is flushed once per 0.05 s worker pump, about 20 chunks/s, so
+0.15 + 0.05..0.10 is what is observable. Lowering `SND_LEAD` alone cannot go
+below that floor; the delivery unit would have to shrink, which means a faster
+worker loop, not a smaller lead.
+
+### A trap worth recording
+
+A `/pcm` client read 4,096 B in **14 s** (290 B/s) and the obvious conclusion --
+"the audio path is 100x slow" -- was wrong. The worker log showed
+`definition=2 gave no video`, then `stream stalled`, then a fresh `CALLING`: the
+camera had restarted mid-read, so the counters belonged to a brand-new worker.
+Read the worker's log before believing a throughput number, and never conclude
+anything from one bad run.
+
+### Still open
+
+* **Individual cameras stop delivering audio while their video continues.**
+  Camera 4 was seen at `audio.age` **33.999 s** and camera 2 at 3.593 s with a
+  full 200-chunk queue, both streaming at ~20 fps. The worker is alive, so this
+  is the camera's audio, not our reader thread.
+* The ~200 ms lost at the start of a talk session (Phase 22) is still there.
+* `getUserMedia` still asks for `echoCancellation` / `noiseSuppression` /
+  `autoGainControl`; those are now the prime suspects for real-talk *quality*
+  (they cannot explain anything measured in Phases 23 or 24).

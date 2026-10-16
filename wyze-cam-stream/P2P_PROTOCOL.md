@@ -2074,3 +2074,64 @@ chopped" before).
   0 vs the app's ~15 000 000 made no difference to audibility).
 * **No signalling is required on the high conv**; the AvStreamCtl side is
   independent of the audio path.
+
+### 13f. The transport to the server: raw bytes, and nothing else
+
+The PCM that feeds all of the above reaches the server over three small POSTs
+(`/api/talk/start`, `/api/talk/pcm/<tid>`, `/api/talk/stop`) and **the body of
+the PCM POST must be raw little-endian PCM16**.  This is not a style
+preference, it cost Phase 23 the whole feature:
+
+* `JSON.stringify()` of a `Uint8Array` is an **object of indices**
+  (`{"0":12,"1":7,...}`), roughly **nine to fourteen bytes per audio byte**,
+  and it is not PCM at all -- the camera plays the braces, quotes and decimal
+  digits as audio.  The symptom is continuous garbage that is audible even when
+  nobody is speaking, at an arrival rate ~9x what the client believes it sent.
+* The server therefore **rejects any body that is entirely printable ASCII**
+  (0x20..0x7e) with `HTTP 400`, because PCM16 uses all 256 byte values and even
+  digital silence is zeros.  A client that gets this wrong now gets told.
+
+Packing happens on the pump thread (`_talk_tick`), never on the HTTP thread, and
+the reader below it must use `read1` -- see Phase 21, where `read` threw away
+two thirds of every sentence.
+
+## 14. Camera -> client audio, and the browser's share of the delay  [SOLVED]
+
+The inbound direction is a different pipeline from section 13, and the delay
+lives in a different place.
+
+    camera --(linktype 4, mu-law interleaved with video)--> _abuf
+           --(one append per worker pump, ~20 chunks/s)--> audio_chunks deque
+           --(GET /audio/<tid>.wav or /pcm/<tid>)--> client
+
+* **The camera's stream is 16 kHz mu-law**, not 8 kHz: one frame is 320 samples
+  per 20 ms.  Frames the camera's own timestamps say we missed are back-filled
+  with mu-law 0xff (digital zero) so the timeline stays continuous -- without
+  that, playback would run 26 % fast and drift against the video.
+* **`/audio/<tid>.wav`** serves it as a streaming WAV (RIFF, `0xFFFFFFFF` sizes,
+  format 1, 1 ch, 16 kHz, 16 bit).  `?gain=1..64` multiplies before clipping,
+  because the mic idles near -76 dBFS.
+* **`/pcm/<tid>`** is the same audio with no header, for the page.
+* A listener starts at `audio_tail()`, i.e. at the **newest** chunk.  Starting
+  at 0 replays the whole 200-chunk backlog (~2 s of stale audio) as one burst.
+* Measured server side: the newest chunk is **24-50 ms** old when it is handed
+  over, queue depth 0.  Our side of this path is not where the delay is.
+* **Measured browser side, with the `<audio>` element the page used to use:
+  `buffered.end() - currentTime` = 2.47 s.**  A media element pointed at a live
+  stream is a player; it fills a read-ahead buffer so a stall cannot make it
+  stutter, and it cannot be told to stay closer to live.  That buffer *was* the
+  delay, while the same browser measured video publish -> painted at 7-21 ms.
+* The page now reads `/pcm/<tid>` with `fetch()` + `body.getReader()` and
+  schedules 16 kHz `AudioBuffer`s on an `AudioContext` `SND_LEAD` = 0.15 s ahead
+  (the node resamples to the device rate).  `SND_MAX_AHEAD` = 0.6 s drops the
+  queue and jumps back to live, the inbound twin of `MAX_LAG`.  Result:
+  **0.23-0.30 s behind live, 0 drops**, and 32,133 B/s delivered = real time
+  with first bytes in 50 ms.
+
+The floor on that 0.25 s is `SND_LEAD` **plus one delivery unit** (~50 ms), not
+`SND_LEAD`: the worker flushes `_abuf` once per 0.05 s pump.  Going lower means
+a faster worker loop, not a smaller lead.
+
+`/api/state` exposes the numbers needed to re-check all of this without
+guessing: per camera `audio.q` / `audio.age`, and the page's own report as
+`audio_lag` (`?aud=tid:behind:dropped`, `?vid=tid:ms`).
