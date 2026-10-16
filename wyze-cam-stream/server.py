@@ -138,6 +138,14 @@ TALK_MIC_HZ = 16000            # what the browser captures and POSTs to us
 TALK_FRAMES_PER_PKT = 6        # six 20 ms AMR-NB frames = 120 ms per packet
 TALK_PKT_SECONDS = 0.120
 TALK_IDLE_TIMEOUT = 2.0        # no PCM for this long -> close the session
+# Jitter buffer between ffmpeg and the camera.  It has to be deep enough to
+# ride out a slow pump iteration but shallow enough not to be heard: the queue
+# IS latency, because the camera plays it at 1x.  24 frames = 480 ms.
+TALK_QUEUE_FRAMES = 4 * TALK_FRAMES_PER_PKT
+# The pump loop's cadence is set by the VIDEO side, not by talk, so one packet
+# per iteration is not the same as one packet per 120 ms.  Allow the tick to
+# send the packets it is behind by, but not more than this per call.
+TALK_MAX_BURST = 3
 # Speech bytes per AMR-NB mode, the ToC octet aside (RFC 4867 table 1).  We
 # always encode 12.2 kbit/s (mode 7, 31 bytes), but a silent mic makes the
 # encoder emit NO_DATA/SID frames, so the table has to be complete or the
@@ -248,7 +256,7 @@ class CameraStreamThread(threading.Thread):
         self.talk_on = False              # the page is holding its talk button
         self.talk_opened = False          # the opening frames have been sent
         self.talk_next = 0.0              # when the next packet may go out
-        self.talk_frames = collections.deque(maxlen=60)   # 31-byte AMR payloads
+        self.talk_frames = collections.deque(maxlen=TALK_QUEUE_FRAMES)  # payloads
         self.talk_ff = None               # the AMR encoder
         self.talk_stop = None
         self.talk_stats = {"pcm_bytes": 0, "frames": 0, "packets": 0,
@@ -531,7 +539,7 @@ class CameraStreamThread(threading.Thread):
                 return "cannot start ffmpeg: %s" % e
             self.talk_ff = ff
             self.talk_stop = threading.Event()
-            self.talk_frames = collections.deque(maxlen=60)
+            self.talk_frames = collections.deque(maxlen=TALK_QUEUE_FRAMES)
             self.talk_opened = False
             self.talk_next = 0.0
             self.talk_stats.update({"pcm_bytes": 0, "frames": 0,
@@ -543,19 +551,26 @@ class CameraStreamThread(threading.Thread):
             return None
 
     def _talk_reader(self):
-        """ffmpeg's AMR bytes -> talk_frames, as 31-byte payloads (no ToC)."""
+        """ffmpeg's AMR bytes -> talk_frames, as 31-byte payloads (no ToC).
+
+        read1, not read: read(n) on a pipe BLOCKS until it has all n bytes, and
+        the encoder only produces ~1.6 kB/s (12.2 kbit/s), so read(1024) sat
+        there for ~640 ms and then handed up ~32 frames in one lump.  The queue
+        is 24 frames deep, so two thirds of every lump was thrown away and the
+        camera got fragmentary audio -- which is exactly what "the sound is
+        awful" was.  read1 returns as soon as anything has arrived, the same
+        lesson the video drain thread learned (see _drain above).
+        """
         ff, stop = self.talk_ff, self.talk_stop
         buf = bytearray()
         hdr_done = False
-        got = frames = 0
         while not stop.is_set():
             try:
-                b = ff.stdout.read(1024)
+                b = ff.stdout.read1(4096)
             except (OSError, ValueError):
                 break
             if not b:
-                break
-            got += len(b)
+                break                       # encoder exited
             buf += b
             if not hdr_done and len(buf) >= 6:
                 if bytes(buf[:6]) == b"#!AMR\n":
@@ -566,13 +581,12 @@ class CameraStreamThread(threading.Thread):
                 if len(buf) < size + 1:
                     break
                 if size:
+                    # deque(maxlen=TALK_QUEUE_FRAMES) drops the OLDEST frame if
+                    # this ever overflows -- the right end to lose, because the
+                    # newest audio is what the speaker is saying right now.
                     self.talk_frames.append(bytes(buf[1:1 + size]))
-                    frames += 1
                 del buf[:1 + size]
-            # Bound the queue: if the browser ever outruns the camera,
-            # send its newest audio rather than a growing backlog.
-            while len(self.talk_frames) > 2 * TALK_FRAMES_PER_PKT:
-                self.talk_frames.popleft()
+
     def talk_feed(self, pcm):
         """Accept 16 kHz PCM16 from the page.  Returns False if it is dropped."""
         with self.talk_lock:
@@ -612,7 +626,7 @@ class CameraStreamThread(threading.Thread):
                 pass
 
     def _talk_tick(self, st, now):
-        """Send one 120 ms packet when the encoder has six frames ready.
+        """Send the 120 ms packets that are due, if six frames are ready.
 
         Runs on the pump thread: CameraStream's socket has one owner and this is
         it.  A tiny job, which is why it is a tick and not a thread.
@@ -629,23 +643,31 @@ class CameraStreamThread(threading.Thread):
             st.open_talk()
             self.talk_opened = True
             self.talk_next = now
-        if (len(self.talk_frames) < TALK_FRAMES_PER_PKT
-                or now < self.talk_next):
-            return
-        batch = [self.talk_frames.popleft()
-                 for _ in range(TALK_FRAMES_PER_PKT)]
-        st.send_talk(batch)
-        self.log("talk: sent pkt %d q=%d dt=%.3f"
-                 % (self.talk_stats["packets"], len(self.talk_frames),
-                    time.time() - getattr(self, "_talk_t0", time.time())))
-        self._talk_t0 = time.time()
-        self.talk_stats["packets"] += 1
-        self.talk_stats["frames"] += len(batch)
-        self.talk_stats["audio_ms"] += TALK_PKT_SECONDS * 1000
         # Pace at 1x the declared audio: six 20 ms frames per 120 ms.  A burst
         # from the browser must not become a burst on the wire, or the camera
         # buffers it and the speaker hears their own voice come back late.
-        self.talk_next = max(self.talk_next, now) + TALK_PKT_SECONDS
+        #
+        # Send every packet that is DUE, not one per call: this tick runs at
+        # the pump loop's cadence, and that loop is paced by the video side (a
+        # 50 ms select that overruns whenever ffmpeg applies back-pressure), so
+        # one packet per call silently stretched 120 ms into whatever the video
+        # happened to take.  If the loop was starved for longer than half a
+        # second, forgive the debt instead of catching up -- replaying it would
+        # only add latency, which is what the listener actually hears.
+        if now - self.talk_next > 0.5:
+            self.talk_next = now
+        sent = 0
+        while (sent < TALK_MAX_BURST
+               and len(self.talk_frames) >= TALK_FRAMES_PER_PKT
+               and now >= self.talk_next):
+            batch = [self.talk_frames.popleft()
+                     for _ in range(TALK_FRAMES_PER_PKT)]
+            st.send_talk(batch)
+            self.talk_stats["packets"] += 1
+            self.talk_stats["frames"] += len(batch)
+            self.talk_stats["audio_ms"] += TALK_PKT_SECONDS * 1000
+            self.talk_next += TALK_PKT_SECONDS
+            sent += 1
 
     def _discover(self):
         for _ in range(DISCOVER_ATTEMPTS):

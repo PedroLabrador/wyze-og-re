@@ -1711,3 +1711,88 @@ timing and byte rate; `talkamr.py` -- the AMR round-trip) are kept next to it.
 The camera holds **one** session, and the server's worker already owns it, so
 talk cannot open its own `CameraStream`.  It has to be pushed through the same
 socket the worker is pumping -- see Phase 21.
+
+## Phase 21 -- two-way audio, productised: two thirds of every sentence was being thrown away
+
+The talk path is in `wyze-cam-stream/server.py`: a hold-to-talk button per tile
+and in the fullscreen bar, three endpoints (`POST /api/talk/start`,
+`/api/talk/pcm/<tid>`, `/api/talk/stop`), and the packing done by the *worker*,
+not the HTTP thread, because the camera holds one session and `send_talk()`
+pushes on that session's low conv (`kcp_lo`), which the pump thread owns.
+
+The browser captures 16 kHz mono with `getUserMedia` + the deprecated
+`ScriptProcessorNode` (no build step) and POSTs 1024-byte (32 ms) Int16LE
+chunks; ffmpeg resamples 16k -> 8k and encodes AMR-NB 12.2k; the worker sends
+one 226-byte packet per 120 ms.
+
+### The first live test sounded awful, and the reason was measurable
+
+The camera **did** make noise, so the framing, cipher, conv and codec were all
+right.  What was wrong showed up in the counters: 5.02 s of PCM accepted
+(139 264 B = 4.35 s of 16 kHz audio) produced ~215 AMR frames at the encoder,
+but only **72 frames (1.44 s) reached the wire -- 33 %**.  Two thirds of every
+sentence was simply discarded.
+
+**Root cause: `ff.stdout.read(1024)`.**  `read(n)` on a pipe's buffered reader
+blocks until it has *all* n bytes.  The encoder emits ~1.6 kB/s (12.2 kbit/s),
+so the reader sat there ~640 ms and then handed up ~32 frames in one lump --
+and the queue was capped at 12 frames, so each lump lost ~20 frames as it
+arrived.  That is exactly the observed 33 %.
+
+This is the *same* bug the video side had already been fixed for (`_drain`
+uses `read1`); the talk reader was written later and never got the lesson.
+Fix: `read1(4096)`.
+
+Two smaller faults in the same path:
+
+* the queue was bounded twice (a `maxlen=60` deque plus an explicit
+  `popleft()` loop down to 12) -- the explicit loop was the binding one.  Now a
+  single `deque(maxlen=TALK_QUEUE_FRAMES)` = 24 frames (480 ms) drops the
+  oldest, which is the right end to lose.
+* `_talk_tick` sent **at most one packet per call**, but it is called once per
+  pump-loop iteration and that loop's cadence is the *video* side's (a 50 ms
+  `select` that overruns whenever ffmpeg applies back-pressure on stdin).  So
+  120 ms silently stretched to whatever the video took.  It now sends every
+  packet that is *due*, capped at `TALK_MAX_BURST = 3`, and forgives the debt
+  if the loop was starved for more than 0.5 s (replaying a starved backlog would
+  only add latency, which is what the listener actually hears).
+
+### Verified locally, silently, with no camera and no network
+
+A stub `CameraStream` plus the real encoder and the real reader, fed 4.42 s of
+silence (`talkreadertest.py`):
+
+| | before | after |
+|---|---|---|
+| delivered to the camera | 1.44 s (33 %) | **4.32 s (98 %)** |
+| queue depth reached | pinned at its 12-frame cap | max 6 frames (120 ms) |
+
+The remaining 2 % is the encoder's own tail latency.  Queue depth is the thing
+to watch here, because the queue *is* latency -- the camera plays it at 1x.
+
+### Also settled, offline: the app's own content is 1x, not 2x
+
+`talkrate.py` re-reads `/tmp/ctrltalk.pcap` keeping timestamps (the shared
+`pcapparse.read_pcap` throws them away, which is how the wrong number got into
+Phase 20): **128 talk packets, 17.87 s wall span, 15.36 s of declared audio,
+ratio 0.86**; p50 gap 0.110 s; the frame counter steps 55-62 per packet against
+our `TALK_COUNTER_STEP = 60`.  So the app sends one 120 ms packet per ~110 ms
+of real time -- its content is natural, and it is *not* over-feeding the camera
+2x.  That contradicts Phase 20's "half rate" conclusion, so `P2P_PROTOCOL.md`
+§13d is marked broken and the next step there is a **headphone** A/B on the
+capture alone (silent to the room, no camera trip).
+
+### Still to do, in order
+
+1. Headphone A/B (above) to close the pacing question without a camera.
+2. One warned camera test of the fixed product path -- on Camera 1 (`192.168.77.12`).
+3. The camera-controls goal stays parked: the capture shows the light/IR
+   toggles never touch the LAN, so there is nothing local to reverse.
+
+### Notes for next time
+
+Do not walk a camera test on the strength of a counter alone.  This phase's
+bug was visible in `talk_stats` for several runs (72 frames for 4.35 s of
+input) while the code "compiled, streamed, and worked" -- the audio was just
+one third of itself.  Compare *delivered declared seconds* against *PCM
+seconds fed* every time; they must match within the encoder's tail.
