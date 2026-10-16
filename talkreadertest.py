@@ -54,11 +54,17 @@ def main():
 
     pcm_s = n * 1024 / 2 / server.TALK_MIC_HZ
     sent_s = st.packets * server.TALK_PKT_SECONDS
+    # We hand the camera content that is deliberately 2x SLOW (its own playout
+    # is 2x fast), so one declared second of what we ship carries only
+    # TALK_CAMERA_PLAYOUT seconds of real speech.  Compare real-to-real, or this
+    # looks like a 50 % drop when it is nothing of the kind.
+    covered = sent_s * server.TALK_CAMERA_PLAYOUT
     print("fed      : %d POSTs = %.2f s of 16 kHz PCM" % (n, pcm_s))
     print("produced : %d AMR frames = %.2f s declared"
           % (w.talk_stats["frames"], w.talk_stats["frames"] * 0.02))
-    print("sent     : %d packets = %.2f s declared (%.0f%% of the input)"
-          % (st.packets, sent_s, 100.0 * sent_s / pcm_s))
+    print("sent     : %d packets = %.2f s declared = %.2f s of real speech "
+          "(%.0f%% of the input)"
+          % (st.packets, sent_s, covered, 100.0 * covered / pcm_s))
     print("queue    : max %d frames, final %d" % (max(produced), len(w.talk_frames)))
     w.talk_end()
 

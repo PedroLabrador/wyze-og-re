@@ -1934,7 +1934,7 @@ conclude anything from a single zero-media run; only `1920x1080` and `640x360`
 are trustworthy single-shot signals.
 
 
-## 13. Client -> camera audio (two-way talk)  [SOLVED, with one open question]
+## 13. Client -> camera audio (two-way talk)  [SOLVED]
 
 This is the only direction in which the *client* sends media.  Everything else
 we send (AvStreamCtl, CALLING, KCP control) is signalling; this is user data
@@ -1989,77 +1989,82 @@ Only their *effect* is known; they are not needed to open the audio path (the
 camera plays audio if the 226-byte frames arrive), but they are cheap and are
 sent to stay close to the app.
 
-### 13d. Pacing and the playback-rate anomaly  [OPEN -- the pacing argument below does not hold]
+**That "16000 Hz / 320 samples" is not decoration -- it is the playout rate.**
+The camera runs a 16 kHz DAC over the 160-sample (8 kHz, 20 ms) AMR frames we
+send it, i.e. 10 ms per frame, so anything we hand over comes back an octave up
+and 2x fast.  The client must therefore hand over content that is deliberately
+2x slow and feed it twice as often; see §13d, which measures this.
 
-> **Re-measured (Phase 21) and this section's arithmetic is wrong.**  Reading
-> the pcap with timestamps instead of throwing them away gives 128 talk
-> packets over a 17.87 s wall span carrying **15.36 s of declared audio**, a
-> ratio of **0.86 -- not 1.0 and nowhere near 2.0**.  The p50 inter-packet gap
-> is 0.110 s against 0.120 s of declared audio per packet.  So the app sends
-> one 120 ms-declared packet per ~110 ms of wall time, which means the app's
-> own content is **1x, i.e. natural** -- it is *not* over-feeding the camera
-> 2x, and the "the app is broken in the same way" note at the bottom of this
-> section is therefore not supported.
->
-> That leaves the two readings in direct conflict: either the capture is
-> natural and the earlier "the camera plays at half rate" ear checks were
-> confounded, or the camera really does play at half rate and the app's own
-> talk is broken.  **The next step is not a camera trip**: replay the capture
-> over *headphones* (silent to the room) as two clips -- decoded
-> at its own 8 kHz, and sped up 2x -- and ask which one is their normal voice.
-> That is a clean A/B of the capture alone.  All of Phase 21's product work
-> assumes the "natural" reading; see JOURNAL Phase 21.
->
-> One more constraint, from §13c's opening frame: it declares **16000 Hz and
-> 320 samples**, i.e. 20 ms per frame, while the AMR-NB frames it precedes
-> carry 160 samples.  A camera that resamples 160 -> 320 and plays at 16 kHz
-> gets exactly the 20 ms the frame declares, which is *natural* playback and
-> would make the app's 1x content correct.  The half-rate reading therefore
-> requires the camera to ignore its own declared sample rate -- possible, but
-> it is now the reading that needs the evidence, not the other one.
->
-> Cash 2x in only if a clean 1x-vs-2x camera test (one trip, both clips in the
-> same session) says so.
+### 13d. Pacing: the camera plays what we send at 2x  [SOLVED -- measured, 2026-10-16]
 
-Replaying the captured audio **byte-for-byte at the app's own interval
-(~120 ms per packet)** makes the camera play it back as *slow motion* -- the
-speech is recognisable but stretched and pitched down.
+This section was argued twice from adjectives and was wrong twice.  It is now
+settled with an instrument: the camera's own speaker was recorded through a
+microphone while a known signal was played through the real product path, and
+the wire content of that signal was separately verified with ffmpeg.
 
-Measured with the capture itself: the app sent 129 packets over 15.2 s, i.e.
-1.0x realtime in "declared" AMR time (6 x 20 ms per packet).  The audio the
-capture decodes to is **normal-pitched** speech (cepstral F0 of the loud voiced
-segments lands at 86-145 Hz, i.e. an ordinary male voice; the autocorrelation
-estimator's 50 Hz was an artefact of the 160-sample AMR frame period).
+The signal was **1.5 s of a 1 kHz tone** (control: our encoder's output decodes
+to 1000 Hz dominant at 0.126, every other band below 0.001) plus **two silent
+controls** (a quiet-room recording measures -72 dBFS and contains no tone in
+any band, so nothing in the recording came from the room).
 
-The decisive experiment: **the identical clip sped up 2x**
-(`asetrate=16000,aresample=8000` before re-encoding, which halves the duration
-and doubles the pitch) read as **normal speed**.  So the camera renders
-declared AMR time at **half rate**, and to sound right the client must feed
-content that is 2x faster than natural.
+| observed at the camera | value |
+|---|---|
+| the 1 kHz tone, fed one packet per 120 ms | **2000 Hz dominant** (96.7 % of band energy) |
+| tone duty, 2 ms windows, at that 1x feed | **51 %** -- on-runs 50 ms, off-runs 20-90 ms |
+| the same tone, once fed one packet per 60 ms | **990-1000 Hz**, continuous over 3.03-4.30 s, **no interior hole**, duty 90-100 % |
 
-Two mechanisms fit the observation equally well and are not distinguished yet:
+### The rule
 
-1. the camera plays the decoded 8 kHz samples at ~4 kHz; or
-2. the camera inserts a gap after each 20 ms frame, so each declared second
-   occupies two real seconds.
+The camera runs a **16 kHz DAC over our 8 kHz AMR**: each 160-sample (20 ms)
+frame is rendered in 10 ms.  That is exactly what §13c's opening frame asks for
+-- it declares **16000 Hz / 320 samples** -- and it is why a 1 kHz tone comes
+back an octave up.
 
-Neither is distinguishable from the ear alone, and both give the same rule.
-The app appears to be broken in the same way (it sends 120 ms of audio every
-120 ms, i.e. 2x faster than the camera consumes), which is consistent.
+| quantity | value |
+|---|---|
+| declared seconds the camera consumes per real second | **2.0** |
+| content it therefore needs | **2x SLOW**, so its 2x playout restores natural pitch *and* natural timeline |
+| packet rate | one 120 ms packet every **60 ms** |
 
-**What the product actually implements** (and the two are *not* the same, which
-is why this section is now marked broken): `wyze-cam-stream/server.py` runs a
-**proper resample** -- `-f s16le -ar 16000 -i pipe:0 ... -ar 8000 -c:a
-libopencore_amrnb` -- so one 20 ms declared frame carries 20 ms of real audio
-and the tick paces one 6-frame packet per 120 ms.  That is "natural content at
-1x pacing", the opposite of 2x, and it is the reading the pacing measurement
-above supports.
+Both halves are needed.  Stretching without the faster feed fixes the pitch and
+leaves the holes; feeding faster without stretching removes the holes and
+leaves a chipmunk.
 
-The 2x variant is a one-line change if the headphone A/B says the camera really
-does want it: drop the `-ar 8000` output option *without* letting ffmpeg
-resample (or just feed the encoder 16 kHz samples declared as 8 kHz) and let
-the tick run at 2x.  Do not make that change on the strength of the old ear
-reports alone.
+`wyze-cam-stream/server.py` implements it as `TALK_CAMERA_PLAYOUT = 0.5` (real
+seconds the camera spends per declared second), from which `TALK_CONTENT_HZ =
+8000` (`asetrate=8000` relabels the 16 kHz microphone as 8 kHz -- the same
+samples, twice the declared duration, half the pitch) and
+`TALK_PKT_REAL_SECONDS = 0.060` are derived, so the two cannot drift apart.
+The same sitting, with the fix in: on headphones the beep reads as **"steady, no
+cutting"** and the spoken voice as **"normal speed/pitch"** (against "slow, and
+chopped" before).
+
+### Why the two earlier readings were wrong
+
+* **Phase 20: "the camera renders declared time at *half* rate, so feed
+  2x-*faster* content and pace one packet per 240 ms."**  That reading was
+  taken while only 33 % of the audio was reaching the wire (the `read` vs
+  `read1` bug fixed in Phase 21), so the camera was starved to a third of a
+  feed -- nothing measured then about *rate* is trustworthy.  Its prediction is
+  the opposite of what is now measured: a *lower* pitch and a ~100 % duty at a
+  1x feed, rather than an octave up and 51 %.
+* **Phase 21: "the app ships at 1x, so the camera must play at 1x."**  The
+  app's shipping rate (0.86 declared/real over the capture, p50 gap 0.110 s) is
+  real and reproducible, but it is the app's *supply* rate, not the camera's
+  *consumption* rate.  Under this section the app's own talk should be starved
+  on the camera too -- a falsifiable question for anyone who has used the app.
+
+### Still open
+
+* **~200 ms is lost at the start of a talk session** (the played beep began
+  200 ms after the packets did).  That is the camera's playout initialising;
+  `TALK_PREBUFFER` covers packet jitter, not the camera's own start-up.
+* The app's captured audio measures F0 ~68-82 Hz here (autocorrelation median
+  68.5, harmonic spacing 78-82) against this user's natural **105-111 Hz**,
+  while Phase 20's cepstral estimate of the same capture was 86-145 Hz.  Three
+  estimators, three answers, so it is **not** evidence of a clean 2x and no
+  longer matters: we invert the camera's playout directly and measure the
+  result instead of inferring what the app does.
 
 ### 13e. What does NOT work / is not needed
 

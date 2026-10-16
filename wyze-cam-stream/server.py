@@ -138,9 +138,30 @@ TALK_MIC_HZ = 16000            # what the browser captures and POSTs to us
 TALK_FRAMES_PER_PKT = 6        # six 20 ms AMR-NB frames = 120 ms per packet
 TALK_PKT_SECONDS = 0.120
 TALK_IDLE_TIMEOUT = 2.0        # no PCM for this long -> close the session
+# HOW FAST THE CAMERA EATS WHAT WE SEND.  Measured on Camera 1 (2026-10-16,
+# JOURNAL Phase 22): its talk output runs a 16 kHz DAC over our 8 kHz AMR, so
+# it plays each 160-sample (20 ms) frame in 10 ms -- 2x fast, matching the
+# 16 kHz / 320 samples that the app's own open frame declares.  A 1 kHz tone
+# whose wire content we verified with ffmpeg came out of the camera's speaker
+# at 2000 Hz, and at a 1x feed it spoke for only 51% of the time.  Two
+# consequences, and the fix is the inverse of each:
+#   1. pitch and timeline -- anything we hand over comes back an octave up and
+#      2x fast, so we hand over content that is deliberately 2x SLOW
+#      (asetrate=8000) and the camera's 2x puts it back to natural.
+#   2. starvation -- it consumes 2.0 declared seconds per real second, so a
+#      120 ms packet has to leave every 60 ms.  Feeding at 1x left it silent
+#      half the time, which is what "sounds cut, sounds cut" was.
+TALK_CAMERA_PLAYOUT = 0.5      # real seconds the camera spends per declared s
+TALK_PKT_REAL_SECONDS = TALK_PKT_SECONDS * TALK_CAMERA_PLAYOUT    # 60 ms
+TALK_CONTENT_HZ = int(TALK_MIC_HZ * TALK_CAMERA_PLAYOUT)          # 8000
+# Head start given to the camera's own jitter buffer when talk opens.  It is
+# pure added latency, so it is deliberately small: enough to cover the pump
+# loop's jitter, not enough to be heard as an echo.
+TALK_PREBUFFER = 3 * TALK_PKT_REAL_SECONDS        # 0.18 s
 # Jitter buffer between ffmpeg and the camera.  It has to be deep enough to
 # ride out a slow pump iteration but shallow enough not to be heard: the queue
-# IS latency, because the camera plays it at 1x.  24 frames = 480 ms.
+# IS latency.  24 frames = 480 ms declared, i.e. 240 ms of real audio, because
+# the camera plays it at 2x.
 TALK_QUEUE_FRAMES = 4 * TALK_FRAMES_PER_PKT
 # The pump loop's cadence is set by the VIDEO side, not by talk, so one packet
 # per iteration is not the same as one packet per 120 ms.  Allow the tick to
@@ -526,8 +547,12 @@ class CameraStreamThread(threading.Thread):
                    "-probesize", "32", "-analyzeduration", "0",
                    "-f", "s16le", "-ar", str(TALK_MIC_HZ), "-ac", "1",
                    "-i", "pipe:0",
-                   # libopencore_amrnb only accepts 8 kHz, so the resample is
-                   # what keeps the camera hearing a normal voice.
+                   # asetrate *relabels* the 16 kHz samples as 8 kHz: the same
+                   # samples, twice the declared duration, half the pitch.  That
+                   # is the content the camera's own 2x playout expects (see
+                   # TALK_CAMERA_PLAYOUT).  aresample then guarantees the 8 kHz
+                   # stream that libopencore_amrnb insists on really is 8 kHz.
+                   "-af", "asetrate=%d,aresample=8000" % TALK_CONTENT_HZ,
                    "-ar", "8000", "-ac", "1",
                    "-c:a", "libopencore_amrnb", "-b:a", "12.2k",
                    "-f", "amr", "pipe:1"]
@@ -642,18 +667,23 @@ class CameraStreamThread(threading.Thread):
         if not self.talk_opened:
             st.open_talk()
             self.talk_opened = True
-            self.talk_next = now
-        # Pace at 1x the declared audio: six 20 ms frames per 120 ms.  A burst
-        # from the browser must not become a burst on the wire, or the camera
-        # buffers it and the speaker hears their own voice come back late.
+            # Prime the camera's buffer: pretend we are TALK_PREBUFFER behind,
+            # so the loop below sends what it has (up to TALK_MAX_BURST) and the
+            # camera starts with audio in hand instead of waiting on the first
+            # packet.  Without this it underruns on our own jitter.
+            self.talk_next = now - TALK_PREBUFFER
+        # Pace at the rate the camera consumes: one 120 ms packet per 60 ms of
+        # real time (TALK_PKT_REAL_SECONDS = 2.0 declared seconds per second).
+        # A burst from the browser must not become a burst on the wire, or the
+        # camera buffers it and the speaker hears their own voice come back late.
         #
         # Send every packet that is DUE, not one per call: this tick runs at
         # the pump loop's cadence, and that loop is paced by the video side (a
         # 50 ms select that overruns whenever ffmpeg applies back-pressure), so
-        # one packet per call silently stretched 120 ms into whatever the video
-        # happened to take.  If the loop was starved for longer than half a
-        # second, forgive the debt instead of catching up -- replaying it would
-        # only add latency, which is what the listener actually hears.
+        # one packet per call silently stretched the interval into whatever the
+        # video happened to take.  If the loop was starved for longer than half
+        # a second, forgive the debt instead of catching up -- replaying it
+        # would only add latency, which is what the listener actually hears.
         if now - self.talk_next > 0.5:
             self.talk_next = now
         sent = 0
@@ -666,7 +696,7 @@ class CameraStreamThread(threading.Thread):
             self.talk_stats["packets"] += 1
             self.talk_stats["frames"] += len(batch)
             self.talk_stats["audio_ms"] += TALK_PKT_SECONDS * 1000
-            self.talk_next += TALK_PKT_SECONDS
+            self.talk_next += TALK_PKT_REAL_SECONDS
             sent += 1
 
     def _discover(self):

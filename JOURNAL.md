@@ -1669,6 +1669,12 @@ measured rather than guessed:
   clip 2x faster (`asetrate=16000,aresample=8000`, halving the duration and
   doubling the pitch) read back as normal speed.  That is the whole answer:
   feed it 2x-rate content.
+  > **This is wrong -- see Phase 22.**  It was measured while only 33 % of the
+  > audio reached the wire (Phase 21's `read` bug), so the camera was starved
+  > to a third of a feed.  A 1 kHz tone recorded from the speaker comes back at
+  > **2000 Hz**, and a 1x feed leaves it silent 51 % of the time: it consumes
+  > 2.0 declared seconds per real second, so it needs 2x-*slower* content and a
+  > packet every 60 ms.
 
 Whether the camera plays the 8 kHz samples at ~4 kHz or inserts a gap after
 each 20 ms frame is not known (the ear cannot tell), and it does not matter:
@@ -1769,6 +1775,9 @@ silence (`talkreadertest.py`):
 
 The remaining 2 % is the encoder's own tail latency.  Queue depth is the thing
 to watch here, because the queue *is* latency -- the camera plays it at 1x.
+> **Corrected in Phase 22:** the camera plays it at **2x**, so 24 frames of
+> queue is 240 ms of real audio, not 480 ms.  The delivery fix here stands; the
+> pacing conclusion does not.
 
 ### Also settled, offline: the app's own content is 1x, not 2x
 
@@ -1796,3 +1805,118 @@ bug was visible in `talk_stats` for several runs (72 frames for 4.35 s of
 input) while the code "compiled, streamed, and worked" -- the audio was just
 one third of itself.  Compare *delivered declared seconds* against *PCM
 seconds fed* every time; they must match within the encoder's tail.
+
+## Phase 22 -- two-way audio SOLVED: the camera plays our frames at 2x
+
+Phase 20 and Phase 21 both tried to settle the talk rate by judging clips by ear, and both got answers that fit two different models.
+This phase stopped guessing: **the Mac's external microphone was pointed at the
+camera's speaker and the camera's own output was recorded** while a known
+signal was played through the real product path.  A recording you can measure
+beats an adjective you have to interpret.
+
+### The signal, and the controls that make it readable
+
+`python3 talkverify.py` (now in the repo -- it is the only check that measures
+what the camera's speaker really does), three phases in one sitting:
+
+* **A (18 s)** a normal voice take, trimmed
+  to its loudest 7 s, peak-normalised and becomes the test clip.  It also gives the take's natural pitch.
+* **B (8 s silence)** mic moved to the camera's speaker.
+* **C (14 s)** the real path plays **1.5 s of 1 kHz tone, 0.8 s of silence,
+  then the voice from A**, paced exactly like the browser's POSTs, while the
+  mic records.  Then everything is measured offline with stdlib only.
+
+Two controls before trusting any of it:
+
+| control | result |
+|---|---|
+| 2 s recording of the quiet room, nothing played | peak 100 ms RMS **8.3**, `-72 dBFS`, no tone in any band |
+| our own encoder's output, decoded and Goertzel'd | **1000 Hz dominant at 0.126**, every other band < 0.001 |
+
+So when a tone appeared at 2000 Hz it could not be room noise, and it could
+not have come from our side: the wire content was provably 1 kHz.
+
+### The measurement: 2x pitch and a 51 % duty cycle
+
+| observed | value |
+|---|---|
+| the 1 kHz tone, at the camera | **2000 Hz dominant** (96.7 % of band energy) |
+| tone duty, 2 ms windows, fed one packet per 120 ms | **51 %**, on-runs 50 ms, off-runs 20-90 ms |
+| 5.6 s of true silence right after the tone | `-72 dBFS` -- the camera had run dry |
+| the speech that followed | sparse bursts, ~1-3 % duty |
+
+Two independent things point the same way: the pitch comes back an octave up,
+*and* a 1x feed leaves the camera silent half the time.  A camera that plays
+each 160-sample (8 kHz, 20 ms) AMR frame in 10 ms explains both at once -- it
+runs a 16 kHz DAC over 8 kHz frames, which is exactly what §13c's opening frame
+asks for (it declares **16000 Hz / 320 samples**).  It consumes **2.0 declared
+seconds per real second**.
+
+That also retires Phase 20's rule.  The old reading ("the camera renders
+declared time at *half* rate, so feed 2x-*faster* content and pace one packet
+per 240 ms") predicts a *lower* pitch and a ~100 % duty at a 1x feed.  What was
+actually measured is the opposite of both.  Phase 20's ear evidence was taken
+with the 33 % delivery bug of Phase 21 still in the code, so the camera was
+being starved to a third of a feed; nothing measured then about *rate* is
+trustworthy.
+
+### The fix, and both halves are needed
+
+`wyze-cam-stream/server.py`:
+
+| constant | before | after | why |
+|---|---|---|---|
+| encoder `asetrate` | 16000 (a no-op) | **8000** (`TALK_CONTENT_HZ`) | relabel the 16 kHz mic as 8 kHz: same samples, 2x the declared duration, half the pitch -- the camera's 2x puts it back |
+| `TALK_PKT_REAL_SECONDS` | 0.120 | **0.060** | one 120 ms packet every 60 ms = the 2.0 declared/real the camera eats |
+| `TALK_PREBUFFER` | 0.36 s | 0.18 s | still 3 packets, now shorter ones |
+
+`TALK_CAMERA_PLAYOUT = 0.5` (real seconds the camera spends per declared
+second) drives all three, so the numbers cannot drift apart again.  Stretching
+without the faster feed only fixes the pitch and leaves the holes; feeding
+faster without stretching only removes the holes and leaves a chipmunk.
+
+Local, silent (`talkreadertest.py`, real encoder + real reader): **99 % of the
+input reaches the wire, 8.16 s declared from 4.13 s real = 2.01
+declared/real**, queue depth max 6 frames.  Before the change the same harness
+was 98 %.
+
+### On hardware: exactly the pitch we asked for
+
+Same sitting, with the fix in place:
+
+| observed | before | after |
+|---|---|---|
+| the beep (shipped as 500 Hz content) | 2000 Hz | **990-1000 Hz**, i.e. 2x of the 500 Hz we sent |
+| beep duty, 2/5/10 ms windows | 51 % | **90-100 %** -- continuous 3.03 -> 4.30 s, **no interior hole**; the only "off-run" was the beep's own tail |
+| user's verdict | "slow, and chopped" | **"Beep: steady, no cutting" / "Voice: normal speed/pitch"** |
+
+The ear and the instrument now agree, which is the first time in three phases.
+
+### What is left
+
+* **~200 ms at the very start of a talk session is lost** (the beep started
+  200 ms late relative to the packets we sent).  That is the camera's playout
+  initialising, not our pacing; the pre-buffer covers packet jitter, not the
+  camera's own start-up.
+* **The browser live-mic path has not been re-tested end to end.**  It POSTs
+  the same 1024-byte/32 ms 16 kHz PCM as the file path and shares every line of
+  server code from `talk_feed()` onward, but only the file-driven version has been heard so far.
+* **The app's own talk audio is still a puzzle, and now not a blocking one.**
+  Its captured content measures F0 ~68-82 Hz (autocorrelation median 68.5,
+  harmonic spacing 78-82) against this user's natural **105-111 Hz**, and
+  Phase 20's cepstral estimate of the same capture was 86-145 Hz.  Three
+  estimators, three answers -- not evidence of a clean 2x.  It does not matter
+  for us any more: we invert the camera's playout directly and measure the
+  result, so we do not need to know what the app does.  A cheap human check is
+  still worth having: ask what the *app's* talk sounds like from these cameras.
+  Under this phase's model it should be as starved as our 1x feed was, because
+  the app ships ~1.0 declared/real (Phase 21) while the camera eats 2.0.
+
+### Notes for next time
+
+Play a **tone**, not speech, when the question is about rate: a beep's pitch is
+a number you can compare against a control, while "sounds slow" fits both a
+starved camera and a stretched voice.  Record the camera's speaker with the
+Mac's external mic (`ffmpeg -f avfoundation -i ":1"`) and always take a
+silent-room control first -- with it, one 90-second sitting settled what two
+phases of adjectives could not.
