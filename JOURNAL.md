@@ -2151,3 +2151,104 @@ worse?" answerable.  A **probe every 2 s is cheap** (one snapshot + one ffmpeg
 at 64x36) -- arming one *before* changing anything is what
 caught the transition and the 8 s of auto-exposure hunting, which a
 before/after pair would have missed entirely.
+
+
+## Phase 26 -- the OG's siren: located, then dropped by request
+
+**Outcome: this line of work was dropped after the analysis.  Nothing was
+implemented and nothing was ever sent to a camera.**  It is written down so the
+next session does not redo it, and so the false leads below are not chased again.
+
+### What the app on the phone actually shows (observed)
+
+The phone is a **moto g52, Android 13** (serial `ZY22HL354B`), `com.hualai`
+installed.  `adb` is enough to *drive* the app but **not to sniff it**: `su` is
+absent, the `adb shell` user (uid 2000) is **not in the `net_raw` group** (so no
+raw sockets), there is no `tcpdump`, and PCAPdroid is not installed.  The
+phone↔camera traffic is unicast Wi-Fi, so the Mac cannot see it either.  Reading
+the app's packets therefore requires PCAPdroid to be installed on the phone.
+
+CAM-1's live view (opened by tapping its tile; read with `uiautomator dump`
+plus `screencap`) has a two-page bottom toolbar (the phone ran the app in Spanish;
+UI labels were translated for this note):
+
+| page | controls |
+| --- | --- |
+| 1 | SD card · Take photo · Record · **Siren** (`resource-id dbdTvlTakePhoto`) |
+| 2 | Album · Quick capture · Off · Reorder |
+
+So the OG **does** have a siren, and the app exposes it as a first-class control.
+Settings also show **Spotlight** -- opening it starts
+`com.wyze.gemini.ui.page.activity.og.setting.GmSpotlightSettingsActivity`, and
+`.og.` is the Cam OG) and, under *Advanced settings*, **Night vision**
+(Auto / On / Off) and **Status light** (the status LED).
+There is no light control in the live-view toolbar at all; it lives in settings.
+
+### The siren is a model-property write, not a CamCommand
+
+Traced from the button into the SDK:
+
+```
+GmLiveFragment.setSirenModel(Z isCheck, I timeSecond)
+  -> GmLiveManager.setModel(...)
+  -> IoTDataManager.setDeviceModel(deviceId, path, value, onSuccess, onError, isModel)
+  -> IoTVideoSdk.getMessageMgr().writeProperty(deviceId, path, value, listener)
+```
+
+* **path** is the literal `"Action.siren.stVal"` -- a Gwell/Tencent *model*
+  property, not one of Wyze's `P…` properties.
+* **value** is `System.currentTimeMillis()/1000` (epoch seconds) when the toggle
+  is on and the literal `"0"` when it is off, which is consistent with a
+  start-timestamp convention (the camera sounds until a timeout derived from it).
+* `setDeviceModel`'s final `isModel` flag writes the device id as
+  `"_@." + deviceId`.
+
+The last hop is the Tencent iotvideo SDK (`com.tencentcs.iotvideo.messagemgr`),
+i.e. the Gwell stack the OG is built on.
+
+**Disproved / not the path -- do not chase these again:**
+
+* `CamCommand`'s light family (`K10030_getNetworkLightStatus`,
+  `K10032_setNetworkLightStatus`, `K10710`/`K10712_setWhiteLightStatus`, …) and
+  `CamProtocolUtils.create` are **not** how the OG's siren button works.  The
+  header layout was decoded correctly -- reference: `byteArrayCopy`'s 5th
+  argument is an **inclusive end index**, so `byteArrayCopy(dst, off, src, 0, 1)`
+  copies **2** bytes, which is exactly where the `"HL"` magic and the u16
+  `id`/length fields come from (`[0:2] "HL"`, `[2:4] 0x0005`, `[4:6] id`,
+  `[6:8] payload length`, `[16:]` payload) -- but the siren never goes through it.
+* `StableActionID.SIREN_ON/SIREN_OFF` (0x6/0x7) are referenced only from
+  `com/wyze/net/services/settings/repo/capabilities/ICapabilitiesKt`, a
+  capability description, not the OG's control path.
+* The app's own LAN captures (`/tmp/applan_a2c.bin`, `…_wyze3.bin`) contain **no**
+  plaintext `"HL\x05\x00"` command -- not raw, not inside unwrapped KCP payloads,
+  and not after RC5 with the CALLING-derived key -- which is consistent with the
+  siren not being a CamCommand at all.
+
+### Why it was not implemented
+
+Controlling it means speaking the Gwell **model-message** path (`writeProperty`,
+i.e. `Action.siren.stVal`), which is a different protocol from the KCP/AV link we
+already own, and the work stopped there, deliberately.  The wash-up is simply: *the OG
+has a siren and a spotlight; both are real; the siren is a model-property write;
+and we never fired it.*
+
+### Also in this commit: 1080p no longer gets lost for good
+
+`server.py` used to treat one HD refusal as a verdict.  A refusal is usually just
+our own previous session not having timed out on the camera yet -- which is
+exactly what a kill-and-restart looks like from the camera's side -- so it clears
+by itself within a minute.  The worker now remembers `hd_start` and, after
+`SD_REPROBE` (60 s) of *healthy* SD, asks for HD again, doubling the pause after
+each further refusal up to `SD_REPROBE_MAX` (600 s).  `stats["definition"]` is
+now exported, so `/api/state` shows `2` (1080p) or `0` (640x360) directly instead
+of having to be inferred from the picture.  Verified live: after this session's
+fiddling all three online cameras are back at `definition=2` near 20 fps.
+
+### Operational note for next time
+
+Opening a camera's live view **in the Wyze app** takes that camera's single P2P
+session away from our server, so that tile goes dark for as long as the app holds
+it.  Backing out returns it -- all three cameras recovered to `definition=2`
+unaided.  `adb` is fine for driving the app and reading `logcat` (that is how
+`GmSpotlightSettingsActivity` was found); it cannot capture packets on this phone
+as configured.
