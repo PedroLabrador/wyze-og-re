@@ -111,9 +111,20 @@ MAX_LAG = 0.5
 # profile (definition 2) or the 640x360 sub-stream (0).  A camera that refuses
 # the HD request answers with no media at all, not with the SD fallback, so a
 # run that produced zero bytes of H.264 is the signal to try again -- and only
-# after this many consecutive empty runs is the camera treated as SD-only.
+# after this many consecutive empty runs does the worker stop asking.
 # Override the starting value with WYZE_DEFINITION.
 HD_RETRIES = 3
+
+# ...but a refusal is a pause, not a verdict.  The common cause is that our own
+# previous session has not timed out on the camera yet -- which is exactly what
+# killing and restarting the server looks like from the camera's side -- and it
+# clears by itself within a minute.  So after serving this long on the SD
+# sub-stream the worker asks for HD again, doubling the pause after each further
+# refusal (60 s, 2 min, 4 min ... capped at SD_REPROBE_MAX).  Without this, one
+# unlucky cold start costs 1080p for the life of the worker, with no way back
+# short of another restart.
+SD_REPROBE = 60.0
+SD_REPROBE_MAX = 600.0
 
 # The camera sends G.711 mu-law, one byte per sample.  Every audio AV frame
 # carries exactly 320 samples and its u32 timestamp advances 20000 us
@@ -270,13 +281,17 @@ class CameraStreamThread(threading.Thread):
         self._log = []
         # 2 = the camera's 1080p profile, 0 = its 640x360 sub-stream.  The
         # definition lives in the 108-byte v2 AvStreamCtl (kcpav.avstreamctl_v2).
-        # If a camera refuses the HD request (no media at all) the worker
-        # drops to SD for good rather than re-asking forever.
+        # If a camera refuses the HD request (no media at all) the worker drops
+        # to SD and re-asks for HD a while later -- see SD_REPROBE.
         try:
             self.definition = int(os.environ.get("WYZE_DEFINITION", "2"))
         except ValueError:
             self.definition = 2
+        self.hd_start = self.definition   # what to go back to after SD
         self.hd_fails = 0
+        self.sd_since = 0.0               # when the SD fallback began; 0 = on HD
+        self.sd_reprobe = SD_REPROBE      # current pause before re-asking
+        self.stats["definition"] = self.definition   # so the page can see it
         # -- two-way audio (see talk_begin/talk_feed/talk_end) -------------
         self.talk_lock = threading.Lock()
         self.talk_on = False              # the page is holding its talk button
@@ -523,9 +538,23 @@ class CameraStreamThread(threading.Thread):
             # An AvStreamCtl the camera dislikes leaves us with NO media at
             # all, not the SD fallback -- so a run that produced zero bytes of
             # H.264 is the signal to retry, and only a few consecutive such
-            # runs mean the camera will not do HD.
+            # runs mean the camera is not doing HD *right now*.
             if self.stats["h264"] != h264_before:
                 self.hd_fails = 0            # this session produced video
+                # Serving SD successfully is the cue to try HD again: the
+                # refusal was usually our own session not having timed out on
+                # the camera yet, and that clears within a minute.  Backing off
+                # keeps a genuinely SD-only camera cheap to live with -- one
+                # short probe every few minutes rather than a permanent flap.
+                if (self.definition != self.hd_start and self.sd_since
+                        and time.time() - self.sd_since >= self.sd_reprobe):
+                    self.log("served SD for %.0fs -- asking for definition=%d "
+                             "again" % (time.time() - self.sd_since,
+                                        self.hd_start))
+                    self.definition = self.hd_start
+                    self.sd_since = 0.0
+                    self.sd_reprobe = min(self.sd_reprobe * 2, SD_REPROBE_MAX)
+                    self.stats["definition"] = self.definition
             elif self.definition != 0:
                 self.hd_fails += 1
                 if self.hd_fails >= HD_RETRIES:
@@ -533,6 +562,8 @@ class CameraStreamThread(threading.Thread):
                              "the SD sub-stream (640x360)"
                              % (self.definition, self.hd_fails))
                     self.definition = 0
+                    self.sd_since = time.time()
+                    self.stats["definition"] = self.definition
                 else:
                     self.log("definition=%d gave no video (attempt %d/%d)"
                              % (self.definition, self.hd_fails, HD_RETRIES))
