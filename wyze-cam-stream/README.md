@@ -35,17 +35,26 @@ python3 server.py --discover      # scan the LAN once and exit
 
 Requirements: Python 3.8+ standard library and `ffmpeg` on `PATH`. Nothing else.
 
-Open the URL and you get a dark grid — one tile per camera, each an MJPEG
-stream. Cameras that are powered off show *"camera offline"* and the rest keep
-working; discovery retries every 2 s from the UI, or on demand with
-**Re-discover**.
+Open the URL and you get a dark grid — a 2×2 layout of square tiles (one column
+on a phone), each an MJPEG stream. Cameras that are powered off show *"camera
+offline"* and the rest keep working; discovery retries every 2 s from the UI, or
+on demand with **Re-discover**.
+
+Clicking a tile goes fullscreen **and focuses** it: the single `/feed`
+connection is re-opened with `?focus=<tid>`, so your browser only receives that
+one camera, and the server drops the other cameras' sessions entirely (worker,
+ffmpeg and P2P session) after a 3 s grace — the cameras are exclusive, so that
+also frees them for any other consumer. Closing fullscreen reconnects the whole
+grid, cold (~1–2 s). With no viewer connected at all, the server stops decoding
+everything rather than streaming to nobody. A paused tile shows a gray dot and
+its last frame.
 
 | Route | What it does |
 |---|---|
 | `GET /` | the grid UI |
 | `GET /api/state` | cameras + per-camera status/fps/error |
 | `POST /api/discover` | rescan the LAN |
-| `GET /feed` | **every camera on one connection** — what the page actually uses |
+| `GET /feed` | **every camera on one connection** — what the page actually uses; `?focus=<tid>` narrows it to one camera while fullscreen |
 | `GET /stream/<tid>.mjpg` | multipart MJPEG for one camera (scripting/fallback) |
 | `GET /audio/<tid>.wav?gain=N` | 16 kHz mono PCM16 audio (`gain` 1–64) |
 | `GET /snapshot/<tid>.jpg` | newest decoded JPEG as a download |

@@ -61,6 +61,16 @@ Each frame carries the instant it was published, so the page prints the real
 end-to-end delay (published -> painted) in every tile's footer, measured by the
 browser itself.  On this Mac it reads single digits to low tens of ms.
 
+Focus::
+
+    Fullscreen a tile and the page reopens its one /feed as
+    ``/feed?focus=<tid>`` -- the other tiles freeze on their last frame and,
+    after a short grace, Hub._supervise drops those cameras' workers entirely
+    (ffmpeg + P2P session + memory).  Leaving fullscreen returns to the grid
+    and everything reconnects cold.  Partly this is bandwidth; mostly it is
+    that the P2P sessions are exclusive per camera, so an unfocused server
+    should not be holding them.
+
 Usage::
 
     python3 server.py                  # http://127.0.0.1:8080
@@ -71,6 +81,7 @@ Only the Python standard library and an ``ffmpeg`` on PATH are required.
 """
 import argparse
 import collections
+import contextlib
 import json
 import os
 import socket
@@ -106,6 +117,14 @@ JPEG_EOI = b"\xff\xd9"
 # would drop frames from healthy viewers.  Chosen so a viewer can never be more
 # than half a second behind the camera.
 MAX_LAG = 0.5
+
+# Focus (see Hub.viewing / Hub._supervise): a camera that has lost every viewer
+# keeps running only through this dwell before its session is dropped.  Long
+# enough that a quick fullscreen open/close costs no cold re-handshake, short
+# enough that the other cameras really do stop streaming while one is focused.
+# The supervisor ticks twice a second.
+PAUSE_DWELL = 3.0
+PAUSE_TICK = 0.5
 
 # The stream request (AvStreamCtl) can ask the camera for either its 1080p
 # profile (definition 2) or the 640x360 sub-stream (0).  A camera that refuses
@@ -856,6 +875,19 @@ class Hub:
         self.cameras = {}          # tid -> {tid, ip, mac, name, calling}
         self.calling = self._load_calling()
         self.names = load_devices_file()
+        # -- focus (see viewing / _supervise) -------------------------------
+        # What the live viewer CONNECTIONS are asking for: id -> camera tid, or
+        # None for "whatever is discoverable" (the grid's /feed).  A camera
+        # loses its worker -- and the exclusive P2P session that goes with it
+        # -- when nothing wants it, which is what makes focusing one camera
+        # stop the others instead of streaming into tiles nobody can see.
+        self._viewers = {}         # viewer-connection id -> tid | None
+        self._next_cid = 0
+        self.paused = set()        # tids currently stopped for lack of viewers
+        self._unwanted_at = {}     # tid -> when it first had no viewer left
+        self._supervise_stop = threading.Event()
+        threading.Thread(target=self._supervise, daemon=True,
+                         name="hub-supervisor").start()
 
     @staticmethod
     def _load_calling():
@@ -948,13 +980,102 @@ class Hub:
             return w, None
 
     def stop_all(self):
+        # Mute the supervisor while tearing everything down, or it would
+        # re-ensure the workers this call is stopping out from under it.
+        self._supervise_stop.set()
+        try:
+            with self.lock:
+                ws = list(self.workers.values())
+                self.workers.clear()
+            for w in ws:
+                w.stop()
+            for w in ws:
+                w.join(timeout=2.0)
+        finally:
+            self._supervise_stop.clear()
+
+    # -- focus -------------------------------------------------------------
+    @contextlib.contextmanager
+    def viewing(self, tid=None):
+        """Count one viewer connection for its whole lifetime.
+
+        ``tid=None`` means "whatever is discoverable" (the grid's /feed); a
+        tid is a focus-limited /feed, a direct /stream socket, or an /audio
+        listener.  Handlers unwind their registration in a ``finally``, so a
+        connection that goes away stops pulling the camera's resources the
+        moment it does.
+        """
         with self.lock:
-            ws = list(self.workers.values())
-            self.workers.clear()
-        for w in ws:
-            w.stop()
-        for w in ws:
-            w.join(timeout=2.0)
+            self._next_cid += 1
+            cid = self._next_cid
+            self._viewers[cid] = None if tid is None else int(tid)
+        try:
+            yield
+        finally:
+            with self.lock:
+                self._viewers.pop(cid, None)
+
+    def _wanted(self):
+        """Camera tids at least one live viewer connection still wants.
+
+        Returns ``None`` when someone is watching the undivided grid, which
+        means every camera must keep running.
+        """
+        with self.lock:
+            vals = list(self._viewers.values())
+            cams = set(self.cameras)
+        if None in vals:
+            return None
+        return {t for t in vals if t in cams}
+
+    def _supervise(self):
+        """Keep running exactly the camera workers that somebody wants.
+
+        This is what makes focus actually free the server: a fullscreen view
+        narrows its /feed to one camera and every OTHER worker -- its ffmpeg
+        process, its P2P session, its memory -- is dropped after a short
+        dwell.  Leaving fullscreen connects the whole grid again, cold.
+
+        It also runs when nobody is connected at all (just the page open on
+        this machine and nothing else): with no viewers left, the server soon
+        stops decoding anything, instead of streaming every camera to nobody.
+
+        The lock is never held across ensure()/stop(): both take it themselves.
+        """
+        while not self._supervise_stop.wait(PAUSE_TICK):
+            want = self._wanted()
+            with self.lock:
+                tids = list(self.cameras)
+            for tid in tids:
+                needed = want is None or tid in want
+                with self.lock:
+                    w = self.workers.get(tid)
+                if needed:
+                    with self.lock:
+                        self.paused.discard(tid)
+                        self._unwanted_at.pop(tid, None)
+                    # ensure() is a no-op while the worker is alive, but it
+                    # replaces a dead one, which is why _wanted is not enough
+                    # on its own -- a worker can die of its own failures.
+                    if w is None or not w.is_alive():
+                        try:
+                            self.ensure(tid)
+                        except Exception:
+                            pass
+                    continue
+                # Nobody wants it.  Unless it only just lost its last viewer
+                # (a quick fullscreen toggle should not cost a cold handshake
+                # on the way back), stop it and let go of the camera: the P2P
+                # session is exclusive, so holding it would block any other
+                # consumer of that camera too.
+                with self.lock:
+                    first = self._unwanted_at.setdefault(tid, time.time())
+                    stale = (time.time() - first) >= PAUSE_DWELL
+                    if stale:
+                        self.workers.pop(tid, None)
+                        self.paused.add(tid)
+                if stale and w is not None:
+                    w.stop()
 
     @staticmethod
     def _stats_copy(w):
@@ -983,7 +1104,11 @@ class Hub:
                 out.append({
                     "tid": tid, "ip": cam.get("ip"), "name": cam.get("name"),
                     "mac": cam.get("mac"),
-                    "status": w.status if w else "idle",
+                    # no worker AND not wanted: focus (or an empty room)
+                    # paused it on purpose -- not the same as "idle", which
+                    # means no viewer has asked for it since discovery.
+                    "status": w.status if w else
+                        ("paused" if tid in self.paused else "idle"),
                     "error": w.error if w else None,
                     "seq": w.seq if w else 0,
                     "stats": self._stats_copy(w),
@@ -1039,8 +1164,15 @@ PAGE = """<!doctype html>
  /* header icon buttons (icon only -- hover the glyph for its name) */
  .ibtn { display:inline-flex; align-items:center; padding:7px 9px; }
  .ibtn svg { display:block; }
+ /* Square 2x2 grid (was: auto-fit fluid columns).  Two fixed columns on
+    anything wide enough, one column on a phone, and every video box 1:1.
+    The H.264 feed is 16:9, so it letterboxes inside the square with
+    object-fit:contain -- the box shape is the layout choice, the stream
+    itself is untouched. */
  #grid { display:grid; gap:14px; padding:18px;
-         grid-template-columns:repeat(auto-fit,minmax(360px,1fr)); }
+         grid-template-columns:repeat(2,minmax(0,1fr));
+         max-width:1440px; margin:0 auto; }
+ @media (max-width:640px) { #grid { grid-template-columns:1fr; } }
  .tile { background:#161b22; border:1px solid #30363d; border-radius:10px;
          overflow:hidden; }
  .tile .head { display:flex; align-items:center; gap:8px; padding:9px 12px;
@@ -1051,10 +1183,13 @@ PAGE = """<!doctype html>
  .dot.connecting, .dot.discovering, .dot.reconnecting {
    background:#d29922; animation:p 1.2s ease-in-out infinite; }
  @keyframes p { 50% { opacity:.35; } }
+ /* paused: the server dropped this camera's session because nobody was
+    watching it (focus).  Dim gray on purpose -- quiet, not an error. */
+ .dot.paused { background:#484f58; opacity:.55; }
  .name { font-weight:600; }
  .ip { color:#8b949e; font-size:12px; font-variant-numeric:tabular-nums; }
  .badge { margin-left:auto; font-size:11px; color:#8b949e; }
- .shot { position:relative; background:#000; aspect-ratio:16/9; }
+ .shot { position:relative; background:#000; aspect-ratio:1/1; }
  /* canvas, not <img>: all cameras now share ONE fetch() stream (see /feed),
     because a socket per camera exhausted the browser's six-connection
     per-origin pool and made every other request queue. */
@@ -1606,8 +1741,28 @@ function parseFeed(buf) {
   return [out, off ? buf.slice(off) : buf];
 }
 
+/* Focus: the ONE /feed connection is narrowed to a single camera.  openFs and
+   closeFs call setFocus(); an abort cuts the connection short and feedLoop
+   reconnects quickly with ?focus=<tid> on the URL.  With nothing else holding
+   viewers, the server then STOPS the other cameras' workers -- ffmpeg, the
+   P2P session, all of it -- so fullscreen really does unclog the server, and
+   the grid reconnects everything (cold, ~1-2 s) when fullscreen closes. */
+let FOCUS = null;         // camera the feed is narrowed to, null = whole grid
+let FEED_AC = null;       // AbortController of the connection in flight
+let FEED_KICK = false;    // a self-initiated abort: reconnect fast, not 1 s
+
+function setFocus(tid) {
+  if (FOCUS === tid) return;
+  FOCUS = tid;
+  FEED_KICK = true;
+  if (FEED_AC) { try { FEED_AC.abort(); } catch (_) {} }
+}
+
 async function readFeed() {
-  const r = await fetch('/feed?r=' + Date.now(), {cache: 'no-store'});
+  FEED_AC = new AbortController();
+  const r = await fetch('/feed?r=' + Date.now()
+    + (FOCUS !== null ? '&focus=' + FOCUS : ''),
+    {cache: 'no-store', signal: FEED_AC.signal});
   if (!r.ok || !r.body) throw new Error('HTTP ' + r.status);
   const rd = r.body.getReader();
   let buf = new Uint8Array(0);
@@ -1628,7 +1783,8 @@ async function readFeed() {
 async function feedLoop() {
   for (;;) {
     try { await readFeed(); } catch (_) { /* server restarting */ }
-    await new Promise(r => setTimeout(r, 1000));         // reconnect
+    await new Promise(r => setTimeout(r, FEED_KICK ? 150 : 1000));
+    FEED_KICK = false;                                   // reconnect
   }
 }
 
@@ -1783,6 +1939,11 @@ function tile(c) {
     state = 'offline'; cls = 'offline';
   } else if (c.status === 'error') {
     state = 'error'; cls = 'error';
+  } else if (c.status === 'paused') {
+    // The server dropped this camera's session: nobody is watching it (focus).
+    // Not an error and not 'offline' -- the frame below is the last one it
+    // painted, and it comes back by itself when fullscreen closes.
+    state = 'paused'; cls = 'paused';
   } else if (live) {
     state = 'live'; cls = 'streaming';
   } else if (age == null) {
@@ -1907,10 +2068,16 @@ function openFs(tid) {
   tileEl.querySelector('.ph').classList.remove('hidden');
   $('#overlay').classList.add('open');
   syncAudioUi(tid);                         // show the bar's speaker state
+  // Focus: narrow the single /feed to this camera.  The server drops the
+  // other workers (see Hub._supervise) -- that is the point of fullscreen.
+  setFocus(tid);
 }
 
 function closeFs() {
   if (FS.tid === null) return;
+  // Back to the grid before any teardown: unfocus makes the server bring the
+  // other cameras' workers back (cold, so tiles reconnect over the next 1-2 s).
+  setFocus(null);
   const cv = document.getElementById('view' + FS.tid),
         aud = document.getElementById('aud' + FS.tid),
         home = FS.home,
@@ -2339,9 +2506,23 @@ class Handler(BaseHTTPRequestHandler):
 
         Binary rather than multipart so the client slices frames with a
         DataView and never has to scan for a boundary.
+
+        ``?focus=<tid>`` narrows this ONE connection to a single camera: the
+        page sends it when a tile goes fullscreen (see setFocus in the page's
+        JS).  With focus set, no other camera is even begun -- and because the
+        connection then counts as a viewer of only that camera, Hub._supervise
+        stops the other workers and frees their sessions for real.
         """
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        try:
+            focus = int((q.get("focus") or [""])[0])
+        except ValueError:
+            focus = None
         with HUB.lock:
-            tids = sorted(HUB.cameras)
+            if focus is None:
+                tids = sorted(HUB.cameras)
+            else:                     # focused: one camera or nothing
+                tids = [focus] if focus in HUB.cameras else []
         workers = []
         for tid in tids:
             w, _err = HUB.ensure(tid)
@@ -2354,6 +2535,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Pragma", "no-cache")
         self.send_header("Connection", "close")
         self.end_headers()
+
+        # Count this connection as a viewer from here until the finally at the
+        # bottom of the loop (a vanished client must not keep demand forever --
+        # that is what holds every camera "running" in the supervisor).
+        view = HUB.viewing(focus)     # None here means "the whole grid"
+        view.__enter__()
 
         cursors = {w.camera["tid"]: w.seq for w in workers}
         # Per-connection diagnostics, mirroring _stream so /api/state keeps
@@ -2373,8 +2560,15 @@ class Handler(BaseHTTPRequestHandler):
                 # already watching, so re-read the roster periodically.
                 if time.time() - roster_at > 5.0:
                     roster_at = time.time()
+                    # A focused connection re-ensures only its own camera, so
+                    # discovery finding a new camera elsewhere never drags
+                    # workers onto a server that is deliberately not streaming
+                    # them.
                     with HUB.lock:
-                        tids = sorted(HUB.cameras)
+                        if focus is None:
+                            tids = sorted(HUB.cameras)
+                        else:
+                            tids = [focus] if focus in HUB.cameras else []
                     for tid in tids:
                         if any(w.camera["tid"] == tid for w in workers):
                             continue
@@ -2419,6 +2613,8 @@ class Handler(BaseHTTPRequestHandler):
             pass
         except Exception as e:
             sys.stderr.write("feed stopped: %r\n" % (e,))
+        finally:
+            view.__exit__(None, None, None)
 
     # -- routes ------------------------------------------------------------
     def do_GET(self):
@@ -2614,6 +2810,11 @@ class Handler(BaseHTTPRequestHandler):
         #     pipe accumulates), and `seq = cur` jumped over the rest of the
         #     burst: 19 frames served out of 132 published.  take() drains the
         #     whole burst instead.
+        # A direct MJPEG viewer counts as demand exactly like a /feed
+        # connection: the supervisor keeps this camera running while the
+        # socket lives, and drops it again after the socket is gone.
+        view = HUB.viewing(tid)
+        view.__enter__()
         served, dead = 0, 0
         dropped = 0
         # Start at the current head: a new viewer should get LIVE frames, not
@@ -2683,6 +2884,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             w.log("mjpeg stopped: %r" % (e,))
         finally:
+            view.__exit__(None, None, None)
             w.log("mjpeg served %d frames (write %.1fs)"
                   % (served, t_write))
 
@@ -2745,23 +2947,32 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             return
 
+        # An audio listener counts as demand just like a video viewer: while
+        # someone is listening, the supervisor must not drop this camera's
+        # session out from under them (sound deliberately keeps playing after
+        # fullscreen closes -- see the tile's speaker button).
+        view = HUB.viewing(tid)
+        view.__enter__()
         cursor = w.audio_tail()      # start live, not with the 200-chunk backlog
         dead = 0
-        while True:
-            chunks, cursor = w.take_audio(cursor)
-            if chunks:
-                try:
-                    self.wfile.write(ulaw_to_pcm16(b"".join(chunks), gain))
-                    self.wfile.flush()
-                    dead = 0
-                except (BrokenPipeError, ConnectionResetError):
-                    break
-            else:
-                time.sleep(0.02)
-                if not w.is_alive():
-                    dead += 1
-                    if dead > 100:
+        try:
+            while True:
+                chunks, cursor = w.take_audio(cursor)
+                if chunks:
+                    try:
+                        self.wfile.write(ulaw_to_pcm16(b"".join(chunks), gain))
+                        self.wfile.flush()
+                        dead = 0
+                    except (BrokenPipeError, ConnectionResetError):
                         break
+                else:
+                    time.sleep(0.02)
+                    if not w.is_alive():
+                        dead += 1
+                        if dead > 100:
+                            break
+        finally:
+            view.__exit__(None, None, None)
 
 
 def main():
