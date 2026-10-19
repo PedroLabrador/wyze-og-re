@@ -1241,7 +1241,8 @@ PAGE = """<!doctype html>
   .sndbtn svg { display:block; }
   .sndbtn:hover { background:#30363d; color:#e6edf3; }
   /* "on" is deliberately more than a colour change: the icon swaps to the
-     un-muted speaker AND the button lights up, because otherwise there was no way to see whether audio was on short of hearing it. */
+     un-muted speaker AND the button lights up, because otherwise there is no
+     way to see whether audio is on short of hearing it. */
   .sndbtn.on { color:#3fb950; background:rgba(63,185,80,.14); }
   /* Hold-to-talk.  This is the page's only button that SENDS, so "on" is not
      the green the speaker uses -- a live microphone feeding a speaker in the
@@ -1314,8 +1315,8 @@ const ICON = {
 // -- audio -----------------------------------------------------------------
 // The on/off state lives on the <audio> element (data-on), and BOTH the tile
 // button and the fullscreen bar are driven from it.  The gap this design
-// exists for: fullscreen had no audio control and no way to see whether sound was
-// on except by hearing it.
+// exists for: fullscreen had no audio control and no way to see whether sound
+// was on except by hearing it.
 //
 // The element is still the state holder, but it no longer plays anything.
 // Sound is scheduled on an AudioContext instead, for the reason the sound
@@ -1889,7 +1890,8 @@ function tile(c) {
       });
       // No 'error' listener on the element any more: the Web Audio reader owns
       // the stream now and reconnects itself (see sndRun), so a camera going
-      // away leaves the button lit and simply resumes -- switching it off silently was its own small lie about what is happening.
+      // away leaves the button lit and simply resumes -- switching it
+      // off silently was its own small lie about what is happening.
     }
   }
   // Hold-to-talk.  Pointer events, not click: the press IS the transmit switch.

@@ -495,7 +495,7 @@ Goal after Phase 10: the app streams 1920x1080 and we stream 640x360, both at
 
 ### The premise, re-measured independently
 
-App 3.23.1.994 was installed on the new device (Moto G52, Android 13, arm64)
+App 3.23.1.994 was installed on the second device (Moto G52, Android 13, arm64)
 and its account logged in.  The app's own logcat no longer prints
 `iv_recv_avheader` (the 2026 SDK build, `IoTVideo 1.5.20ad`, cut verbosity),
 so the resolution was confirmed a second way -- **throughput**, via
@@ -965,7 +965,8 @@ candidates are:
    quality property that may be what the encoder actually follows.  The cached
    `wyze_devices.json` (`home_page/get_object_list`) has no such key, so it
    would need `get_device_info`/property read + write.  Testable with the
-   existing OAuth + Signature2 + curl path, but it mutates a camera's live config, so it waits for a spare test camera.
+   existing OAuth + Signature2 + curl path, but it mutates a camera's live
+   config, so it waits for a spare test camera.
 2. **A stream resource we never request.**  `setDataResource` / "data resource"
    is the SDK's own vocabulary for the definition path, and `iv_start_av_link`'s
    `ctx+0xa0..0xb0` block is fed from the app side, not from anything we can
@@ -1348,7 +1349,7 @@ powered-on cameras held four slots permanently.  Switch sound on and each
 camera's `<audio>` held another.  A `POST /api/discover`, a `/api/state` poll or
 the snapshot's `<a download>` then had nothing left to run on and sat in
 "pending" until some stream ended — which, for a live MJPEG socket, is never.
-the delay on screen was therefore not transport, decoder or server
+The delay on screen was therefore not transport, decoder or server
 queueing: it was the browser replaying/starving on a saturated pool.
 
 ### The fix: one connection for every camera
@@ -1388,8 +1389,8 @@ delay, published → painted.  Server and browser share a clock here, so the
 number is direct rather than estimated.
 
 Measured by `httptest.py` against a live camera: **3–50 ms** end-to-end
-(`end-to-end age of the newest local camera frame`).  If the picture
-still feels behind while that footer reads single/two-digit ms, the remaining
+(`end-to-end age of the newest local camera frame`).  if the picture
+still feels behind on such a fast footer, while that footer reads single/two-digit ms, the remaining
 delay is inside the camera or the browser's compositor, not in our code.
 
 ### A mistake worth recording
@@ -1619,7 +1620,8 @@ Delete the plaintext token files (`/tmp/wyze_token.json`, `/tmp/wyze_live.txt`,
 
 The talk button was the last thing the app did that we could not do.  It turned
 out to be the *only* place the client sends real media, and it is now proven on
-hardware: a voice spoken into the app on the phone, then streamed through our server, came out of Camera 1's
+hardware: a voice spoken into the app on the phone, then streamed through
+our server, came out of Camera 1's
 speaker (`192.168.77.12:64146`).
 
 ### The capture that had the answer
@@ -1808,7 +1810,8 @@ seconds fed* every time; they must match within the encoder's tail.
 
 ## Phase 22 -- two-way audio SOLVED: the camera plays our frames at 2x
 
-Phase 20 and Phase 21 both tried to settle the talk rate by judging clips by ear, and both got answers that fit two different models.
+Phase 20 and Phase 21 both tried to settle the talk rate by judging clips
+by ear, and both got answers that fit two different models.
 This phase stopped guessing: **the Mac's external microphone was pointed at the
 camera's speaker and the camera's own output was recorded** while a known
 signal was played through the real product path.  A recording you can measure
@@ -1819,8 +1822,9 @@ beats an adjective you have to interpret.
 `python3 talkverify.py` (now in the repo -- it is the only check that measures
 what the camera's speaker really does), three phases in one sitting:
 
-* **A (18 s)** a normal voice take, trimmed
-  to its loudest 7 s, peak-normalised and becomes the test clip.  It also gives the take's natural pitch.
+* **A (18 s)** a normal voice take over the mic, trimmed to its loudest 7 s
+  peak-normalised and becomes the test clip.  It also gives the take's
+  natural pitch.
 * **B (8 s silence)** mic moved to the camera's speaker.
 * **C (14 s)** the real path plays **1.5 s of 1 kHz tone, 0.8 s of silence,
   then the voice from A**, paced exactly like the browser's POSTs, while the
@@ -1900,7 +1904,8 @@ The ear and the instrument now agree, which is the first time in three phases.
   camera's own start-up.
 * **The browser live-mic path has not been re-tested end to end.**  It POSTs
   the same 1024-byte/32 ms 16 kHz PCM as the file path and shares every line of
-  server code from `talk_feed()` onward, but only the file-driven version has been heard so far.
+  server code from `talk_feed()` onward, but only the file-driven version has
+  been heard so far.
 * **The app's own talk audio is still a puzzle, and now not a blocking one.**
   Its captured content measures F0 ~68-82 Hz (autocorrelation median 68.5,
   harmonic spacing 78-82) against this user's natural **105-111 Hz**, and
@@ -2003,7 +2008,8 @@ bug visible.
 ## Phase 24 -- the camera's sound was 2.4 s late, and it was the browser
 
 The symptom, right after Phase 23: our voice reaches the camera almost
-instantly, but the sound *from* the camera takes seconds to reach the stream. They are two different mechanisms, and only one of them is ours.
+instantly, but the sound *from* the camera takes seconds to reach the stream.
+They are two different mechanisms, and only one of them is ours.
 
 | direction | who owns it | measured |
 |---|---|---|
@@ -2073,8 +2079,8 @@ anything from one bad run.
 
 ## Phase 25 -- what night vision actually changes in the feed
 
-The question: the cameras switch to night vision on their own -- does the video feed look
-the same when it does?  Night vision is three
+The question: the cameras switch to night vision on their own -- does the
+video feed look the same when it does?  Night vision is three
 things stacked, and only the last is about the feed:
 
 1. **the control** -- `night-shot` / `night-shot-state` / `infrared-mode`
@@ -2155,9 +2161,9 @@ before/after pair would have missed entirely.
 
 ## Phase 26 -- the OG's siren: located, then dropped by request
 
-**Outcome: this line of work was dropped after the analysis.  Nothing was
+**Outcome: this line of work was dropped after the analysis, on purpose.  Nothing was
 implemented and nothing was ever sent to a camera.**  It is written down so the
-next session does not redo it, and so the false leads below are not chased again.
+work does not redo it, and so the false leads below are not chased again.
 
 ### What the app on the phone actually shows (observed)
 
@@ -2169,8 +2175,8 @@ phone↔camera traffic is unicast Wi-Fi, so the Mac cannot see it either.  Readi
 the app's packets therefore requires PCAPdroid to be installed on the phone.
 
 CAM-1's live view (opened by tapping its tile; read with `uiautomator dump`
-plus `screencap`) has a two-page bottom toolbar (the phone ran the app in Spanish;
-UI labels were translated for this note):
+plus `screencap`) has a two-page bottom toolbar (the phone ran the app in
+Spanish; UI labels translated here):
 
 | page | controls |
 | --- | --- |
@@ -2228,7 +2234,7 @@ i.e. the Gwell stack the OG is built on.
 
 Controlling it means speaking the Gwell **model-message** path (`writeProperty`,
 i.e. `Action.siren.stVal`), which is a different protocol from the KCP/AV link we
-already own, and the work stopped there, deliberately.  The wash-up is simply: *the OG
+already own, and the work was deliberately stopped there.  The wash-up is simply: *the OG
 has a siren and a spotlight; both are real; the siren is a model-property write;
 and we never fired it.*
 
@@ -2252,3 +2258,45 @@ it.  Backing out returns it -- all three cameras recovered to `definition=2`
 unaided.  `adb` is fine for driving the app and reading `logcat` (that is how
 `GmSpotlightSettingsActivity` was found); it cannot capture packets on this phone
 as configured.
+
+---
+
+## Phase 27 -- one last idea, honestly closed: streaming with no capture at all
+
+The one awkward part of the product was always the setup: a brand-new user had
+to run one capture pass before anything streamed, because the `CALLING`
+handshake came from a replay.  The obvious question -- can the server synthesize
+it instead? -- was answered the honest way, by measurement:
+
+* A byte-differential map across three independent captured CALLINGs showed
+  which offsets are protocol constants and which are per-session client state
+  (session key at [120:128], conversation word at [28:32], nonces and
+  checksums).  Most of the frame is constant or provably client-chosen.
+* Rebuilt `CALLING` from scratch with the constants, random client fields and a
+  random session key, folded the checksum, encrypted it with the same scheme,
+  and ran the real flow -- full broadcast discovery, handshake, H.264 decode --
+  against two live cameras (the two that happened to be powered-on).
+* **Discovery worked every time.  Handshake never.**  Three variants
+  (everything anonymous; + the captured id8; + the captured 8-byte identity
+  field), both cameras, six handshakes, **zero video frames**.  So at least one
+  more field in `CALLING` is validated than the captures alone can reveal, and
+  guessing further would be blind trial-and-error against hardware.
+
+Conclusion: the capture stays.  It is one faithful run per user, it stays local
+(`wire/*` is ignored by git), and `wire/README.md` explains exactly how to do
+it.  The differential map above is written down so the synth idea can be
+reopened someday with a capture that has two different accounts.
+
+## Why the project stops here
+
+Most of the codebase's own notes say what is still missing.  Some of it is
+genuinely undone: the relay rendezvous, camera controls (they have no LAN path
+anyway), the siren (a cloud model write), polish on the 1080p negotiation.  A
+lot more could be built on this protocol now that it is understood.
+
+But the aim of the exercise was smaller than that: **see all of my cameras and
+hear them, in one place, with no subscription, no cloud middleman and no limit
+of one stream.**  That works, end to end, on real hardware -- discovery to
+decoding, snapshot to two-way talk.  The scope of the reverse-engineering was
+reached.  Everything else is optional; the knowledge is written down for
+whoever wants to carry it further, and I am stopping here, happily.

@@ -253,7 +253,7 @@ wyze-re/
 
 ## [X] Key open problems (in priority order)
 
-> Routes A and B were **eliminated -- deliberate scope cut** (see DECISION below) — the old "decide
+> Routes A and B were **eliminated (a deliberate scope cut)** (see DECISION below) — the old "decide
 > between A/B/C" list is retired. Route C is the only live path, and its first two stages are
 > done, so the list starts where the work now actually is.
 

@@ -1,13 +1,13 @@
 # Wyze / Hualai (com.hualai 2.50.7.487) — Reverse Engineering Master Notes
 
-> **Purpose:** single source of truth so the work can resume from zero.
+> **Purpose:** single source of truth so the work can be resumed from zero.
 > Everything here was verified unless explicitly marked `SPECULATIVE` or `UNVERIFIED`.
-> Companion docs: `SECRETS.md` (keys + rotation), `STATUS.md` (state + next moves), `README.md` (how to run).
+> Companion docs: `STATUS.md` (state + next moves), `README.md` (how to run).
 
 **Goal:** stream *all* of your own Wyze OG cameras into a local web browser,
 bypassing Wyze's 1-camera web-UI limit. Constraints:
 - Email/password entered in browser UI only; server must not store them.
-- Credentials/API keys in an easily-rotatable local config; revoked/rotated when done.
+- Credentials/API keys in an easily-rotatable local config; revoked/rotated when the work is done.
 - Must use **mobile** endpoints (web version caps streaming at 1 camera).
 - The P2P client must be **built by us** (not delegated to wyze-bridge or any third-party).
 - Practical over deep rabbit-holing (decided up front).
@@ -111,7 +111,7 @@ bypassing Wyze's 1-camera web-UI limit. Constraints:
 | Tools **missing** | `nmap`, `socat`, `apksigner`, `zipalign`, Android build-tools, Frida |
 | tcpdump | exists (`/usr/sbin/tcpdump`) but **no permission** without sudo (`You don't have permission to capture on that device /dev/bpf0`) → cannot sniff the LAN wire directly |
 
-### Tooling gotchas
+### Tooling gotchas (macOS / zsh)
 - macOS has **no `timeout` command**.
 - zsh reserves `$UID` → use `$WUID`. zsh fails on unquoted globs → quote `--include="*.smali"`.
 - Big greps over the whole smali tree (`grep -rn ... .`) **time out** (>30s) — scope with explicit `smali_classesN/...` paths.

@@ -1,5 +1,12 @@
 # Wire captures — Gwell/Kalay P2P list-server exchange
 
+**The capture run is mandatory, not optional.** A zero-capture CALLING synthesis was
+attempted (2026-10-18, from the byte-differential map of three real captures) and
+rejected by the hardware: discovery answered every time, six handshakes with three
+synthesized variants produced zero video frames (JOURNAL Phase 27).  Until the extra
+validated field is isolated, this one faithful pass is how every user produces the
+`p2p_frames.json` their machine needs.  Captures stay **local** (`wire/*` is git-ignored).
+
 Captured **2026-10-12**. This is the ground truth that unblocked the wire protocol
 (see `../wyze-cam-stream/P2P_PROTOCOL.md` §3a).
 
@@ -12,6 +19,9 @@ Captured **2026-10-12**. This is the ground truth that unblocked the wire protoc
 4. Restart the app; it reaches the home screen after ~45 s, then fires the list request.
 
 ## Files
+
+The table below describes the local artifacts **you** generate during the pass; none of
+them are committed to this repo (`.gitignore` covers all of `wire/*`).
 
 | file | what |
 |---|---|
@@ -40,4 +50,4 @@ captures.
 ## Secrets note
 
 These frames contain only the app's P2P terminal IDs, no credentials. Live OAuth tokens are
-**not** stored in this repo (see `.gitignore` and `SECRETS.md`).
+**not** stored in this repo (see `.gitignore`; rotate anything you captured when done).

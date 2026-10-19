@@ -13,7 +13,8 @@ is the camera's own capture clock (it advances exactly 0x4e20 = 20000 us per
 We cannot recover the absolute transit (the camera's clock epoch is unknown),
 but the *slope* of that quantity over time is decisive:
 
-    slope ~ 0   -> camera->us is real time and we keep up.  The delay a viewer sees is NOT in the transport, so it is browser-side
+    slope ~ 0   -> camera->us is real time and we keep up.  The delay a viewer
+                    sees is NOT in the transport, so it is browser-side
                     (MJPEG <img> or audio element buffering).
     slope > 0   -> we are accumulating delay, at `slope` ms per second.
 
@@ -184,7 +185,7 @@ def main():
               "frames; our transport is not the cause."
               % (tr[n // 2] / 1000.0), flush=True)
     elif tr[n // 2] < 250:
-        print("  -> transport is quick (%.0f ms).  Any larger delay the user "
+        print("  -> transport is quick (%.0f ms).  Any larger delay a viewer "
               "sees is added after our socket."
               % tr[n // 2], flush=True)
 

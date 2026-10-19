@@ -33,7 +33,9 @@ the bridge as a standalone LAN engine:
 Requirements: **Python 3.8+** (standard library only — no pip packages) and
 **`ffmpeg`** on `PATH`. That's it; the browser does the rest.
 
-You need **one-time captures of your own gear** before anything streams:
+Discovery itself needs nothing else -- the server finds cameras on the LAN
+on its own, at every start.  But you do need **one-time captures of your
+own gear** before anything streams:
 
 1. **Capture the camera-side handshake** into `wire/p2p_frames.json`
    (`hello` / `calling` / `avstreamctl` frames, hex-encoded). The capture
