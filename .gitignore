@@ -8,23 +8,36 @@
 *.idsig
 *.jar
 *.xlog
+*.flow
 com.hualai_*/
 wyze_3.23/
 wyze_xapk/
 
 # ============================================================
-# Signing material (throwaway debug keystore — password is
-# documented in wyze-cam-stream/SECRETS.md, regenerate if lost)
+# Signing material (throwaway debug keystore — regenerate if
+# lost; the signing recipe lives in wire/README.md)
 # ============================================================
 wyze_debug.keystore
 
 # ============================================================
-# Live credentials — deliberately NOT in git.
-# Re-obtainable in ~1 min via the OAuth flow documented in
-# wyze-cam-stream/REVERSE_ENGINEERING.md (C1/C2).
-# Rotate before committing anything else; see SECRETS.md.
+# Live credentials & captures — deliberately NOT in git.
+# Re-obtainable via the flows documented in wyze-cam-stream/
+# REVERSE_ENGINEERING.md and wire/README.md (capture your own).
 # ============================================================
 wyze_token.json
+wyze_devices.json
+auth_login.html
+auth_url.txt
+oauth_code.txt
+pkce.txt
+pkce2.json
+pkce_final.json
+wire/p2p_frames.json
+wire/list_request_app.hex
+wire/list_request_app_asc.txt
+wire/list_resp_raw.hex
+wire/list_resp_decrypted.hex
+wire/list_resp_decrypted.txt
 
 # ============================================================
 # Transient capture output / interpreter debris
@@ -37,6 +50,16 @@ __pycache__/
 # Extracted from the device, not authored — junk
 # ============================================================
 sp_secure.xml
+
+# ============================================================
+# Local-private extras kept out of any push
+# ============================================================
+wyze-private-backup/
+# ============================================================
+# wyze-cam-stream local-only files (credentials & private notes)
+# ============================================================
+wyze-cam-stream/config.json
+wyze-cam-stream/SECRETS.md
 
 # ============================================================
 # OS noise
