@@ -134,7 +134,11 @@ class Grabber(threading.Thread):
     def _genuine(self):
         rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         rx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        rx.bind(("127.0.0.1", 0))     # unicast replies come back on loopback-ish first hop
+        # bind EVERYTHING, not loopback: real cameras answer to the probe's
+        # source address -- our LAN IP -- so a loopback-only bind would never
+        # hear them.  (The loopback test reaches this socket through 127.0.0.1
+        # as well; binding *:port matches both.)
+        rx.bind(("0.0.0.0", 0))
         rx.setblocking(False)
         tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         tx.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)

@@ -115,11 +115,11 @@ def main():
                   % (len(probe), probe[:2].hex(), _who[1]))
             assert len(probe) == 28 and probe[0] == 0x70 and probe[1] == 0x02
             # a real camera answers the port ADVERTISED IN THE PROBE
-            # (build_probe packs it at [26:28]), never the packet's
-            # source port -- mimic that here.
+            # (build_probe packs it at [26:28]) AT THE PROBE'S SOURCE IP --
+            # mimic both, so the test exercises the same path as the LAN.
             reply_port = struct.unpack_from("<H", probe, 26)[0]
-            print("[t-cam] replying to payload port", reply_port)
-            cam.sendto(fake_advert(), ("127.0.0.1", reply_port))
+            print("[t-cam] replying to %s:%d" % (_who[0], reply_port))
+            cam.sendto(fake_advert(), (_who[0], reply_port))
         except Exception as e:
             print("[t-cam] camera-thread exception: %r" % (e,))
         finally:
