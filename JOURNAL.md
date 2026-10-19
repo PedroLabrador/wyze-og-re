@@ -2338,8 +2338,115 @@ stop-here entry below still stands -- this is build polish on the collected
 scope, not new reverse-engineering -- but "one manual step" turned into "the
 server does it for you", which is why the READMEs changed shape this late.
 
-## Why the project stops here
+## Phase 29 -- the capture day that was not (and what it taught)
 
+Date: a few days after Phase 28.  The in-server grabber had become the
+documented happy path: clone, run the server, view one camera once.  Two live
+sessions exposed two real bugs; both are fixed and both changed how the code
+defends itself.
+
+1. **A test leaked into a live grabber.**  The loopback end-to-end test and a
+   real server shadowing the LAN ran at the same time on the same machine.
+   Both bind the advert and fake-dial sockets on all interfaces (the real
+   path needs that); on macOS two `SO_REUSEADDR` binds of one port overlap
+   deliveries, so the test's synthetic handshake frames landed inside the
+   running grabber's intake.  The grabber grouped them, froze them, and the
+   frozen file was synthetic -- the cameras rejected its CALLING at dial
+   time and every tile stalled with no video at all.  The frozen tid gave it
+   away: a synthetic id, never a camera id.
+   Fix, both sides: the test's grabber now binds loopback-only sockets on
+   OS-picked ports (it may never share port space with a live grabber), and
+   the frame intake drops packets from this machine's own IPs unless a test
+   opts in -- the self gate the probe answerer already had, now also on the
+   handshake path.  Lesson: one machine can be its own population of fake
+   phones; every capture must say who it came from.
+
+2. **The forged advert was ignored by a current app build.**  A shadow armed
+   on all four cameras answered every phone probe instantly, yet a tap into
+   a camera streamed from the real camera and never dialed the server --
+   no inbound frames of any size.  Two observations pinned the mechanism:
+   each phone probed the advert port once per whole run and then went
+   quiet, and the cameras' P2P ports were unchanged across server restarts
+   (ports only turn over on camera reboot).  So the app was running on a
+   warm endpoint and did not consult LAN discovery at all for that tap.
+   The follow-up check (answers with the genuine reply byte-for-byte,
+   `forge_call --identical`) pointed at the answer channel itself: the
+   probe's last field (the reply port the app declares in
+   `discover.build_probe`) is the port the **cameras** answer, while both
+   impersonators hardcoded the legacy phone listener port.  Any app build
+   that declares another port silently discards our advert -- exactly what
+   the endless probe loop showed.  Both tools now read the declared port
+   from the probe and answer there as well as on the legacy port, and they
+   say the declared port out loud so the next live match is one line of
+   evidence, not a theory.
+
+Verdict on the capture flow: unchanged and correct in design; the app-side
+gesture (view one camera once) now has a server that answers on the port the
+app itself asks for.  The old stopping point still stands.
+
+## Phase 30 -- why the forged advert stopped being dialed, and the route that works
+
+Date: 2026-10-19.
+
+Phase 29 left one question open: the reply was answered on the port the app
+declares and still not dialed. This round closed it with four measurements and
+one working route.
+
+**The advert is not the problem.** Two cameras were probed three times each
+with different counters and a different target slot; every reply was
+byte-identical. A cloned advert is replayable forever, so no stale nonce or
+per-probe field can explain the refusal. A probe that declares another reply
+port is answered on that port and nowhere else, which is where both tools
+already listen.
+
+**The app does use LAN discovery, and dials the camera's real endpoint.** A
+PCAPdroid capture of the phone while one camera played showed direct LAN UDP
+between the app's P2P socket and the camera's advertised port -- 28,505
+packets / 24.4 MB from one camera and 7,809 / 4.9 MB from the other, with the
+return direction on the same tuple -- plus a small relay flow and 72 discovery
+probes to the limited broadcast. The port the app dialed is the one from the
+camera's discovery reply, so replies are consumed; ours was simply not the one
+it used.
+
+**Neither app takes the forged reply while the real camera is answering.**
+Multi-minute runs with the reply answered instantly on the declared port and a
+500 Hz broadcast beside it produced zero inbound frames. The patched Android
+app (with its patched list host made reachable by an IP alias and its list
+exchange answered for real by a proxy) and the official app on a second phone
+both swept and never dialed the forged endpoint. A fresh app start and a new
+discovery socket did not change it.
+
+The reading that fits every observation: for a given device the app keeps the
+camera's own reply, and a userspace listener cannot beat camera firmware to its
+own probe. The 2026-10-13 capture was made on an app that had just been
+uninstalled and re-signed, so it had no endpoint cached for that camera; that
+is the state in which a forged reply can still win, and it is not the state of
+a phone that has played the camera once.
+
+**The route that works: take the camera's address.** With the camera powered
+off, the endpoint the app already knows is free. Alias that address on the
+capture machine, bind the camera's P2P port, force-stop the app and open the
+camera:
+
+    python3 forge_call.py 20            # camera on: note [clone] <ip> port <p2p>
+    # power the camera off
+    sudo ifconfig en0 alias <camera-ip> 255.255.255.0
+    python3 forge_call.py 600 --listen=<p2p-port>
+    # force-stop the app, open the camera
+
+The first live run produced an inbound 76-byte `7eb9` AvStreamCtl from the
+phone's P2P socket on the camera's port. A session built from scratch also
+delivers hello (74 B) and calling (128 B); if only the AvStreamCtl arrives, the
+app reused an open session and needs the force-stop. `forge_call.py --listen`
+binds a port when no clone is available, which is what makes the powered-off
+case possible, and `listsrv.py` answers the patched app's list exchange from
+the genuine service for anyone reproducing the comparison.
+
+Consequence: the automatic grab is no longer the promised happy path. README
+and wire/README lead with the takeover; `wiregrab.py` stays as a bonus that
+can still win on a cold app.
+
+## Why the project stops here
 Most of the codebase's own notes say what is still missing.  Some of it is
 genuinely undone: the relay rendezvous, camera controls (they have no LAN path
 anyway), the siren (a cloud model write), polish on the 1080p negotiation.  A

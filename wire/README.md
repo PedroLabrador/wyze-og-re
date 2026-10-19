@@ -19,53 +19,83 @@ is not.
 
 ## Takeover capture
 
+First time here? The full walkthrough, including what each step should print
+and what to do when it does not, is
+[First setup, start to finish](../README.md#first-setup-start-to-finish).
+This section is the capture part on its own. All commands run from the repo
+root; the addresses below are examples.
+
 1. Let the phone's app stream the target camera once on this Wi-Fi, so it has
-   learned that camera's `LAN IP:port`.
+   learned that camera's `LAN IP:port`. Nothing is installed or changed on the
+   phone.
 2. With the camera **on**, read the endpoint off a genuine reply:
 
    ```sh
-   python3 ../forge_call.py 20
-   # [clone] <camera-ip>   port <p2p-port>  ...
+   python3 forge_call.py 20
+   # [clone] 192.168.77.50   port 50413  -> 29000  chk 0x... mac=... id=...
    ```
 
-3. Power that camera **off**.
+   Keep the IP and the **first** port (before `->`); `29000` is the fake port
+   used by the other route. `captured no genuine replies` means the camera is
+   off, on another subnet, or on another Wi-Fi/VLAN.
+
+3. Power that camera **off**, completely.
 4. Give this machine the camera's address (adjust the interface):
 
    ```sh
-   sudo ifconfig en0 alias <camera-ip> 255.255.255.0
+   sudo ifconfig en0 alias 192.168.77.50 255.255.255.0     # macOS
+   sudo ip addr add 192.168.77.50/24 dev wlan0              # Linux
    ```
 
 5. Listen on the camera's P2P port. The camera is off, so nothing can be
    cloned; `--listen` binds the port by number:
 
    ```sh
-   python3 ../forge_call.py 600 --listen=<p2p-port>
+   python3 forge_call.py 600 --listen=50413
+   # [listen] discovery :8899   fake p2p :29000   camera ports [50413]   for 600 s
    ```
 
-6. Force-stop the app and open that camera again. It dials
-   `<camera-ip>:<p2p-port>` — this machine — and every frame prints and lands
-   in `/tmp/forge_in_<port>_<time>_<seq>.bin`:
+   The port in `camera ports` must match step 2.
+
+6. Force-stop the app (Android: Settings -> Apps -> Wyze -> Force stop;
+   iPhone: swipe up and flick the card away), then open that camera again. It
+   dials `<camera-ip>:<p2p-port>` -- this machine -- and every frame prints
+   and lands in `/tmp/forge_in_<port>_<time>_<seq>.bin`:
 
    ```
-   [ 87.9s] *** INBOUND [camport:<p2p-port>] from <phone-ip>:<src-port> len=76 ***
+   [ 12.4s] *** INBOUND [camport:50413] from 192.168.77.20:46860  len=74 ***
    ```
 
    A session built from scratch delivers three frames: `hello` (74 B),
    `calling` (128 B) and `avstreamctl` (76 B). If only the 76-byte `7eb9`
-   arrives, the app reused an already-open session — force-stop it first.
+   arrives, the app reused an already-open session -- force-stop it first.
 
 7. Freeze the frames:
 
    ```sh
-   python3 ../dump_frames.py        # groups one internally-consistent
-                                    # (tid, session word) set per camera
+   python3 dump_frames.py      # prints wrote .../wire/p2p_frames.json
    ```
+
+   Each `tid=...` line lists the frames kept. `INCOMPLETE` means one is
+   missing; recapture, do not merge sessions.
 
 8. Undo the address, then power the camera back on:
 
    ```sh
-   sudo ifconfig en0 -alias <camera-ip>
+   sudo ifconfig en0 -alias 192.168.77.50        # macOS
+   sudo ip addr del 192.168.77.50/24 dev wlan0    # Linux
    ```
+
+### When the takeover does not produce frames
+
+| what you see | what it means | what to do |
+|---|---|---|
+| `captured no genuine replies` in step 2 | the probe reached no camera | camera on, same Wi-Fi/VLAN, no VPN on the computer |
+| `camera ports []` in step 5 | `--listen` was not given or had a typo | repeat step 5 with the port from step 2 |
+| nothing inbound after the tap | the app dialed the real camera, not this machine | check the alias and port (steps 4-5); confirm the camera is off; power-cycle the phone's Wi-Fi |
+| only a 76-byte `7eb9` frame | the app reused an open session | force-stop the app, then reopen the camera (step 6) |
+| app shows the camera offline and will not open it | the cloud marked it offline and hid the tile | wait a minute and tap again; the LAN address is still cached |
+| `dump_frames` prints `INCOMPLETE` | the three frames came from different sessions | recapture; the session word must match across frames |
 
 The same steps work with the official app on any phone: the route depends on
 the app's endpoint cache, not on the APK being patched.
