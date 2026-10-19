@@ -29,7 +29,6 @@ from p2p_call import extract_tid     # noqa: E402
 
 FRAME_PORT = 45555                   # "camera P2P port" inside the fake advert
 ADVERT_PORT = 8899                   # fake camera's advert port
-FAKE_P2P = wiregrab.FAKE_P2P_PORTS[0]   # the port the forged advert claims
 
 TID = 0x4297000000001234             # synthetic; "tid ...1234"
 WORD = 0xCAFE0001
@@ -91,7 +90,21 @@ def fake_advert():
     return bytes(ad)
 
 
+def _free_loopback_port():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
+
+
 def main():
+    # OS-picked loopback ports: the grabber under test may never share the
+    # real 8899/29000 of a live server shadowing this same LAN (macOS would
+    # overlap the deliveries of two SO_REUSEADDR binds and feed the live
+    # grabber test frames).
+    disc_port = _free_loopback_port()
+    fake_port = _free_loopback_port()
     out = os.path.join("/tmp", "wyze-og", "grab_test.json")
     try:
         os.remove(out)
@@ -131,7 +144,9 @@ def main():
     grabber = wiregrab.Grabber(REPO, on_done=lambda s: done.set(),
                                out_path=out,
                                probe_targets=["127.0.0.1"],
-                               allow_self=True, quiet=False)
+                               allow_self=True,
+                               disc_port=disc_port, fake_port=fake_port,
+                               quiet=False)
     grabber.start()
     assert advert_answered.wait(25.0), "fake camera never saw the probe"
 
@@ -147,7 +162,10 @@ def main():
         pass                               # blasting is a race; frames matter
 
     for fr in (build_hello(), build_calling(), build_avctl()):
-        ph.sendto(fr, ("127.0.0.1", FAKE_P2P))
+        # to the port the forged advert itself claims (parsed: the test may
+        # never assume the module default, it passes its own fake_port)
+        claimed = struct.unpack_from("<I", buf, 44)[0] if buf else fake_port
+        ph.sendto(fr, ("127.0.0.1", claimed))
         time.sleep(0.01)                   # mimic one frame per tap
 
     assert done.wait(20.0), "grabber never froze the capture"

@@ -91,6 +91,8 @@ class Grabber(threading.Thread):
                  out_path=None,
                  probe_targets=None,   # override: plain IPs to probe (tests)
                  allow_self=False,     # tests: answer probes from ourselves
+                 disc_port=None,       # tests: loopback-bound advert port
+                 fake_port=None,       # tests: loopback-bound dial port
                  quiet=False):
         super().__init__(name="wire-grab", daemon=True)
         self.root = root
@@ -101,6 +103,15 @@ class Grabber(threading.Thread):
         self.probe_targets = (probe_targets or
                               (env_t.split(",") if env_t else None) or None)
         self.allow_self = allow_self
+        # Tests run the whole arc inside 127.0.0.1.  Passing explicit ports
+        # here binds those sockets to loopback ONLY: a live server shadowing
+        # the same LAN holds "0.0.0.0" on the same ports, and on macOS two
+        # SO_REUSEADDR binds of one port overlap deliveries -- synthetic test
+        # frames could leak into a running grabber's capture (seen live), so
+        # tests must never share ports with a real one.
+        self.disc_port = DISC_PORT if disc_port is None else disc_port
+        self.loop = disc_port is not None
+        self.fake_port = FAKE_P2P_PORTS[0] if fake_port is None else fake_port
         self.quiet = quiet
         self._halt = threading.Event()
         self._lock = threading.Lock()
@@ -177,25 +188,25 @@ class Grabber(threading.Thread):
         for ip, data in sorted(genuine.items()):
             forged = bytearray(data)
             real_port = struct.unpack_from("<I", data, 44)[0]
-            delta = real_port ^ FAKE_P2P_PORTS[0]
+            delta = real_port ^ self.fake_port
             chk = struct.unpack_from("<I", data, 16)[0]
-            struct.pack_into("<I", forged, 44, FAKE_P2P_PORTS[0])
+            struct.pack_into("<I", forged, 44, self.fake_port)
             struct.pack_into("<I", forged, 16, chk ^ delta)
             clones.append(bytes(forged))
             self.say("cloned the camera at %s (real P2P port %d -> ours: %d)"
-                     % (ip, real_port, FAKE_P2P_PORTS[0]))
+                     % (ip, real_port, self.fake_port))
 
         disc = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         disc.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        disc.bind(("0.0.0.0", DISC_PORT))
+        disc.bind(("127.0.0.1" if self.loop else "0.0.0.0", self.disc_port))
         disc.setblocking(False)
 
         p2p = None
-        for p in FAKE_P2P_PORTS:
+        for p in ((self.fake_port,) if self.loop else FAKE_P2P_PORTS):
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
-                s.bind(("0.0.0.0", p))
+                s.bind(("127.0.0.1" if self.loop else "0.0.0.0", p))
                 s.setblocking(False)
                 p2p = s
                 break
@@ -235,6 +246,17 @@ class Grabber(threading.Thread):
         phone = None
         last_send = 0.0
         landed = False
+        noise = {"n": 0, "t": 0.0}
+
+        def note(msg, data, addr, port):
+            # rate-limited visibility for everything that is NOT a handshake
+            # frame; if a phone ever dials us, the server must say so with
+            # size, source and first bytes instead of dropping it silently.
+            noise["n"] += 1
+            if noise["n"] <= 10 or time.time() - noise["t"] > 2.0:
+                noise["t"] = time.time()
+                self.say("%s: %d B on :%d from %s head %s"
+                         % (msg, len(data), port, addr[0], bytes(data[:10]).hex()))
         try:
             self.say("shadowing the cameras: open the official app on any "
                      "phone of this Wi-Fi and view ONE camera once")
@@ -270,17 +292,30 @@ class Grabber(threading.Thread):
                             except OSError:
                                 pass
                             last_send = time.time()
+                        else:
+                            note("non-probe on the advert port", data, addr,
+                                 self.disc_port)
                         continue
 
                     ln = len(data)
-                    if ln not in KIND:
-                        continue      # later session traffic we do not need
                     d = bytes(data)
+                    # Self-sourced frames are never a phone: this machine's
+                    # own discovery, or a test running here.  A loopback test
+                    # once leaked into a live grabber and froze a synthetic
+                    # capture; the self gate belongs on this intake too.
+                    if not self.allow_self and addr[0] in self._own:
+                        continue
+                    if ln not in KIND:
+                        note("non-handshake inbound", data, addr,
+                             s.getsockname()[1])
+                        continue      # later session traffic we do not need
                     tid = extract_tid(d)
                     w = None if tid is None else _word_of(d)
                     if tid is None or w is None:
+                        note("tid/word UNREADABLE frame", data, addr,
+                             s.getsockname()[1])
                         continue
-                    st = self._set(frames=self.status["frames"] + 1)
+                    self._set(frames=self.status["frames"] + 1)
                     self.say("handshake frame captured (%s of tid ...%s)"
                              % (KIND[ln], str(tid)[-4:]))
                     groups.setdefault((tid, w), {})[KIND[ln]] = d.hex()
@@ -323,6 +358,15 @@ class Grabber(threading.Thread):
     # -- thread body ------------------------------------------------------
     def run(self):
         try:
+            env_t = os.environ.get("WIREGRAB_PROBE_TARGETS")
+            if self.probe_targets:
+                self.say("armed; probing %s%s"
+                         % (self.probe_targets,
+                            " (set by WIREGRAB_PROBE_TARGETS)"
+                            if env_t else ""))
+            else:
+                self.say("armed; probing the derived subnet broadcasts (%d)"
+                         % len(broadcast_addrs()))
             while not self._halt.is_set():
                 genuine = self._genuine()
                 if not genuine:
