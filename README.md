@@ -41,7 +41,9 @@ and finds cameras at every start. Before anything streams, it also needs
 official Wyze app on any phone of the Wi-Fi views ONE camera, the handshake
 bytes land in the server, freeze into `wire/p2p_frames.json` (git-ignored),
 impersonation stops and the grid streams permanently. No scripts to run, no
-root, no APK patching — one tap in the app you already have.
+root, no APK patching — one tap in the app you already have. The phone takes
+part **only over the network**: it stays in your pocket on the same Wi-Fi —
+no USB, no adb, nothing connects it to the PC.
 
 Everything capture-related stays local (`wire/*` is git-ignored):
 `wire/README.md` documents what the grabber freezes plus the manual

@@ -33,8 +33,10 @@ carry that file (git-ignored), so `wiregrab.py` — a thread inside the server �
 arms itself instead: it shadows the cameras on the LAN and the first time the
 official Wyze app on **any phone of this Wi-Fi** views ONE camera, that
 phone's handshake walks into the server, freezes to `wire/p2p_frames.json`,
-impersonation stops and the grid streams. One tap, once; no scripts, no root,
-no APK patching. Steps:
+impersonation stops and the grid streams. One tap, once; no scripts, no
+root, no APK patching. The phone takes part over the network only — it
+stays wherever it is on the Wi-Fi, no USB, no adb, nothing ties it to the
+PC. Steps:
 
 * what the grabber does + what it freezes: [`wire/README.md`](../wire/README.md)
 * background: `REVERSE_ENGINEERING.md` §5 (CALLING, RC5, KCP)
