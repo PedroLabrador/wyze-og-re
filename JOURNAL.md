@@ -2287,6 +2287,57 @@ Conclusion: the capture stays.  It is one faithful run per user, it stays local
 it.  The differential map above is written down so the synth idea can be
 reopened someday with a capture that has two different accounts.
 
+## Phase 28 -- removing the last manual step: the server runs the capture itself
+
+Phase 27 closed the *synthesis* path, but leaving one scripted capture for
+every user bugged me more than the synth itself: the workflow ("clone, run
+the capture recipe, then run the server") was three steps where one would do,
+and the recipe needed a machine to run two command lines plus a phone.  The
+tools it needed were already proven (`forge_call.py` had captured the 10-13
+handshake by impersonating cameras on the discovery port; `dump_frames.py`
+had how the frames must be grouped by session word), so I folded both into
+the server as one background pass, `wiregrab.py`.
+
+* **The scheme is the proven one.** While nothing is on file, the grabber
+  answers the phone's discovery probe *as a camera* (own IP, cloned advert,
+  P2P-port field edited, XOR checksum rebalanced).  The official app then
+  dials the server when its user views a camera, and the handshake bytes
+  arrive on sockets I own.  First complete (hello, calling, avstreamctl)
+  trio sharing one session word freezes as the frozen `wire/p2p_frames.json`
+  in the exact format `dump_frames.py` writes, impersonation stops, and the
+  workers restart against real cameras.  No root: UDP only.
+* **Discovery lost its hardcoded broadcast.** While wiring this in I noticed
+  the probe still aimed at one literal address from my own LAN, which would
+  have made ANY fresh clone discover nothing anywhere else.
+  `discover.py:broadcast_addrs()` now parses `ifconfig`/`ip addr` at
+  runtime (per-interface subnet broadcasts, limited broadcast as fallback)
+  and `wire/README`/probes aim accordingly.
+* **The loopback gate.** A grab that mistakes the server's own discovery
+  probes for a phone's would shadow itself, so the grabber ignores probes
+  from any local address and answers only the phone's.
+* **End-to-end validation on the loop:** `tests/test_wiregrab.py` rebuilds
+  the whole arc without hardware -- a fake camera answers the probe with a
+  synthetic but byte-valid advert, a fake phone binds 8900 and streams
+  hello/calling/avstreamctl built with the repo's own RC5 codec, and the
+  test proves the grabber clones, groups by session word, freezes, and that
+  the frozen CALLING round-trips through `decrypt`/`extract_tid` back to the
+  same tid and word.  The real-network boot check on this machine (a short
+  server run with the catch file moved aside) found the cameras from the
+  runtime broadcast and the grabber armed and waited as designed.
+* **What is honestly still open:** the mid-shadow behavior on real phones --
+  exactly which of the two paths (broadcast blast at 500 Hz vs. the instant
+  probe reply) wins the race for a given app/phone build -- was proven for
+  the standalone script in the 10-13 capture, so the server variant repeats
+  both.  The one thing no script can verify without another live phone with
+  the official app is the final yard; the protocol-side machinery it relies
+  on is the same code that already captured once.
+
+Consequence: from a fresh clone the workflow is now *clone, run the server,
+tapping a camera in the official app once on any phone of the Wi-Fi*.  The
+stop-here entry below still stands -- this is build polish on the collected
+scope, not new reverse-engineering -- but "one manual step" turned into "the
+server does it for you", which is why the READMEs changed shape this late.
+
 ## Why the project stops here
 
 Most of the codebase's own notes say what is still missing.  Some of it is

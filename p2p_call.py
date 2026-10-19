@@ -74,7 +74,7 @@ import time
 
 sys.path.insert(0, ".")
 from analyze_calls import decrypt, hexdump
-from discover import build_probe, parse_reply, BROADCAST, BROADCAST_PORT
+from discover import build_probe, parse_reply, broadcast_addrs, BROADCAST_PORT
 from listreq import rc5_decrypt_block, rc5_encrypt_block, rc5_setup
 from mtp_frame import wrap as mtp_wrap, unwrap as mtp_unwrap
 import mtp_res
@@ -331,7 +331,12 @@ def discover(duration=3.0):
     rx.setblocking(False)
     tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     tx.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    tx.sendto(build_probe(rx.getsockname()[1]), (BROADCAST, BROADCAST_PORT))
+    probe = build_probe(rx.getsockname()[1])
+    for bc in broadcast_addrs():
+        try:
+            tx.sendto(probe, (bc, BROADCAST_PORT))
+        except OSError:
+            pass
 
     found = {}
     end = time.time() + duration

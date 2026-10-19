@@ -1,11 +1,20 @@
 # Wire captures — Gwell/Kalay P2P list-server exchange
 
-**The capture run is mandatory, not optional.** A zero-capture CALLING synthesis was
-attempted (2026-10-18, from the byte-differential map of three real captures) and
-rejected by the hardware: discovery answered every time, six handshakes with three
-synthesized variants produced zero video frames (JOURNAL Phase 27).  Until the extra
-validated field is isolated, this one faithful pass is how every user produces the
-`p2p_frames.json` their machine needs.  Captures stay **local** (`wire/*` is git-ignored).
+**The server does this capture itself now.** `wiregrab.py` runs inside
+`wyze-cam-stream/server.py`: when `p2p_frames.json` is missing it shadows
+the cameras, and the first time the official app on any phone of the Wi-Fi
+views ONE camera the handshake freezes here, impersonation stops, and the
+grid streams. The recipes below are the manual equivalent — same
+impersonation (`forge_call.py`), same freezing (`dump_frames.py`) — kept
+for anyone who prefers it or for debugging.
+
+A zero-capture synthesis, in contrast, is a measured dead end (2026-10-18,
+from the byte-differential map of three real captures): discovery answered
+every time but the hardware rejected all six handshake variants with zero
+video frames (JOURNAL Phase 27). Until that extra validated field is
+isolated, one faithful capture — automatic or manual — is how every machine
+produces the `p2p_frames.json` it needs. Captures stay **local**
+(`wire/*` is git-ignored).
 
 Captured **2026-10-12**. This is the ground truth that unblocked the wire protocol
 (see `../wyze-cam-stream/P2P_PROTOCOL.md` §3a).

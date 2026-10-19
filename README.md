@@ -33,21 +33,24 @@ the bridge as a standalone LAN engine:
 Requirements: **Python 3.8+** (standard library only — no pip packages) and
 **`ffmpeg`** on `PATH`. That's it; the browser does the rest.
 
-Discovery itself needs nothing else -- the server finds cameras on the LAN
-on its own, at every start.  There is exactly **one manual step** before
-anything streams; after it, running the server is the whole workflow:
+Discovery is automatic: the server derives the subnet broadcast at runtime
+and finds cameras at every start. Before anything streams, it also needs
+**one camera-side handshake** (`hello` / `calling` / `avstreamctl` frames in
+`wire/p2p_frames.json`) — and **the server collects that one by itself**:
+`wiregrab.py` runs in the server, shadows the cameras, and the first time the
+official Wyze app on any phone of the Wi-Fi views ONE camera, the handshake
+bytes land in the server, freeze into `wire/p2p_frames.json` (git-ignored),
+impersonation stops and the grid streams permanently. No scripts to run, no
+root, no APK patching — one tap in the app you already have.
 
-1. **Capture the camera-side handshake, once** into `wire/p2p_frames.json`
-   (`hello` / `calling` / `avstreamctl` frames, hex-encoded). The capture
-   recipe and the reasoning behind it are in
-   [`wire/README.md`](wire/README.md) and
-   [`wyze-cam-stream/REVERSE_ENGINEERING.md`](wyze-cam-stream/REVERSE_ENGINEERING.md);
-   the tooling is in this repo (`forge_call.py`, `dump_frames.py`).
-   *No frames are committed here — they are per-session-random, so a borrowed
-   copy is worthless; run the recipe on your own gear.*
-   *(Why can't the server forge this itself? It was tried and measured:
-   JOURNAL Phase 27 — a synthesized CALLING passes discovery but six
-   handshakes against two live cameras delivered zero video frames.)*
+Everything capture-related stays local (`wire/*` is git-ignored):
+`wire/README.md` documents what the grabber freezes plus the manual
+recipe (`forge_call.py`, `dump_frames.py`) for anyone who prefers the
+command line. Why a capture instead of pure synthesis: JOURNAL Phase 27
+measured it — a synthesized CALLING passes discovery but six handshakes
+against two live cameras delivered zero video frames; replay of a captured
+handshake streams every camera (Phase 17). If the phone-side of the auto
+grab misses the window, the manual recipe is documented and byte-equivalent.
 2. *(optional)* **`wyze_devices.json`** at the repo root gives tiles their real
    nicknames; the cache format is the same JSON the Wyze cloud endpoints return
    for `get_device_list`. Without it the UI just shows generic camera labels.

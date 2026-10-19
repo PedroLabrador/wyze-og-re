@@ -25,22 +25,26 @@ No names, no cloud, no `wyze_devices.json` needed; cameras are labelled
 cameras sit in discovery backoff; the rest start streaming the moment the
 browser opens.
 
-### The one manual step: a handshake capture
+### The handshake: the server grabs its own capture
 
-Discovery is automatic, but **video needs one faithful capture of your own
-gear**.  The server replays a captured `CALLING` handshake from
-`wire/p2p_frames.json`; a clean checkout does not contain that file (it is
-deliberately git-ignored), so tiles appear but streaming politely refuses until
-you run the capture once:
+Discovery is automatic, and so is the handshake. The server replays a
+captured `CALLING` from `wire/p2p_frames.json`; a clean checkout does not
+carry that file (git-ignored), so `wiregrab.py` — a thread inside the server —
+arms itself instead: it shadows the cameras on the LAN and the first time the
+official Wyze app on **any phone of this Wi-Fi** views ONE camera, that
+phone's handshake walks into the server, freezes to `wire/p2p_frames.json`,
+impersonation stops and the grid streams. One tap, once; no scripts, no root,
+no APK patching. Steps:
 
-* recipe + reasoning: [`wire/README.md`](../wire/README.md)
+* what the grabber does + what it freezes: [`wire/README.md`](../wire/README.md)
 * background: `REVERSE_ENGINEERING.md` §5 (CALLING, RC5, KCP)
-* why synthesis does not replace the capture: `../JOURNAL.md` Phase 27 — a
-  zero-capture synthesized CALLING was built from the byte-differential map of
-  three real captures and tested against two live cameras; discovery answered
-  every time, six handshakes produced **zero** video frames, so the honest
-  conclusion is that the cameras validate more than the captures alone reveal.
-  Anything you capture stays local on your disk.
+* why the capture cannot be replaced by synthesis: `../JOURNAL.md` Phase 27 —
+  a zero-capture synthesized CALLING was tested against two live cameras;
+  discovery answered every time, six handshakes produced **zero** video
+  frames, so the honest conclusion is that the cameras validate more than
+  the captures alone reveal.
+* optional manual route: run `forge_call.py` + `dump_frames.py` yourself;
+  byte-equivalent to what the grabber harvests.
 
 Optional extras, never committed, all read if present:
 

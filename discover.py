@@ -5,7 +5,7 @@ This is the piece that was missing: how the client learns each camera's P2P
 port.  Reverse-engineered from send_loop (0x7d778) and confirmed by sniffing
 the real exchange with lansniff.py (P2P_PROTOCOL.md 5d).
 
-    us  --UDP 28 B-->  broadcast 192.168.77.18:8899   (also ff02::1%if:8899)
+    us  --UDP 28 B-->  <subnet broadcast>:8899     (also ff02::1%if:8899)
     cam --UDP 138 B->  <our port>                      (from <cam>:8899)
 
 Request, 28 bytes, NOT encrypted (the payload counter is visible in the clear
@@ -50,17 +50,67 @@ Usage:
     python3 discover.py             # broadcast + multicast, 3 s
     python3 discover.py 192.168.77.12 192.168.77.17   # unicast to given cams
 """
+import re
 import select
 import socket
 import struct
+import subprocess
 import sys
 import time
 
 BROADCAST_PORT = 8899
 FLAGS = 0x02010000
-BROADCAST = "192.168.77.18"
+# limited-broadcast fallback (routers never forward it, but it reaches every
+# host on the same link, which is all a camera needs); per-interface subnet
+# broadcasts are derived at runtime in broadcast_addrs().
+BROADCAST = "255.255.255.255"
 MULTICAST6 = ("ff02::1", BROADCAST_PORT)
 REPLY_LEN = 138
+
+
+def broadcast_addrs():
+    """The broadcast address of every local IPv4 interface, best first.
+
+    macOS `ifconfig` and Linux `ip -4 addr` print the per-interface broadcast
+    directly; parsing them means the code works on any home subnet -- from a
+    fresh checkout, with no relay to hand-edit and no netmask guessing.  If
+    nothing parses (unusual OS), fall back to limited broadcast 255.255.255.255.
+    """
+    out = []
+    try:
+        if sys.platform == "darwin":
+            txt = subprocess.run(["ifconfig"], capture_output=True,
+                                 timeout=3).stdout.decode("utf-8", "replace")
+            for ln in txt.splitlines():
+                ln = ln.strip()
+                if ln.startswith("broadcast "):
+                    b = ln.split(None, 1)[1].split(None, 1)[0]
+                    if b and b != "0.0.0.0":
+                        out.append(b)
+        else:
+            txt = subprocess.run(["ip", "-4", "-o", "addr"], capture_output=True,
+                                 timeout=3).stdout.decode("utf-8", "replace")
+            for mo in re.finditer(r"\bbrd\s+(\d+\.\d+\.\d+\.\d+)\b", txt):
+                out.append(mo.group(1))
+            if not out:
+                # Linux without brd left out: derive from iface/prefix
+                for mo in re.finditer(r"inet\s+(\d+\.\d+\.\d+\.\d+)/(\d+)\b", txt):
+                    ip_s, pre = mo.group(1), int(mo.group(2))
+                    if pre == 24:
+                        o = [int(x) for x in ip_s.split(".")]
+                        out.append("%d.%d.%d.255" % tuple(o[:3]))
+                    elif pre == 16:
+                        o = [int(x) for x in ip_s.split(".")]
+                        out.append("%d.255.255.255" % o[0])
+    except Exception:
+        pass
+    seen, res = set(out), []
+    for b in out:
+        if b not in seen:
+            continue
+        seen.discard(b)      # dedupe in order
+        res.append(b)
+    return res or [BROADCAST]
 
 
 def build_probe(reply_port, counter=0x10000000):
@@ -119,7 +169,7 @@ def main():
     if targets:
         destinations = [(ip, BROADCAST_PORT) for ip in targets]
     else:
-        destinations = [(BROADCAST, BROADCAST_PORT)]
+        destinations = [(b, BROADCAST_PORT) for b in broadcast_addrs()]
         try:
             tx6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
             tx6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_HOPS, 1)

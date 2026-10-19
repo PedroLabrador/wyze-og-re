@@ -702,11 +702,13 @@ Other AV-leg facts already pinned from these logs:
 ### The exchange
 
 ```
-us  --UDP 28 B-->  192.168.77.18:8899        (also ff02::1 port 8899 from the phone)
+us  --UDP 28 B-->  <subnet broadcast>:8899    (also ff02::1 port 8899 from the phone)
 cam --UDP 138 B->  <whatever port we put in the probe>   from <cam>:8899
 ```
 
-The camera's IPv4 is simply the **source address of the reply** — nothing in the payload.
+The broadcast address is the phone's own subnet broadcast (`discover.py`'s
+`broadcast_addrs()` derives it per interface at runtime); the camera's IPv4
+is simply the **source address of the reply** — nothing in the payload.
 
 ### Request — 28 bytes, NOT encrypted, no checksum
 
@@ -764,7 +766,8 @@ $ python3 discover.py
 [done] 4 camera(s)
 ```
 
-Both **broadcast** (`192.168.77.18:8899`) and **unicast** to a known camera IP work.
+Both **broadcast** (the runtime-derived subnet broadcast, port 8899) and
+**unicast** to a known camera IP work.
 All four advertised ports then pass the ICMP-open test (silent, no port-unreachable), while
 `8900` / `32300` / `4456` are provably closed on all four.
 
@@ -1668,7 +1671,7 @@ LAN call chain (what our client must reproduce next)
 | C36 | **[DISASSEMBLED]** `certify_req` = type `0x0c`, 64 B header+body: flags word `0x01410000` @+20, `hash(nonce)` @+28, **32-B RC5 nonce @+32** |
 | C37 | **[DISASSEMBLED]** `certify_resp` reports `u16 errcode` at `+26` and an **8-byte token** at `+28..+36`, echoed in later requests by `frame+24 bit2` |
 | C38 | **[DISASSEMBLED]** **The GUTES session RC5 key = the client's own 32-byte nonce** — `rc5_ctx_setkey(ctx+0xd8, ctx+156, 32)` right after a successful `certify` |
-| C39 | **[WIRE]** **LAN discovery solved**: 28-B request → `192.168.77.18:8899`, 138-B cleartext reply; **P2P port at offset 44, MAC at 58, `wyze_id` at 102**; camera IP = reply source address |
+| C39 | **[WIRE]** **LAN discovery solved**: 28-B request → subnet broadcast :8899, 138-B cleartext reply; **P2P port at offset 44, MAC at 58, `wyze_id` at 102**; camera IP = reply source address |
 | C40 | **[STANDALONE]** `discover.py` finds **all 4 cameras in 3 s** from the Mac with no app and no phone involved; broadcast and unicast both work |
 | C41 | **[EMPIRICAL]** On all four cameras UDP **8899 and the advertised P2P port are open**; **8900 / 32300 / 4456 are closed** (ICMP port-unreachable) |
 

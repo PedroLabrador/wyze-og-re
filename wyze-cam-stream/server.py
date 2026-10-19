@@ -101,6 +101,7 @@ for _p in (ROOT, HERE):
 
 from p2p_client import CameraStream, discover        # noqa: E402
 import p2p_call                                       # noqa: E402
+import wiregrab                                       # noqa: E402
 
 DEVICES_FILE = os.path.join(ROOT, "wyze_devices.json")
 
@@ -875,6 +876,18 @@ class Hub:
         self.cameras = {}          # tid -> {tid, ip, mac, name, calling}
         self.calling = self._load_calling()
         self.names = load_devices_file()
+        # No captured handshake on this machine yet: the server collects one
+        # by itself (wiregrab.py -- the forge_call.py discovery-impersonation
+        # scheme as a daemon).  While nothing is on file it shadows the
+        # cameras; the first time the official app on any phone of this
+        # Wi-Fi views ONE camera, the handshake bytes land here and the
+        # catch file freezes.  Impersonation then stops and the grid
+        # streams.  The UI banner reports the state meanwhile.
+        if self.calling is None:
+            self.grab = wiregrab.Grabber(ROOT, on_done=self.capture_landed)
+            self.grab.start()
+        else:
+            self.grab = None
         # -- focus (see viewing / _supervise) -------------------------------
         # What the live viewer CONNECTIONS are asking for: id -> camera tid, or
         # None for "whatever is discoverable" (the grid's /feed).  A camera
@@ -952,6 +965,20 @@ class Hub:
                 pass
         return found
 
+    def capture_landed(self, state):
+        """wiregrab froze wire/p2p_frames.json: go live with it.
+
+        Runs on the grabber thread.  The workers spawned so far were all
+        parked on the missing-capture error, so replace them wholesale and
+        rediscover; after that the regular viewer machinery owns the grid.
+        """
+        sys.stderr.write("[grab] handshake landed (tid ...%s): reloading\n"
+                         % (state.get("complete_tid") or "?")[-4:])
+        self.stop_all()
+        self.calling = self._load_calling()
+        self.grab = None
+        self.refresh()
+
     # -- streaming ---------------------------------------------------------
     def ensure(self, tid):
         with self.lock:
@@ -959,7 +986,7 @@ class Hub:
             if not cam:
                 return None, "unknown camera (run discovery first)"
             if not self.calling:
-                return None, "no CALLING frame in wire/p2p_frames.json"
+                return None, "waiting for the handshake grab (see the banner)"
             w = self.workers.get(int(tid))
             # A live worker self-heals (it re-runs discovery + handshake with
             # backoff), so never spawn a second one -- two workers on one
@@ -2650,16 +2677,27 @@ class Handler(BaseHTTPRequestHandler):
                     except ValueError:
                         pass
             names = load_devices_file()
+            grab = HUB.grab.state() if getattr(HUB, "grab", None) else None
+            if HUB.calling is None:
+                warn = ("no handshake on file yet, so there is no video: "
+                        "on any phone of this Wi-Fi open the official Wyze "
+                        "app and view ONE camera once; the server takes "
+                        "care of the rest by itself.")
+                if grab and grab.get("genuine"):
+                    warn += (" (the grabber is shadowing %d camera(s), "
+                             "waiting for the app's handshake)" % grab["genuine"])
+            else:
+                warn = None if names else \
+                    "wyze_devices.json not found \\u2014 camera names are generic."
             self._json(200, cameras=HUB.state(),
+                       capture=grab,
                        micprobe=LAST_PROBE,
                        audio_lag=AUD_LAG,
                        talk_junk={"bytes": TALK_JUNK["bytes"],
                                   "srcs": len(TALK_JUNK["srcs"]),
                                   "first": TALK_JUNK["first"],
                                   "last": TALK_JUNK["last"]},
-                       warning=None if names else
-                       "wyze_devices.json not found \\u2014 camera names are "
-                       "generic.")
+                       warning=warn)
         elif path == "/feed":
             self._feed()
         elif path == "/probe":
@@ -3003,8 +3041,11 @@ def main():
         return 0
 
     if not HUB.calling:
-        print("WARNING: no CALLING frame found in wire/p2p_frames.json;")
-        print("         streaming will not work until one is captured.")
+        print("No handshake on file yet: the grabber is armed and shadows "
+              "the cameras.")
+        print("The first time the official app on any phone of this Wi-Fi "
+              "views ONE")
+        print("camera, the handshake lands by itself and the grid streams.")
 
     devs = load_devices_file()
     print("Scanning the LAN for cameras...")

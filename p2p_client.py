@@ -52,9 +52,8 @@ MTU = 1032                 # gute_recv_fragment_init mtu=1032, from live logcat
 
 # LAN discovery is proven in ../discover.py -- reuse it rather than
 # re-deriving the probe.  Note the real port is 8899 and the real target is
-# the subnet broadcast, not 255.255.255.255.
-from discover import (build_probe, parse_reply,          # noqa: E402
-                      BROADCAST, BROADCAST_PORT)
+# the subnet broadcast, derived per interface at runtime (see broadcast_addrs).
+from discover import build_probe, parse_reply, broadcast_addrs, BROADCAST_PORT
 
 
 def discover(duration=3.0, want_tid=None):
@@ -69,7 +68,12 @@ def discover(duration=3.0, want_tid=None):
     rx.setblocking(False)
     tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     tx.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    tx.sendto(build_probe(rx.getsockname()[1]), (BROADCAST, BROADCAST_PORT))
+    probe = build_probe(rx.getsockname()[1])
+    for bc in broadcast_addrs():
+        try:
+            tx.sendto(probe, (bc, BROADCAST_PORT))
+        except OSError:
+            pass
 
     found = {}
     end = time.time() + duration

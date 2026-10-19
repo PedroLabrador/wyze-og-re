@@ -40,12 +40,11 @@ import sys
 import time
 
 sys.path.insert(0, ".")
-from discover import build_probe, BROADCAST_PORT
+from discover import build_probe, BROADCAST_PORT, broadcast_addrs
 
 DISC_PORT = 8899          # source port the app expects a reply from
 FAKE_P2P_PORT = 29000     # where we want the app to send its CALLING frame
 PHONE_PORT = 8900         # the port broadcast_fd_init binds on the phone
-BROADCAST = "192.168.77.18"
 _args = [a for a in sys.argv[1:] if not a.startswith("--")]
 # --identical: send the genuine reply byte-for-byte (only the source IP differs).
 # This isolates "is the payload edit being rejected?" from "is the source IP
@@ -72,7 +71,12 @@ def capture_genuine_replies():
     rx.setblocking(False)
     tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     tx.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    tx.sendto(build_probe(rx.getsockname()[1]), (BROADCAST, BROADCAST_PORT))
+    probe = build_probe(rx.getsockname()[1])
+    for bc in broadcast_addrs():
+        try:
+            tx.sendto(probe, (bc, BROADCAST_PORT))
+        except OSError:
+            pass
 
     replies = {}
     end = time.time() + 3.0
@@ -165,7 +169,7 @@ def main():
 
     def blast():
         for forged in forges.values():
-            for dest in ({phone, BROADCAST} if phone else {BROADCAST}):
+            for dest in ({phone} if phone else set(broadcast_addrs())):
                 try:
                     disc.sendto(forged, (dest, PHONE_PORT))
                 except OSError:
