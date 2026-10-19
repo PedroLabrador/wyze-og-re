@@ -247,6 +247,8 @@ class Grabber(threading.Thread):
         last_send = 0.0
         landed = False
         noise = {"n": 0, "t": 0.0}
+        probe_said = {}        # phone ip -> when its probes were last logged
+        phone_ports = {PHONE_PORT}
 
         def note(msg, data, addr, port):
             # rate-limited visibility for everything that is NOT a handshake
@@ -263,12 +265,14 @@ class Grabber(threading.Thread):
             while not self._halt.is_set() and not landed:
                 if time.time() - last_send >= 0.002:
                     last_send = time.time()
+                    ports = phone_ports if phone else (PHONE_PORT,)
                     for forged in clones:
-                        for dest in ([phone] if phone else blast_targets):
-                            try:
-                                disc.sendto(forged, (dest, PHONE_PORT))
-                            except OSError:
-                                pass
+                        for port in ports:
+                            for dest in ([phone] if phone else blast_targets):
+                                try:
+                                    disc.sendto(forged, (dest, port))
+                                except OSError:
+                                    pass
                 r, _, _ = select.select(cap, [], [], 0.2)
                 for s in r:
                     try:
@@ -282,13 +286,37 @@ class Grabber(threading.Thread):
                             sip = addr[0]
                             if not self.allow_self and sip in self._own:
                                 continue     # the server's own discovery: no
-                            if phone != sip:
-                                phone = sip
-                                self.say("phone found at %s: answering its "
-                                         "probes instantly" % phone)
+                            # The probe's last field is the reply port the
+                            # app wants answers at (discover.build_probe).
+                            # The cameras obey it, so we must too: app
+                            # builds answer on other ports than the old
+                            # :8900, and a reply to a dead port is why a
+                            # shadow was ignored on 2026-10-19.
+                            want = struct.unpack_from("<H", data, 26)[0] \
+                                or PHONE_PORT
+                            first = want not in phone_ports
+                            now = time.time()
+                            # every probe is visible (rate-limited): "was
+                            # the phone probing at tap time?" must not be
+                            # a guess -- dusk-probe prints once per IP hid
+                            # the difference between "no probing at all"
+                            # and "probing continuously, advert ignored".
+                            if phone != sip or first or \
+                                    now - probe_said.get(sip, 0.0) > 4.0:
+                                probe_said[sip] = now
+                                if phone != sip:
+                                    phone = sip
+                                    self.say("phone found at %s: answering "
+                                             "its probes instantly" % phone)
+                                self.say("probe asks for replies on port %d%s"
+                                         % (want, " (first sighting)"
+                                            if first else ""))
+                            if first:
+                                phone_ports.add(want)
                             try:
-                                for forged in clones:
-                                    disc.sendto(forged, (sip, PHONE_PORT))
+                                for port in ({want, PHONE_PORT}):
+                                    for forged in clones:
+                                        disc.sendto(forged, (sip, port))
                             except OSError:
                                 pass
                             last_send = time.time()
