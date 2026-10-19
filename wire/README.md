@@ -1,12 +1,75 @@
-# Wire captures — Gwell/Kalay P2P list-server exchange
+# Wire captures — Gwell/Kalay P2P handshake
 
-**The server does this capture itself now.** `wiregrab.py` runs inside
-`wyze-cam-stream/server.py`: when `p2p_frames.json` is missing it shadows
-the cameras, and the first time the official app on any phone of the Wi-Fi
-views ONE camera the handshake freezes here, impersonation stops, and the
-grid streams. The recipes below are the manual equivalent — same
-impersonation (`forge_call.py`), same freezing (`dump_frames.py`) — kept
-for anyone who prefers it or for debugging.
+**One capture per machine, reused for every camera.** `p2p_frames.json` holds the
+app's `hello` / `calling` / `avstreamctl` frames. The CALLING is not bound to a
+device, so the same file streams every OG camera on the LAN. The server needs it
+before anything plays, and it never leaves the machine (`wire/*` is ignored).
+
+## Which capture route to use
+
+| route | what it does | status |
+|---|---|---|
+| **takeover** (below) | the app dials the camera's known `IP:port`; power the camera off and let this machine own that address | works with the current app builds |
+| `wiregrab.py` in the server, or `forge_call.py` | answers the phone's discovery probe as a camera and waits to be dialed | produced the 2026-10-13 capture on a freshly installed app; current builds keep using the real camera's reply and ignore it (JOURNAL Phase 30) |
+
+The takeover exists because a running app already knows where each camera is,
+so a second advert for the same device loses to the real camera's own reply.
+Removing the competitor is reliable; racing its firmware from a Python process
+is not.
+
+## Takeover capture
+
+1. Let the phone's app stream the target camera once on this Wi-Fi, so it has
+   learned that camera's `LAN IP:port`.
+2. With the camera **on**, read the endpoint off a genuine reply:
+
+   ```sh
+   python3 ../forge_call.py 20
+   # [clone] <camera-ip>   port <p2p-port>  ...
+   ```
+
+3. Power that camera **off**.
+4. Give this machine the camera's address (adjust the interface):
+
+   ```sh
+   sudo ifconfig en0 alias <camera-ip> 255.255.255.0
+   ```
+
+5. Listen on the camera's P2P port. The camera is off, so nothing can be
+   cloned; `--listen` binds the port by number:
+
+   ```sh
+   python3 ../forge_call.py 600 --listen=<p2p-port>
+   ```
+
+6. Force-stop the app and open that camera again. It dials
+   `<camera-ip>:<p2p-port>` — this machine — and every frame prints and lands
+   in `/tmp/forge_in_<port>_<time>_<seq>.bin`:
+
+   ```
+   [ 87.9s] *** INBOUND [camport:<p2p-port>] from <phone-ip>:<src-port> len=76 ***
+   ```
+
+   A session built from scratch delivers three frames: `hello` (74 B),
+   `calling` (128 B) and `avstreamctl` (76 B). If only the 76-byte `7eb9`
+   arrives, the app reused an already-open session — force-stop it first.
+
+7. Freeze the frames:
+
+   ```sh
+   python3 ../dump_frames.py        # groups one internally-consistent
+                                    # (tid, session word) set per camera
+   ```
+
+8. Undo the address, then power the camera back on:
+
+   ```sh
+   sudo ifconfig en0 -alias <camera-ip>
+   ```
+
+The same steps work with the official app on any phone: the route depends on
+the app's endpoint cache, not on the APK being patched.
+
 
 A zero-capture synthesis, in contrast, is a measured dead end (2026-10-18,
 from the byte-differential map of three real captures): discovery answered
