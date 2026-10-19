@@ -34,17 +34,20 @@ Requirements: **Python 3.8+** (standard library only — no pip packages) and
 **`ffmpeg`** on `PATH`. That's it; the browser does the rest.
 
 Discovery itself needs nothing else -- the server finds cameras on the LAN
-on its own, at every start.  But you do need **one-time captures of your
-own gear** before anything streams:
+on its own, at every start.  There is exactly **one manual step** before
+anything streams; after it, running the server is the whole workflow:
 
-1. **Capture the camera-side handshake** into `wire/p2p_frames.json`
+1. **Capture the camera-side handshake, once** into `wire/p2p_frames.json`
    (`hello` / `calling` / `avstreamctl` frames, hex-encoded). The capture
-   recipes and the reasoning behind them are in
+   recipe and the reasoning behind it are in
    [`wire/README.md`](wire/README.md) and
    [`wyze-cam-stream/REVERSE_ENGINEERING.md`](wyze-cam-stream/REVERSE_ENGINEERING.md);
    the tooling is in this repo (`forge_call.py`, `dump_frames.py`).
-   *No frames are committed here — every user captures their own, and they are
-   per-session-random, so a borrowed copy is worthless anyway.*
+   *No frames are committed here — they are per-session-random, so a borrowed
+   copy is worthless; run the recipe on your own gear.*
+   *(Why can't the server forge this itself? It was tried and measured:
+   JOURNAL Phase 27 — a synthesized CALLING passes discovery but six
+   handshakes against two live cameras delivered zero video frames.)*
 2. *(optional)* **`wyze_devices.json`** at the repo root gives tiles their real
    nicknames; the cache format is the same JSON the Wyze cloud endpoints return
    for `get_device_list`. Without it the UI just shows generic camera labels.
