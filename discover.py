@@ -68,42 +68,250 @@ MULTICAST6 = ("ff02::1", BROADCAST_PORT)
 REPLY_LEN = 138
 
 
+IS_WINDOWS = sys.platform.startswith("win")
+_QUAD_RE = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b")
+
+
+def _mask_bits(mask):
+    """Prefix length of a dotted-quad netmask, or None if not contiguous."""
+    try:
+        n = int.from_bytes(socket.inet_aton(mask), "big")
+    except OSError:
+        return None
+    if n == 0:
+        return None              # 0.0.0.0 is "no mask", not a /0 netmask
+    inv = (~n) & 0xFFFFFFFF
+    if inv & (inv + 1):
+        return None              # 255.0.255.0 and friends are not netmasks
+    return bin(n).count("1")
+
+
+def _broadcast_of(ip, mask):
+    """Directed broadcast for one address/netmask pair, or None for /31, /32."""
+    bits = _mask_bits(mask)
+    if bits is None or bits >= 31:
+        return None
+    try:
+        i = int.from_bytes(socket.inet_aton(ip), "big")
+        m = int.from_bytes(socket.inet_aton(mask), "big")
+    except OSError:
+        return None
+    return socket.inet_ntoa(((i & m) | ((~m) & 0xFFFFFFFF)).to_bytes(4, "big"))
+
+
+def windows_ifaces():
+    """[(ip, netmask)] for every IPv4 adapter, from `ipconfig`.
+
+    Windows has no equivalent of `ip -4 addr`, and its text output is
+    localised.  The *values* are always plain dotted quads, though, so pair
+    each netmask with the address printed immediately above it instead of
+    matching English labels.  (Order in `ipconfig` is Address then Mask.)
+    """
+    if not IS_WINDOWS:
+        return []
+    try:
+        run = subprocess.run(
+            ["ipconfig"], capture_output=True, timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:
+        return []
+    # Digits and dots are ASCII in every OEM/ANSI code page; high bytes only
+    # appear in adapter names, which we do not parse.
+    txt = run.stdout.decode("ascii", "replace")
+    pairs, last = [], None
+    for line in txt.splitlines():
+        mo = _QUAD_RE.search(line)
+        if not mo:
+            continue
+        value = mo.group(1)
+        bits = _mask_bits(value)
+        if bits is not None:
+            if last and bits < 31:
+                pairs.append((last, value))
+            last = None
+        else:
+            last = value
+    return pairs
+
+
+def resolver_ipv4():
+    """IPv4 addresses the resolver knows about (last-resort enumeration)."""
+    try:
+        return [ip for ip in socket.gethostbyname_ex(socket.gethostname())[2]
+                if not ip.startswith("127.")]
+    except OSError:
+        return []
+
+
+def local_ipv4():
+    """Every non-loopback IPv4 address on this host, best effort.
+
+    Used by the grabber's self-gate (wiregrab.own_ips) as well as discovery's
+    sweep fallback.  On Windows this is the only enumeration that works
+    without running an external tool per call, so the two share it.
+    """
+    ips = []
+    if IS_WINDOWS:
+        ips = [ip for ip, _ in windows_ifaces()]
+    else:
+        try:
+            if sys.platform == "darwin":
+                txt = subprocess.run(["ifconfig"], capture_output=True,
+                                     timeout=3).stdout.decode("utf-8", "replace")
+            else:
+                txt = subprocess.run(["ip", "-4", "-o", "addr"],
+                                     capture_output=True, timeout=3
+                                     ).stdout.decode("utf-8", "replace")
+                if "inet" not in txt:
+                    txt = subprocess.run(["ifconfig"], capture_output=True,
+                                         timeout=3
+                                         ).stdout.decode("utf-8", "replace")
+            ips = re.findall(r"\binet\s+(?:addr:)?(\d+\.\d+\.\d+\.\d+)", txt)
+        except Exception:
+            pass
+    if not ips:
+        ips = resolver_ipv4()
+    seen, res = set(), []
+    for ip in ips:
+        if ip in seen or ip == "0.0.0.0" or ip.startswith("127."):
+            continue
+        seen.add(ip)
+        res.append(ip)
+    return res
+
+
+def slash24_hosts(exclude=()):
+    """Every usable host on each local subnet (one /24 at most per adapter).
+
+    A unicast probe is a fallback for networks where the broadcast is dropped
+    before it reaches the camera (VPN/virtual adapters on Windows are the
+    usual culprits).  The camera answers unicast probes just like broadcast
+    ones -- discover.py's command line has always supported that.
+
+    On Windows the real netmask is used, which also keeps the sweep out of
+    /32 VPN adapters (a /32 has no broadcast and no neighbours) and small
+    point-to-point links.  Wide subnets are capped at the local /24 so a /16
+    does not turn into 65k packets.
+    """
+    skip = set(exclude) | {"0.0.0.0", "127.0.0.1"}
+    nets = (windows_ifaces() if IS_WINDOWS else
+            [(ip, "255.255.255.0") for ip in local_ipv4()])
+    out, seen = [], set()
+    for ip, mask in nets:
+        if ip.startswith(("127.", "169.254.")):
+            continue
+        bits = _mask_bits(mask)
+        if bits is None or bits >= 31:      # /32 VPN, /31 point-to-point
+            continue
+        if bits < 24:
+            base = ip.rsplit(".", 1)[0]
+            cands = ["%s.%d" % (base, host) for host in range(1, 255)]
+        else:
+            m = int.from_bytes(socket.inet_aton(mask), "big")
+            net = int.from_bytes(socket.inet_aton(ip), "big") & m
+            size = 1 << (32 - bits)
+            cands = [socket.inet_ntoa((net + k).to_bytes(4, "big"))
+                     for k in range(1, size - 1)]
+        for cand in cands:
+            if cand in skip or cand in seen:
+                continue
+            seen.add(cand)
+            out.append(cand)
+    return out
+
+
 def broadcast_addrs():
     """The broadcast address of every local IPv4 interface, best first.
 
-    macOS `ifconfig` and Linux `ip -4 addr` print the per-interface broadcast
-    directly; parsing them means the code works on any home subnet -- from a
+    macOS `ifconfig`, Linux `ip -4 addr` and Windows `ipconfig` all expose the
+    addresses; parsing them means the code works on any home subnet -- from a
     fresh checkout, with no relay to hand-edit and no netmask guessing.  If
-    nothing parses (unusual OS), fall back to limited broadcast 255.255.255.255.
+    nothing parses (unusual OS), fall back to limited broadcast
+    255.255.255.255.
+
+    Windows used to fall into the Linux branch: `ip` does not exist there, the
+    exception was swallowed, and discovery silently went out as a single
+    255.255.255.255 packet.  On a machine with a VPN or Hyper-V/WSL adapter
+    that limited broadcast is often routed out the wrong interface, so no
+    camera ever answered.  Use the per-adapter subnet broadcast instead.
     """
     out = []
     try:
-        if sys.platform == "darwin":
+        if IS_WINDOWS:
+            for ip, mask in windows_ifaces():
+                b = _broadcast_of(ip, mask)
+                if b:
+                    out.append(b)
+            if not out:
+                # ipconfig missing/unparseable: assume the home default /24.
+                for ip in resolver_ipv4():
+                    out.append("%s.255" % ip.rsplit(".", 1)[0])
+        elif sys.platform == "darwin":
             txt = subprocess.run(["ifconfig"], capture_output=True,
                                  timeout=3).stdout.decode("utf-8", "replace")
+            # macOS puts everything on one line:
+            #   inet 192.168.0.132 netmask 0xffffff00 broadcast 192.168.0.255
+            # (the old code looked for a line *starting* with "broadcast ",
+            # which never matches, so it always fell back to 255.255.255.255).
             for ln in txt.splitlines():
-                ln = ln.strip()
-                if ln.startswith("broadcast "):
-                    b = ln.split(None, 1)[1].split(None, 1)[0]
-                    if b and b != "0.0.0.0":
+                if "inet " not in ln:
+                    continue
+                mo = re.search(r"\bbroadcast\s+(\d+\.\d+\.\d+\.\d+)", ln)
+                if mo:
+                    out.append(mo.group(1))
+                    continue
+                mip = re.search(r"\binet\s+(?:addr:)?(\d+\.\d+\.\d+\.\d+)", ln)
+                mmo = re.search(r"\bnetmask\s+(0x[0-9a-fA-F]+|\d+\.\d+\.\d+\.\d+)",
+                                ln)
+                if mip and mmo:
+                    mask = mmo.group(1)
+                    if mask.startswith("0x"):
+                        mask = socket.inet_ntoa(
+                            int(mask, 16).to_bytes(4, "big"))
+                    b = _broadcast_of(mip.group(1), mask)
+                    if b:
                         out.append(b)
         else:
-            txt = subprocess.run(["ip", "-4", "-o", "addr"], capture_output=True,
-                                 timeout=3).stdout.decode("utf-8", "replace")
+            try:
+                txt = subprocess.run(["ip", "-4", "-o", "addr"],
+                                     capture_output=True, timeout=3
+                                     ).stdout.decode("utf-8", "replace")
+            except Exception:
+                txt = ""
             for mo in re.finditer(r"\bbrd\s+(\d+\.\d+\.\d+\.\d+)\b", txt):
                 out.append(mo.group(1))
             if not out:
-                # Linux without brd left out: derive from iface/prefix
+                # Linux without brd left out, or a BSD: try `ifconfig`.
+                try:
+                    txt = subprocess.run(["ifconfig"], capture_output=True,
+                                         timeout=3
+                                         ).stdout.decode("utf-8", "replace")
+                except Exception:
+                    txt = ""
+                for mo in re.finditer(r"broadcast\s+(\d+\.\d+\.\d+\.\d+)", txt):
+                    out.append(mo.group(1))
+            if not out:
                 for mo in re.finditer(r"inet\s+(\d+\.\d+\.\d+\.\d+)/(\d+)\b", txt):
                     ip_s, pre = mo.group(1), int(mo.group(2))
+                    mask = None
                     if pre == 24:
-                        o = [int(x) for x in ip_s.split(".")]
-                        out.append("%d.%d.%d.255" % tuple(o[:3]))
+                        mask = "255.255.255.0"
                     elif pre == 16:
-                        o = [int(x) for x in ip_s.split(".")]
-                        out.append("%d.255.255.255" % o[0])
+                        mask = "255.255.0.0"
+                    elif pre == 8:
+                        mask = "255.0.0.0"
+                    if mask:
+                        b = _broadcast_of(ip_s, mask)
+                        if b:
+                            out.append(b)
     except Exception:
         pass
+    out = [b for b in out if b and not b.startswith("127.")]
+    # Always keep the limited broadcast as a last target: it costs one packet
+    # and is the one address no adapter/netmask parsing can get wrong.  On
+    # Windows it can leave via the wrong interface (hence the directed
+    # broadcasts above), but when it leaves via the right one it just works.
+    out.append(BROADCAST)
     seen, res = set(out), []
     for b in out:
         if b not in seen:

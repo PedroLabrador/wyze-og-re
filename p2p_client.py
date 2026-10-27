@@ -53,14 +53,21 @@ MTU = 1032                 # gute_recv_fragment_init mtu=1032, from live logcat
 # LAN discovery is proven in ../discover.py -- reuse it rather than
 # re-deriving the probe.  Note the real port is 8899 and the real target is
 # the subnet broadcast, derived per interface at runtime (see broadcast_addrs).
-from discover import build_probe, parse_reply, broadcast_addrs, BROADCAST_PORT
+from discover import (build_probe, parse_reply, broadcast_addrs,
+                      slash24_hosts, BROADCAST_PORT)
 
 
-def discover(duration=3.0, want_tid=None):
+def discover(duration=3.0, want_tid=None, verbose=False, sweep=False):
     """Broadcast-probe the LAN.  Returns {ip: {"tid","p2p_port"}}.
 
     Ports are NOT stable, so this must be re-run at the start of every
     session.  It is also flaky -- callers should retry.
+
+    ``verbose`` prints every destination, send error and reply; it is what
+    ``server.py --discover`` uses to make a silent zero-camera result
+    debuggable.  ``sweep`` adds 254 unicast probes per local /24 after the
+    broadcasts: if a Windows firewall/router/VPN eats the broadcast, unicast
+    still reaches the camera and the answer proves the LAN path works.
     """
     rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     rx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -68,12 +75,29 @@ def discover(duration=3.0, want_tid=None):
     rx.setblocking(False)
     tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     tx.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    probe = build_probe(rx.getsockname()[1])
-    for bc in broadcast_addrs():
+    reply_port = rx.getsockname()[1]
+    probe = build_probe(reply_port)
+    targets = broadcast_addrs()
+    if verbose:
+        print("[discover] reply port %d, %d broadcast target(s): %s"
+              % (reply_port, len(targets), ", ".join(targets)), flush=True)
+    for bc in targets:
         try:
             tx.sendto(probe, (bc, BROADCAST_PORT))
-        except OSError:
-            pass
+        except OSError as e:
+            if verbose:
+                print("[discover] send to %s:8899 failed: %s" % (bc, e),
+                      flush=True)
+    if sweep:
+        hosts = slash24_hosts(exclude=())
+        if verbose:
+            print("[discover] sweeping %d unicast hosts on :%d"
+                  % (len(hosts), BROADCAST_PORT), flush=True)
+        for ip in hosts:
+            try:
+                tx.sendto(probe, (ip, BROADCAST_PORT))
+            except OSError:
+                pass
 
     found = {}
     end = time.time() + duration
@@ -87,17 +111,30 @@ def discover(duration=3.0, want_tid=None):
             continue
         dev = parse_reply(data, addr)
         if not dev:
+            if verbose:
+                print("[discover] junk %d B from %s:%d head %s"
+                      % (len(data), addr[0], addr[1], data[:10].hex()),
+                      flush=True)
             continue
         if want_tid and str(dev["tid"]) != str(want_tid):
             continue
         # keep wyze_id/mac too: the cloud device list is keyed by the
         # "CAM-1_xxxxxxxxxxxx" id, so nicknames can only be resolved if the
         # discovery reply carries it through.
+        if dev["ip"] not in found and verbose:
+            print("[discover] reply from %s: p2p_port=%s tid=%s %s"
+                  % (dev["ip"], dev["p2p_port"], dev["tid"],
+                     dev.get("wyze_id") or ""), flush=True)
         found[dev["ip"]] = {"tid": dev["tid"], "p2p_port": dev["p2p_port"],
                             "wyze_id": dev.get("wyze_id"),
                             "mac": dev.get("mac")}
     rx.close()
     tx.close()
+    if verbose and not found:
+        print("[discover] no reply in %.1fs. The probe left this host, so "
+              "either the camera is not on this subnet or its answer was "
+              "blocked on the way back (Windows Firewall is the usual "
+              "reason; see README)." % duration, flush=True)
     return found
 
 

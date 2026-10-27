@@ -84,6 +84,7 @@ import collections
 import contextlib
 import json
 import os
+import shutil
 import socket
 import struct
 import subprocess
@@ -100,6 +101,7 @@ for _p in (ROOT, HERE):
         sys.path.insert(0, _p)
 
 from p2p_client import CameraStream, discover        # noqa: E402
+from discover import broadcast_addrs, local_ipv4      # noqa: E402
 import p2p_call                                       # noqa: E402
 import wiregrab                                       # noqa: E402
 
@@ -254,7 +256,7 @@ def load_devices_file():
     if not os.path.exists(DEVICES_FILE):
         return {}
     try:
-        raw = json.load(open(DEVICES_FILE))
+        raw = json.load(open(DEVICES_FILE, encoding="utf-8"))
     except Exception:
         return {}
     out = {}
@@ -912,7 +914,7 @@ class Hub:
         """
         path = os.path.join(ROOT, "wire", "p2p_frames.json")
         try:
-            doc = json.load(open(path))
+            doc = json.load(open(path, encoding="utf-8"))
         except Exception:
             return None
         for tid in sorted(doc.get("devices", {})):
@@ -925,11 +927,18 @@ class Hub:
         return None
 
     # -- discovery ---------------------------------------------------------
-    def refresh(self, progress=None):
-        """Scan the LAN and reconcile it with the cached name list."""
+    def refresh(self, progress=None, sweep=False):
+        """Scan the LAN and reconcile it with the cached name list.
+
+        ``sweep`` adds one unicast /24 pass on the final attempt.  Callers
+        that retry on a timer leave it off (a broadcast storm every 2 s is
+        rude); interactive/startup scans turn it on so a network that eats
+        broadcasts still finds its cameras.
+        """
         found = {}
         for attempt in range(1, DISCOVER_ATTEMPTS + 1):
-            found = discover(DISCOVER_DURATION)
+            found = discover(DISCOVER_DURATION,
+                             sweep=(sweep and attempt == DISCOVER_ATTEMPTS))
             if found:
                 break
             if progress and attempt < DISCOVER_ATTEMPTS:
@@ -2729,7 +2738,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/discover":
             self._body()
             notes = []
-            found = HUB.refresh(progress=lambda m: notes.append(m))
+            found = HUB.refresh(progress=lambda m: notes.append(m), sweep=True)
             if not found:
                 notes.append("nothing answered %d broadcast attempts"
                              % DISCOVER_ATTEMPTS)
@@ -3015,7 +3024,66 @@ class Handler(BaseHTTPRequestHandler):
             view.__exit__(None, None, None)
 
 
+def platform_report():
+    """One screen of facts that decide whether discovery can work at all."""
+    print("Python %s on %s" % (sys.version.split()[0], sys.platform))
+    ips = local_ipv4()
+    print("local IPv4 : %s" % (", ".join(ips) or "(none -- no LAN address?)"))
+    print("broadcast  : %s" % (", ".join(broadcast_addrs()) or "(none)"))
+    ff = shutil.which("ffmpeg")
+    print("ffmpeg     : %s" % (ff or "NOT FOUND on PATH -- video will not decode"))
+    if sys.platform.startswith("win"):
+        # The inbound direction is the one Windows blocks by default, and it
+        # is the answer's direction: we send the probe, the camera answers to
+        # our ephemeral port.  No amount of broadcast tuning survives that.
+        print("windows    : if the probe leaves but no camera answers, allow "
+              "%s" % sys.executable)
+        print("             through Windows Defender Firewall (Private "
+              "networks), not just outbound.")
+
+
+def no_camera_help():
+    """What to check when three probes produced nothing."""
+    print("")
+    print("No camera answered. Check these in order:")
+    print("  1. This PC and the cameras are on the same subnet.  Compare the")
+    print("     local IPv4 above with the IP the phone shows for a camera")
+    print("     (official app -> camera -> Device Info).  Different third")
+    print("     octet means a second router/guest VLAN: broadcasts cannot")
+    print("     cross it.")
+    print("  2. Windows Firewall must allow INBOUND UDP for %s."
+          % sys.executable)
+    if sys.platform.startswith("win"):
+        print("     Run once in an elevated PowerShell:")
+        print('       New-NetFirewallRule -DisplayName "wyze-cam-stream" '
+              '-Direction Inbound')
+        print('         -Program "%s" -Protocol UDP -Action Allow '
+              '-Profile Private' % sys.executable)
+        print("     Also make sure the Wi-Fi/Ethernet profile is Private:")
+        print("       Get-NetConnectionProfile")
+        print('       Set-NetConnectionProfile -InterfaceAlias "Wi-Fi" '
+              '-NetworkCategory Private')
+    print("  3. Ping a camera's IP.  A reply proves routing; a timeout with")
+    print("     the same subnet usually means the firewall or AP isolation.")
+    print("     If the Wyze app shows a camera IP, probe it directly")
+    print("     (from the wyze-cam-stream directory):")
+    print("       python ../discover.py 192.168.1.23")
+    print("  4. Some routers/APs enable 'client isolation' (guest Wi-Fi),")
+    print("     which blocks PC <-> camera traffic entirely.")
+    print("  5. A VPN, Hyper-V, WSL or VirtualBox adapter can take the")
+    print("     broadcast route.  Disconnect the VPN and retry.")
+
+
 def main():
+    # Windows consoles/redirected stdout use a legacy code page; camera
+    # nicknames are user data and may not fit it.  Never let a print() kill
+    # the scan -- degrade the glyph instead.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
     ap = argparse.ArgumentParser(description="Wyze camera web viewer (LAN only)")
     ap.add_argument("--host", default="127.0.0.1",
                     help="bind address (default: localhost only)")
@@ -3025,9 +3093,15 @@ def main():
     args = ap.parse_args()
 
     if args.discover:
+        platform_report()
         found = {}
-        for _ in range(DISCOVER_ATTEMPTS):
-            found = discover(DISCOVER_DURATION)
+        for attempt in range(1, DISCOVER_ATTEMPTS + 1):
+            print("discovery attempt %d/%d..." % (attempt, DISCOVER_ATTEMPTS),
+                  flush=True)
+            # Last chance: unicast the local /24 as well, so a blocked
+            # broadcast does not look like an absent camera.
+            found = discover(DISCOVER_DURATION, verbose=True,
+                             sweep=(attempt == DISCOVER_ATTEMPTS))
             if found:
                 break
         devs = load_devices_file()
@@ -3037,8 +3111,13 @@ def main():
                   % (ip, d.get("tid"), d.get("p2p_port"),
                      (devs.get(mac) or {}).get("nickname") or "?", mac))
         if not found:
-            print("no cameras answered %d attempts" % DISCOVER_ATTEMPTS)
+            no_camera_help()
         return 0
+
+    if not shutil.which("ffmpeg"):
+        print("WARNING: ffmpeg is not on PATH.  Discovery will work but the")
+        print("         video pipeline cannot decode; install ffmpeg and")
+        print("         reopen this terminal before streaming.")
 
     if not HUB.calling:
         print("No handshake on file yet: the grabber is armed and shadows "
@@ -3049,10 +3128,12 @@ def main():
 
     devs = load_devices_file()
     print("Scanning the LAN for cameras...")
-    found = HUB.refresh(progress=lambda m: print("  " + m))
+    found = HUB.refresh(progress=lambda m: print("  " + m), sweep=True)
     if not found:
         print("  no cameras answered (they may be off) "
               "-- the UI retries every 2 s.")
+        print("  Run 'python server.py --discover' for a full LAN/firewall "
+              "diagnostic.")
     for ip, d in sorted(found.items()):
         mac = d.get("wyze_id") or ""
         print("  %-15s %-12s %s"

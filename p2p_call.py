@@ -145,7 +145,7 @@ def load_templates():
                           "wire", "p2p_frames.json")
     if not os.path.exists(frozen):
         return out
-    with open(frozen) as f:
+    with open(frozen, encoding="utf-8") as f:
         doc = json.load(f)
     print("[templates] using frozen wire/p2p_frames.json (no /tmp captures)")
     for tid, rec in doc.get("devices", {}).items():

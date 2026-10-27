@@ -11,6 +11,10 @@ own LAN P2P protocol, which this repo reverse-engineered end to end
 Requirements: **Python 3.8+** (standard library only — no pip installs) and
 **`ffmpeg`** on `PATH`.  Nothing else.
 
+On Windows, also allow **`python.exe` inbound UDP** in Windows Defender
+Firewall once (Private profile) — the cameras answer discovery inbound; see
+the [Windows](#windows) section below.
+
 ```bash
 cd wyze-cam-stream
 python3 server.py                 # http://127.0.0.1:8080
@@ -24,6 +28,42 @@ No names, no cloud, no `wyze_devices.json` needed; cameras are labelled
 `Camera <id>` unless the optional nickname cache exists (below).  Powered-off
 cameras sit in discovery backoff; the rest start streaming the moment the
 browser opens.
+
+### Windows
+
+The LAN protocol is platform-neutral, but two Windows defaults can make the
+cameras look absent.  Run `python server.py --discover` first: it prints the
+local IPv4 addresses, the broadcast target per adapter, whether `ffmpeg` is
+on `PATH`, every probe reply, and — on the last attempt — also sweeps the
+local /24 with unicast probes.
+
+* **Firewall.** Discovery is outbound UDP to `:8899`, but the **answer** is
+  inbound UDP to an ephemeral port.  Windows Defender Firewall blocks that by
+  default for an unknown program.  When the "allow access" prompt appears,
+  allow **Private** networks; if it never appeared (or you clicked Cancel),
+  run once in an *elevated* PowerShell, with the real `python.exe` path
+  printed by `--discover`:
+
+  ```powershell
+  New-NetFirewallRule -DisplayName "wyze-cam-stream" -Direction Inbound `
+    -Program "C:\Path\To\python.exe" -Protocol UDP -Action Allow -Profile Private
+  ```
+
+  Also confirm the adapter profile is Private:
+  `Get-NetConnectionProfile`, then
+  `Set-NetConnectionProfile -InterfaceAlias "Wi-Fi" -NetworkCategory Private`.
+
+* **Broadcast routing.** Windows has no `ip` command, so older builds fell
+  back to a single `255.255.255.255` probe.  With a VPN, Hyper-V/WSL or
+  VirtualBox adapter present, that packet often leaves through the wrong
+  interface.  `discover.py` now derives each adapter's subnet broadcast from
+  `ipconfig` (values only, so localised Windows works).  If it still finds
+  nothing, disconnect the VPN and retry; `--discover`'s unicast sweep tells
+  you whether the block is the broadcast path or the return path.
+
+Use `python server.py` (on Windows `python3` usually does not exist).  A
+timeout pinging a camera's IP with the PC and camera on the same subnet
+points at the firewall or at AP/client isolation on the router.
 
 ### The handshake: the server grabs its own capture
 

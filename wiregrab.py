@@ -28,11 +28,9 @@ machine (`wire/*` is git-ignored).
 """
 import json
 import os
-import re
 import select
 import socket
 import struct
-import subprocess
 import sys
 import threading
 import time
@@ -40,7 +38,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # repo root
 
 from analyze_calls import decrypt          # noqa: E402
-from discover import BROADCAST_PORT, broadcast_addrs, build_probe  # noqa: E402
+from discover import (BROADCAST_PORT, broadcast_addrs, build_probe,  # noqa: E402
+                      local_ipv4)
 from mtp_frame import unwrap               # noqa: E402
 from p2p_call import extract_tid           # noqa: E402
 
@@ -52,20 +51,14 @@ FAKE_P2P_PORTS = [29000, 29101, 29173]   # proven first, then fallbacks
 
 
 def own_ips():
-    """Every local IPv4 address this host sends probes from (self-gate)."""
-    out = {"127.0.0.1"}
-    try:
-        if sys.platform == "darwin":
-            txt = subprocess.run(["ifconfig"], capture_output=True,
-                                 timeout=3).stdout.decode("utf-8", "replace")
-        else:
-            txt = subprocess.run(["ip", "-4", "-o", "addr"], capture_output=True,
-                                 timeout=3).stdout.decode("utf-8", "replace")
-        for mo in re.finditer(r"inet\s+(\d+\.\d+\.\d+\.\d+)\b", txt):
-            out.add(mo.group(1))
-    except Exception:
-        pass
-    return out
+    """Every local IPv4 address this host sends probes from (self-gate).
+
+    This used to shell out to `ifconfig`/`ip` with the same platform blind
+    spot as discovery: on Windows it returned only 127.0.0.1, so the grabber
+    did not recognise its own LAN probes and could shadow itself.  The shared
+    helper covers all three platforms.
+    """
+    return {"127.0.0.1"} | set(local_ipv4())
 
 
 def _word_of(d):
@@ -376,7 +369,7 @@ class Grabber(threading.Thread):
         }
         os.makedirs(os.path.dirname(self.out_path) or ".", exist_ok=True)
         tmp = self.out_path + ".part"
-        with open(tmp, "w") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(out, f, indent=1, sort_keys=True)
         os.replace(tmp, self.out_path)
         self._set(phase="done", complete_tid=str(tid))
