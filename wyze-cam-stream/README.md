@@ -103,6 +103,11 @@ Optional extras, never committed, all read if present:
 * **Two-way talk** to a camera, **listen** to a camera, **snapshot** (client-side
   encode of the canvas), and per-tile live fps/lag/staleness badges — including
   an honest "streaming over a frozen picture" word when the worker stalls.
+* **Fullscreen keeps the display awake**: the page holds a Screen Wake Lock
+  while the overlay is open, so a wall display does not blank.  The lock
+  needs a secure origin — `http://127.0.0.1:8080`/`localhost` or HTTPS; a
+  phone on a plain `http://192.168.x.x` address gets an honest "screen may
+  sleep" badge instead.
 * With no viewer connected, the server stops decoding instead of streaming to
   nobody; opening the page brings the grid back cold in ~1–2 s.
 

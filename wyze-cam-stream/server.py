@@ -1264,6 +1264,12 @@ PAGE = """<!doctype html>
          color:#fff; font-size:14px; opacity:0; transition:opacity .25s; }
  #overlay:hover .obar { opacity:1; }
  .obar .ostat { color:#8b949e; font-size:12px; }
+ /* Wake Lock status in the fullscreen bar: green while the display is held
+    awake, amber when this browser/origin refuses a lock. */
+ .obar .owake { display:none; font-size:11px; letter-spacing:.02em;
+                color:#3fb950; white-space:nowrap; }
+ .obar .owake.show { display:inline-block; }
+ .obar .owake.warn { color:#d29922; }
  .obar .x { background:rgba(255,255,255,.14); border:0; color:#fff;
             padding:7px 13px; border-radius:6px; cursor:pointer; }
  .obar .x:hover { background:rgba(255,255,255,.28); }
@@ -1325,6 +1331,7 @@ PAGE = """<!doctype html>
   <div class="obar">
     <strong class="oname"></strong>
     <span class="ostat"></span>
+    <span id="fswake" class="owake"></span>
     <div class="spacer"></div>
     <button id="fstalk" class="talkbtn" title="Hold to talk to this camera" aria-label="Talk to this camera"></button>
     <button id="fssound" class="sndbtn" title="Sound off (click to enable)" aria-label="Toggle sound"></button>
@@ -2082,6 +2089,68 @@ function tile(c) {
   }
 }
 
+/* ---- keep the screen awake -------------------------------------------
+   The Screen Wake Lock API is the standard way to stop the display from
+   sleeping while a camera is fullscreen.  It needs a *secure context*:
+   http://127.0.0.1 and http://localhost qualify, a plain http://LAN-IP does
+   not, so a phone pointed at 192.168.x.x gets the honest "screen may sleep"
+   note instead of a silent failure.  The browser releases the lock whenever
+   the tab is hidden; visibilitychange takes it back. */
+const WAKE = (() => {
+  const el = $('#fswake');
+  let sentinel = null, wanted = false, pending = false;
+  function paint(state) {
+    if (!el) return;
+    el.classList.toggle('show', state !== 'off');
+    el.classList.toggle('warn', state === 'warn');
+    el.textContent = state === 'on' ? 'screen on'
+                   : state === 'warn' ? 'screen may sleep' : '';
+    el.title = state === 'on'
+      ? 'Wake Lock active: the display will not turn off while this view is open.'
+      : state === 'warn'
+        ? 'This browser/origin refused a screen Wake Lock. A secure origin is '
+          + 'required: use http://127.0.0.1:8080 on the server PC, or HTTPS '
+          + 'elsewhere (a phone on http://192.168.x.x cannot keep the display '
+          + 'awake).'
+        : '';
+  }
+  async function acquire() {
+    if (!wanted || sentinel || pending) return;
+    if (!navigator.wakeLock) { paint('warn'); return; }
+    pending = true;
+    try {
+      const s = await navigator.wakeLock.request('screen');
+      if (!wanted) { Promise.resolve(s.release()).catch(() => {}); return; }
+      sentinel = s;
+      // Released by the browser on tab hide, battery saver, etc.  Do not
+      // fight it: the visibility handler below re-asks when we come back.
+      s.addEventListener('release', () => {
+        if (sentinel === s) sentinel = null;
+        if (wanted) paint(document.visibilityState === 'visible'
+                          ? 'warn' : 'off');
+      });
+      paint('on');
+    } catch (_) {
+      paint('warn');       // NotAllowedError: battery saver or site policy
+    } finally {
+      pending = false;
+    }
+  }
+  function on()  { wanted = true; acquire(); }
+  function off() {
+    wanted = false;
+    if (sentinel) {
+      Promise.resolve(sentinel.release()).catch(() => {});
+      sentinel = null;
+    }
+    paint('off');
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (wanted && document.visibilityState === 'visible') acquire();
+  });
+  return {on, off};
+})();
+
 /* ---- fullscreen ------------------------------------------------------
    The tile's existing <canvas> is MOVED into the overlay and moved back on
    close.  Moving keeps the element, so it stays the same thing the /feed
@@ -2089,7 +2158,7 @@ function tile(c) {
 const FS = {tid: null, home: null};
 
 function openFs(tid) {
-  if (FS.tid === tid) return;
+  if (FS.tid === tid) { WAKE.on(); return; }   // same camera: just re-arm
   if (FS.tid !== null) closeFs();
   const cv = document.getElementById('view' + tid),
         aud = document.getElementById('aud' + tid),
@@ -2105,6 +2174,7 @@ function openFs(tid) {
   cv.classList.remove('hidden');
   tileEl.querySelector('.ph').classList.remove('hidden');
   $('#overlay').classList.add('open');
+  WAKE.on();                                // display must not sleep now
   syncAudioUi(tid);                         // show the bar's speaker state
   // Focus: narrow the single /feed to this camera.  The server drops the
   // other workers (see Hub._supervise) -- that is the point of fullscreen.
@@ -2121,6 +2191,7 @@ function closeFs() {
         home = FS.home,
         audHome = FS.audHome;
   $('#overlay').classList.remove('open');
+  WAKE.off();                               // back to normal sleep policy
   if (cv && home) {
     home.appendChild(cv);                   // move it back into the tile
   }
