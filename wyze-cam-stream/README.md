@@ -110,6 +110,10 @@ Optional extras, never committed, all read if present:
   sleep" badge instead.
 * With no viewer connected, the server stops decoding instead of streaming to
   nobody; opening the page brings the grid back cold in ~1–2 s.
+* **Recovers without a restart** when the official app takes a camera (or the
+  stream is cut mid-GOP).  A watchdog breaks a wedged ffmpeg pipe, and the
+  worker re-discovers and re-handshakes on its own; the page's `/feed` adopts
+  the replacement worker instead of holding a dead one.
 
 Measured with all four cameras live for 25 s: **1992 frames, 70 MB, zero
 dropped** (`pub == served` on every camera) — see `../JOURNAL.md` Phase 17.

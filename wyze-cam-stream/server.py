@@ -129,6 +129,24 @@ MAX_LAG = 0.5
 PAUSE_DWELL = 3.0
 PAUSE_TICK = 0.5
 
+# The worker feeds ffmpeg through a blocking stdin pipe.  If ffmpeg ever stops
+# consuming it, that write never returns and no in-loop check can run -- the
+# camera shows "streaming" while frozen until the server is restarted.  An
+# independent watchdog kills ffmpeg after this long without a completed loop
+# iteration; write() then raises and the normal reconnect path takes over.
+# A healthy iteration is a 50 ms pump plus one write, so this is ~200x headroom.
+PIPE_STALL = 12.0
+# Input can keep arriving while the decoder itself is wedged (or fed a stream
+# it cannot parse).  If no JPEG has been published for this long even though
+# H.264 is flowing, recycle the session rather than showing a frozen picture.
+DECODER_STALL = 15.0
+# Last-resort Hub check: a worker that still says "streaming" but has published
+# nothing for this long is wedged somewhere the in-worker watchdog cannot see
+# (or could not break).  The Hub then closes its socket/kills ffmpeg so the
+# thread can unwind and be replaced.  Well above both timeouts above, so the
+# normal recovery path always gets there first.
+WORKER_STALL = 40.0
+
 # The stream request (AvStreamCtl) can ask the camera for either its 1080p
 # profile (definition 2) or the 640x360 sub-stream (0).  A camera that refuses
 # the HD request answers with no media at all, not with the SD fallback, so a
@@ -283,7 +301,14 @@ class CameraStreamThread(threading.Thread):
         super().__init__(daemon=True)
         self.camera = camera                      # tid, ip, name, calling
         self.status = "starting"
+        self.status_since = time.time()
         self.error = None
+        # Live pipeline objects, so the Hub can break a wedged worker out of a
+        # blocking pipe/socket call instead of waiting for a server restart.
+        self._live_lock = threading.Lock()
+        self._live_ff = None
+        self._live_st = None
+        self._forced_at = 0.0
         self.frame = b""
         self.seq = 0
         # Frames are buffered, not just "latest wins": ffmpeg hands JPEGs over
@@ -336,12 +361,40 @@ class CameraStreamThread(threading.Thread):
         self._log = (self._log + ["%s %s" % (time.strftime("%H:%M:%S"), msg)])[-40:]
 
     def set_status(self, s, err=None):
+        if s != self.status:
+            self.status_since = time.time()
         self.status, self.error = s, err
         if self._on_status:
             try:
                 self._on_status()
             except Exception:
                 pass
+
+    def force_restart(self, why):
+        """Break a wedged pipeline from outside the worker thread.
+
+        The Hub calls this when a worker still claims "streaming" but has not
+        published a JPEG for far longer than any in-worker timeout.  Killing
+        ffmpeg and closing the UDP socket makes a blocked write/select return;
+        _stop then makes the pump loop exit and the supervisor starts a fresh
+        worker.  Without this the only recovery was restarting the server.
+        """
+        now = time.time()
+        if now - self._forced_at < 10.0:      # one attempt per 10 s
+            return False
+        self._forced_at = now
+        self.log("hub watchdog: %s -- forcing a restart" % why)
+        self._stop.set()
+        with self._live_lock:
+            ff, st = self._live_ff, self._live_st
+        for closer in (ff.kill if ff else None, st.close if st else None):
+            if closer is None:
+                continue
+            try:
+                closer()
+            except Exception:
+                pass
+        return True
 
     def take(self, since_seq=0):
         """Return `([(jpeg, t_pub), ...], cursor)` for frames past `since_seq`.
@@ -442,14 +495,20 @@ class CameraStreamThread(threading.Thread):
         # native 1920x1080 for maximum sharpness; any other width scales.
         width = int(os.environ.get("WYZE_WIDTH", "1280"))
         vf = ["-vf", "scale=%d:-2" % width] if width > 0 else []
-        ff = subprocess.Popen(
-            ["ffmpeg", "-loglevel", "error",
-             "-probesize", "32", "-analyzeduration", "0",
-             "-f", "h264", "-i", "pipe:0",
-             "-an"] + vf + [
-             "-f", "mjpeg", "-q:v", "5", "pipe:1"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE)
+        try:
+            ff = subprocess.Popen(
+                ["ffmpeg", "-loglevel", "error",
+                 "-probesize", "32", "-analyzeduration", "0",
+                 "-f", "h264", "-i", "pipe:0",
+                 "-an"] + vf + [
+                 "-f", "mjpeg", "-q:v", "5", "pipe:1"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE)
+        except Exception:
+            st.close()                 # do not leak the bound UDP socket
+            raise
+        with self._live_lock:
+            self._live_ff, self._live_st = ff, st
         self.set_status("streaming")
 
         # Drain ffmpeg's stdout on its OWN thread.
@@ -500,14 +559,69 @@ class CameraStreamThread(threading.Thread):
                                  name="drain-%s" % self.camera["tid"])
         drain.start()
 
-        h264_before = self.stats["h264"]
-        st.start()  # handshake + KCP up + AvStreamCtl
+        # ffmpeg's stderr is a pipe too.  `-loglevel error` still prints one
+        # line per corrupt frame, so a stream cut mid-GOP -- exactly what
+        # happens when the official app takes the camera -- can fill the pipe
+        # buffer.  ffmpeg then blocks writing stderr, stops reading stdin, and
+        # the blocking ff.stdin.write() below wedges the worker forever.  That
+        # was the "camera needs a server restart" failure.  Drain stderr and
+        # keep only the tail for the worker's log ring.
+        def _drain_err():
+            tail = collections.deque(maxlen=6)
+            while not stop_drain.is_set():
+                try:
+                    line = ff.stderr.readline()
+                except (OSError, ValueError):
+                    break
+                if not line:
+                    break
+                text = line.decode("utf-8", "replace").strip()
+                if text:
+                    tail.append(text)
+            for text in tail:
+                self.log("ffmpeg: " + text)
 
+        err_drain = threading.Thread(target=_drain_err, daemon=True,
+                                     name="fferr-%s" % self.camera["tid"])
+        err_drain.start()
+
+        # Independent progress watchdog.  The 8 s input-stall check lives
+        # inside the loop below, so it cannot fire while that loop is blocked
+        # in ff.stdin.write().  If no iteration completes for PIPE_STALL
+        # seconds, kill ffmpeg: the pending write raises, the loop exits, and
+        # _cycle re-handshakes.  wd_fired then forces a fresh discovery too,
+        # because the camera's P2P port may have changed while the app had it.
+        hb = {"t": time.time()}
+        wd_stop = threading.Event()
+        wd_fired = threading.Event()
+
+        def _watchdog():
+            while not wd_stop.wait(1.0):
+                idle = time.time() - hb["t"]
+                if idle > PIPE_STALL:
+                    self.log("watchdog: no pipeline progress for %.0fs -- "
+                             "killing ffmpeg" % idle)
+                    wd_fired.set()
+                    try:
+                        ff.kill()
+                    except Exception:
+                        pass
+                    return
+
+        watchdog = threading.Thread(target=_watchdog, daemon=True,
+                                    name="wd-%s" % self.camera["tid"])
+        watchdog.start()
+
+        h264_before = self.stats["h264"]
         # Single pump loop: feed video AND audio from one CameraStream
         last_h264 = time.time()
         audio_cursor = 0
+        jpg_mark = self.stats["jpg"]
+        last_jpg_t = time.time()
         try:
+            st.start()  # handshake + KCP up + AvStreamCtl
             for _ in range(1000000):  # effectively infinite
+                hb["t"] = time.time()       # watchdog heartbeat
                 if self._stop.is_set():
                     break
                 st._pump(0.05, [(st.kcp_lo.conv, st.kcp_lo),
@@ -539,6 +653,17 @@ class CameraStreamThread(threading.Thread):
                 # Talk: this camera's own voice, pushed on the same session.
                 self._talk_tick(st, time.time())
 
+                # Output stall: H.264 is still arriving (last_h264 was just
+                # refreshed) but ffmpeg has published no JPEG.  That is a wedge
+                # the input check below can never see, so recycle instead of
+                # serving a frozen picture indefinitely.
+                if self.stats["jpg"] != jpg_mark:
+                    jpg_mark = self.stats["jpg"]
+                    last_jpg_t = time.time()
+                elif time.time() - last_jpg_t > DECODER_STALL:
+                    raise RuntimeError(
+                        "decoder stalled: H.264 in, no JPEG out")
+
                 # stall check
                 if time.time() - last_h264 > 8.0:
                     raise RuntimeError("stream stalled")
@@ -548,15 +673,22 @@ class CameraStreamThread(threading.Thread):
             # A talk session outlives this stream's life: the camera holds one
             # session, so the encoder has to go with it or it keeps pushing.
             self.talk_end()
-            for closer in (lambda: ff.stdin.close(), ff.kill, st.close):
+            # Kill ffmpeg BEFORE closing its stdin.  close() flushes, and that
+            # flush is the same blocking pipe write the watchdog exists to
+            # break; with the child gone it simply raises EPIPE and is caught.
+            for closer in (ff.kill, lambda: ff.stdin.close(), st.close):
                 try:
                     closer()
                 except Exception:
                     pass
-            try:
-                drain.join(timeout=2.0)
-            except Exception:
-                pass
+            wd_stop.set()
+            for th in (drain, err_drain, watchdog):
+                try:
+                    th.join(timeout=2.0)
+                except Exception:
+                    pass
+            with self._live_lock:
+                self._live_ff = self._live_st = None
             # An AvStreamCtl the camera dislikes leaves us with NO media at
             # all, not the SD fallback -- so a run that produced zero bytes of
             # H.264 is the signal to retry, and only a few consecutive such
@@ -590,6 +722,13 @@ class CameraStreamThread(threading.Thread):
                     self.log("definition=%d gave no video (attempt %d/%d)"
                              % (self.definition, self.hd_fails, HD_RETRIES))
             self.set_status("reconnecting")
+
+        # A watchdog kill means the pipeline stopped consuming input: restart
+        # from discovery rather than trusting a session that may have been
+        # taken over by the app.  Raising (instead of returning) makes run()
+        # drop the cached P2P port and back off.
+        if wd_fired.is_set():
+            raise RuntimeError("pipeline watchdog restarted the session")
 
     # -- two-way audio (client -> camera) ----------------------------------
     def talk_begin(self, rate=None, dry=False):
@@ -786,7 +925,9 @@ class CameraStreamThread(threading.Thread):
             self.talk_stop.set()
         if not ff:
             return
-        for closer in (lambda: ff.stdin.close(), ff.kill):
+        # Kill first: closing stdin flushes, and a flush into a wedged encoder
+        # blocks forever -- the same trap as the video pipe.
+        for closer in (ff.kill, lambda: ff.stdin.close()):
             try:
                 closer()
             except Exception:
@@ -1098,6 +1239,20 @@ class Hub:
                             self.ensure(tid)
                         except Exception:
                             pass
+                        with self.lock:
+                            w = self.workers.get(tid)
+                    # Last-resort watchdog: the in-worker one breaks blocking
+                    # pipe writes, but if anything else wedges the thread it
+                    # stays "streaming" forever and ensure() keeps returning
+                    # the live-but-useless worker.  A stale pipeline is closed
+                    # here; _stop makes the thread exit, and the next tick
+                    # starts a fresh one.
+                    if (w is not None and w.is_alive()
+                            and w.status == "streaming"):
+                        last = w.stats.get("last") or w.status_since
+                        idle = time.time() - last
+                        if idle > WORKER_STALL:
+                            w.force_restart("no JPEG for %.0fs" % idle)
                     continue
                 # Nobody wants it.  Unless it only just lost its last viewer
                 # (a quick fullscreen toggle should not cost a cold handshake
@@ -2499,8 +2654,18 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         try:
             self.wfile.write(body)
-        except (BrokenPipeError, ConnectionResetError):
+        except ConnectionError:
             pass
+
+    def handle_one_request(self):
+        # Windows reports a browser that vanished mid-request as
+        # ConnectionAbortedError (WSAECONNABORTED).  socketserver would print a
+        # whole traceback for what is just a closed tab or a phone leaving
+        # Wi-Fi; treat it as the end of this connection instead.
+        try:
+            super().handle_one_request()
+        except ConnectionError:
+            self.close_connection = True
 
     def _json(self, code, **kw):
         self._send(code, kw)
@@ -2509,7 +2674,10 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         if not n:
             return b""
-        return self.rfile.read(n)
+        try:
+            return self.rfile.read(n)
+        except ConnectionError:
+            return b""       # client vanished mid-upload; not a server error
 
     def _body(self):
         try:
@@ -2586,7 +2754,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Disposition",
                          'attachment; filename="%s"' % name)
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except ConnectionError:
+            pass
 
     # -- one connection for every camera -----------------------------------
     _FEED_HDR = struct.Struct("<QQI")      # tid, publish ms, jpeg length
@@ -2678,13 +2849,30 @@ class Handler(BaseHTTPRequestHandler):
                             tids = sorted(HUB.cameras)
                         else:
                             tids = [focus] if focus in HUB.cameras else []
+                    # Re-ensure EVERY wanted camera, not just newly discovered
+                    # ones.  A worker can be replaced while this connection is
+                    # open -- the recovery watchdog forces a fresh one -- and
+                    # holding the dead object would freeze that tile until the
+                    # page reconnected (i.e. until the server restarted).
+                    by_tid = {w.camera["tid"]: w for w in workers}
                     for tid in tids:
-                        if any(w.camera["tid"] == tid for w in workers):
-                            continue
                         w, _err = HUB.ensure(tid)
-                        if w:
-                            workers.append(w)
-                            cursors[tid] = w.seq
+                        if not w:
+                            continue
+                        old = by_tid.get(tid)
+                        if old is w:
+                            continue
+                        by_tid[tid] = w
+                        # The replacement starts its own sequence at 0, so a
+                        # cursor from the old worker would skip every new
+                        # frame.  Start live and reset its per-connection stats.
+                        cursors[tid] = w.seq
+                        served[tid] = 0
+                        dropped[tid] = 0
+                        w.stats["t0"] = time.time()
+                        w.stats["base_jpg"] = w.stats.get("jpg", 0)
+                        w.stats["nconn"] = w.stats.get("nconn", 0) + 1
+                    workers = list(by_tid.values())
 
                 out = bytearray()
                 for w in workers:
@@ -2718,7 +2906,7 @@ class Handler(BaseHTTPRequestHandler):
                     time.sleep(0.01)
                     for w in workers:
                         w.stats["loops"] = w.stats.get("loops", 0) + 1
-        except (BrokenPipeError, ConnectionResetError):
+        except ConnectionError:
             pass
         except Exception as e:
             sys.stderr.write("feed stopped: %r\n" % (e,))
@@ -2991,7 +3179,7 @@ class Handler(BaseHTTPRequestHandler):
                         self.wfile.flush()
                         t_write += time.time() - t0
                         w.stats["t_write"] = round(t_write, 2)
-                    except (BrokenPipeError, ConnectionResetError):
+                    except ConnectionError:
                         break
                     dead = 0
                 else:
@@ -3064,7 +3252,7 @@ class Handler(BaseHTTPRequestHandler):
             if wav:
                 self.wfile.write(riff)
                 self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
+        except ConnectionError:
             return
 
         # An audio listener counts as demand just like a video viewer: while
@@ -3083,7 +3271,7 @@ class Handler(BaseHTTPRequestHandler):
                         self.wfile.write(ulaw_to_pcm16(b"".join(chunks), gain))
                         self.wfile.flush()
                         dead = 0
-                    except (BrokenPipeError, ConnectionResetError):
+                    except ConnectionError:
                         break
                 else:
                     time.sleep(0.02)
